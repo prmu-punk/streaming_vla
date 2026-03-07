@@ -1,0 +1,10 @@
+model_name_or_path: Qwen/Qwen3-VL-4B-Instruct
+state_dim: 10
+oat_tokenizer_checkpoint: /path/to/oat_tokenizer.ckpt
+device: null
+
+stream:
+  state_interval_s: 0.0
+  vision_interval_s: 0.0
+  obs_same_token: "<obs_same>"
+  max_context_len: null
