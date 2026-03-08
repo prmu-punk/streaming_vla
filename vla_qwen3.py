@@ -13,6 +13,9 @@ import yaml
 from action_tokenizers import OATActionTokenizer
 from qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from qwen3_vl.stream_runner import Qwen3VLStreamRunner
+from utils.pipeline_queue import PipelineState
+from utils.pipeline_types import ChunkPacket, StepPacket
+from utils.stages import action_head_forward, backbone_forward, vision_forward
 
 
 @dataclass
@@ -129,6 +132,69 @@ class Qwen3VLA(nn.Module):
             frames_t = frames_t[:num_frames]
         return frames_t
 
+    def new_pipeline_state(self) -> PipelineState:
+        return PipelineState()
+
+    def push_step(
+        self,
+        pipeline: PipelineState,
+        frames: np.ndarray | torch.Tensor,
+        *,
+        state: torch.Tensor,
+        ts: Optional[int] = None,
+        num_frames: int = 4,
+    ) -> int:
+        step_id = pipeline.next_id()
+        pipeline.step_queue.append(
+            StepPacket(
+                step_id=step_id,
+                frames=frames,
+                state=state,
+                ts=ts,
+                num_frames=num_frames,
+            )
+        )
+        return step_id
+
+    def run_pipeline_once(
+        self,
+        runner: Qwen3VLStreamRunner,
+        pipeline: PipelineState,
+        *,
+        fixed_action_tokens: int = 5,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+    ) -> bool:
+        did_work = False
+
+        if pipeline.step_queue:
+            step_packet = pipeline.step_queue[0]
+            inserted = vision_forward(self, runner, step_packet)
+            if not inserted:
+                return did_work
+            pipeline.step_queue.popleft()
+            token_packet = backbone_forward(
+                self,
+                runner,
+                step_packet.step_id,
+                fixed_action_tokens=fixed_action_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            pipeline.token_queue.append(token_packet)
+            did_work = True
+
+        if pipeline.token_queue:
+            token_packet = pipeline.token_queue.popleft()
+            chunk_packet = action_head_forward(self, token_packet)
+            pipeline.chunk_queue.append(chunk_packet)
+            did_work = True
+
+        return did_work
+
+    def pop_action_chunk(self, pipeline: PipelineState) -> Optional[ChunkPacket]:
+        return pipeline.pop_action_chunk()
+
     def insert_step(
         self,
         runner: Qwen3VLStreamRunner,
@@ -197,38 +263,18 @@ class Qwen3VLA(nn.Module):
         then append <act_eos>. The generated action tokens are detokenized by OAT.
         Requires runner cache to already end with <act_bos>.
         """
-        logits = runner.get_last_logits()
-        if logits.shape[0] != 1:
-            raise ValueError(f"Only batch size 1 is supported in action generation, got {logits.shape[0]}.")
-        if fixed_action_tokens <= 0:
-            raise ValueError(f"fixed_action_tokens must be positive, got {fixed_action_tokens}.")
-
-        allowed = self.action_tokenizer.allowed_hf_token_ids(
-            device=logits.device,
-            include_eos=False,
+        token_packet = backbone_forward(
+            self,
+            runner,
+            -1,
+            fixed_action_tokens=fixed_action_tokens,
+            temperature=temperature,
+            top_k=top_k,
         )
-        eos_id = self.action_tokenizer.act_eos_hf_id
-
-        generated: list[torch.LongTensor] = []
-        for _ in range(fixed_action_tokens):
-            next_token = self._sample_masked_next_token(
-                logits,
-                allowed_token_ids=allowed,
-                temperature=temperature,
-                top_k=top_k,
-            )  # [1, 1]
-            generated.append(next_token)
-            logits = runner.generate_next(next_token)
-
-        # Close action span with <act_eos>.
-        eos_token = torch.tensor([[eos_id]], dtype=torch.long, device=logits.device)
-        runner.append_text_tokens(input_ids=eos_token)
-
-        action_token_ids = torch.cat(generated, dim=1)  # [1, fixed_action_tokens]
-        action_chunk = self.action_tokenizer.detokenize(action_token_ids)
+        chunk_packet = action_head_forward(self, token_packet)
 
         return {
-            "action_token_ids": action_token_ids,
-            "action_chunk": action_chunk,
-            "ended_by_eos": torch.tensor([True], device=self.device),
+            "action_token_ids": chunk_packet.action_token_ids,
+            "action_chunk": chunk_packet.action_chunk,
+            "ended_by_eos": torch.tensor([token_packet.ended_by_eos], device=self.device),
         }
