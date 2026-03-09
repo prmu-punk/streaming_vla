@@ -1,0 +1,3 @@
+[submodule "third-party/oat"]
+	path = third-party/oat
+	url = https://github.com/Chaoqi-LIU/oat.git
