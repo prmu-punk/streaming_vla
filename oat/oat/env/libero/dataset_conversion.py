@@ -2,17 +2,29 @@ import h5py
 import numpy as np
 import tqdm
 import json
-from robosuite.utils.transform_utils import axisangle2quat
 from typing import Optional
 
 from oat.env.libero.env import task_name_to_suite_and_ids
 from oat.common.replay_buffer import ReplayBuffer
 
 
+def axisangle2quat(vec: np.ndarray) -> np.ndarray:
+    angle = np.linalg.norm(vec)
+    if angle == 0.0:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    axis = vec / angle
+    half = angle * 0.5
+    sin_half = np.sin(half)
+    return np.array(
+        [axis[0] * sin_half, axis[1] * sin_half, axis[2] * sin_half, np.cos(half)],
+        dtype=np.float64,
+    )
+
+
 axisangle2quat_vectorized = np.vectorize(
-    axisangle2quat, 
-    signature='(3)->(4)',  # Input: (3,) axis-angle vector, Output: (4,) quaternion
-    otypes=[np.float64]
+    axisangle2quat,
+    signature="(3)->(4)",
+    otypes=[np.float64],
 )
 
 def convert_libero_hdft_to_zarr(

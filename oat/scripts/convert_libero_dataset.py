@@ -2,14 +2,20 @@
 Convert downloaded Libero dataset to desired zarr format.
 """
 
-if __name__ == "__main__":
-    import sys
-    import os
-    import pathlib
+import sys
+import os
+import pathlib
+from unittest.mock import MagicMock
 
-    ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
-    sys.path.append(ROOT_DIR)
-    os.chdir(ROOT_DIR)
+os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+os.environ["MUJOCO_GL"] = "osmesa"
+sys.modules["OpenGL"] = MagicMock()
+sys.modules["OpenGL.GL"] = MagicMock()
+sys.modules["OpenGL.EGL"] = MagicMock()
+
+ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
+sys.path.append(ROOT_DIR)
+os.chdir(ROOT_DIR)
 
 import click
 import zarr
