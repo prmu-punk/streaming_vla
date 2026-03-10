@@ -1,0 +1,52 @@
+defaults:
+  - _self_
+  - task/tokenizer: libero/libero10
+
+name: train_bintok
+_target_: oat.workspace.train_bintok.TrainBinTokWorkspace
+
+seed: 42
+horizon: 32
+task_name: ${task.tokenizer.name}
+
+tokenizer: 
+  _target_: oat.tokenizer.bin.tokenizer.BinTok
+  min_val: -1.0
+  max_val: 1.0
+  num_bins: 256
+
+training:
+  max_reconst_steps: null
+  seed: ${seed}
+  num_demo: 500
+  tqdm_interval_sec: 1.0
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+checkpoint:
+  topk:
+    monitor_key: test_reconst_mse
+    mode: min
+    k: 3
+    format_str: 'mse-{test_reconst_mse:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  wandb_name_base: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  sweep:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+    subdir: ${hydra.job.num}

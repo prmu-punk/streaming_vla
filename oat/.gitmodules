@@ -1,0 +1,4 @@
+[submodule "third_party/LIBERO"]
+	path = third_party/LIBERO
+	url = https://github.com/Chaoqi-LIU/LIBERO.git
+	branch = oat

@@ -1,0 +1,129 @@
+defaults:
+  - _self_
+  - task/policy: libero/libero10
+
+name: train_binpolicy
+_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+
+seed: 42
+horizon: 32
+n_action_steps: 16
+n_obs_steps: 2
+task_name: ${task.policy.name}
+shape_meta: ${task.policy.shape_meta}
+
+policy:
+  _target_: oat.policy.binpolicy.BinPolicy
+
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  obs_encoder:
+    _target_: oat.perception.fused_obs_encoder.FusedObservationEncoder
+    _recursive_: false
+    shape_meta: ${shape_meta}
+
+    vision_encoder:
+      _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
+      crop_shape: [76, 76]
+    
+    state_encoder:
+      _target_: oat.perception.state_encoder.ProjectionStateEncoder
+      out_dim: null   # identity projection
+
+  action_tokenizer:
+    _target_: oat.tokenizer.bin.tokenizer.BinTok.from_checkpoint
+    checkpoint: ???
+
+  # backbone model params
+  embed_dim: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+  # policy inference params
+  temperature: 1.0
+  topk: 10
+
+
+training:
+  resume: True
+  allow_bf16: True
+  max_grad_norm: 1.0
+  num_epochs: 5001
+  val_every: 10
+  sample_every: 10
+  rollout_every: 200
+  checkpoint_every: 10
+  lr_scheduler: constant
+  lr_warmup_steps: 100
+  gradient_accumulate_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  max_reconst_steps: null
+  seed: ${seed}
+  use_ema: True
+  num_demo: 500
+  tqdm_interval_sec: 1.0
+
+ema:
+  _target_: oat.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+optimizer:
+  policy_lr: 5.0e-5
+  obs_enc_lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  
+dataloader:
+  batch_size: 256
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+logging:
+  project: oat_dev
+  resume: True
+  mode: online
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  tags: ["${name}", "${task_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: mean_success_rate
+    mode: max
+    k: 3
+    format_str: 'ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  wandb_name_base: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  sweep:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+    subdir: ${hydra.job.num}
