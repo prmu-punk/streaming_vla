@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument(
         "--datasets",
         type=str,
-        choices=["all", "libero_goal", "libero_spatial", "libero_object", "libero_100"],
+        choices=["all", "libero_goal", "libero_spatial", "libero_object", "libero_100", "libero_90"],
         default="all",
     )
     parser.add_argument(

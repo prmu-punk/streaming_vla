@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task/tokenizer: libero/libero10
+  - task/tokenizer: libero/libero90
 
 name: train_oattok_dit
 _target_: oat.workspace.train_oattok.TrainOATTokWorkspace

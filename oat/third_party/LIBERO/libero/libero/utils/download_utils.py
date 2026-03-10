@@ -175,6 +175,7 @@ def libero_dataset_download(datasets="all", download_dir=None, check_overwrite=T
         "libero_goal",
         "libero_spatial",
         "libero_100",
+        "libero_90",
     ]
 
     datasets_to_download = [
@@ -195,6 +196,14 @@ def libero_dataset_download(datasets="all", download_dir=None, check_overwrite=T
             )
         else:
             print("Using original download links (these may expire soon)")
+            if dataset_name == "libero_90":
+                print("libero_90 is only available individually on Hugging Face.")
+                download_from_huggingface(
+                    dataset_name=dataset_name,
+                    download_dir=download_dir,
+                    check_overwrite=check_overwrite
+                )
+                continue
             download_url(
                 DATASET_LINKS[dataset_name],
                 download_dir=download_dir,
