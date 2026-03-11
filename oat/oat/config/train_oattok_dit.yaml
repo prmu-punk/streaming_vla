@@ -65,7 +65,7 @@ training:
   max_reconst_steps: null
   seed: ${seed}
   use_ema: True
-  num_demo: 500
+  num_demo: 4500
   tqdm_interval_sec: 1.0
 
 ema:
