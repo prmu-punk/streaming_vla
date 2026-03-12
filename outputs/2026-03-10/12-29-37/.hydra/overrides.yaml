@@ -1,0 +1,3 @@
+- training.num_epochs=1
+- training.max_train_batches=10
+- eval.max_val_batches=2
