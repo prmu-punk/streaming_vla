@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+import wandb
 
 ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
 if ROOT_DIR not in sys.path:
@@ -50,6 +52,7 @@ def run_epoch(
     cfg: DictConfig,
     train: bool,
     optimizer: torch.optim.Optimizer | None,
+    epoch: int,
 ) -> Dict[str, float]:
     if train:
         vla.train()
@@ -65,13 +68,19 @@ def run_epoch(
     max_batches_key = "max_train_batches" if train else "max_val_batches"
     max_batches = cfg.training.get(max_batches_key, None) if train else cfg.eval.get(max_batches_key, None)
 
-    for batch_idx, sample_list in enumerate(dataloader):
+    progress = tqdm(
+        dataloader,
+        desc=f"{'train' if train else 'val'} epoch {epoch}",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for batch_idx, sample_list in enumerate(progress):
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            out = vla.replay_offline_context_batch(
+            out = vla.forward_offline_context_batch(
                 samples=sample_list,
                 fixed_action_tokens=int(cfg.model.fixed_action_tokens),
                 num_frames=int(cfg.model.num_frames),
@@ -118,6 +127,11 @@ def run_epoch(
             total_mse += float(mse) * bs
             n_samples += bs
             n_tokens += token_weight
+            progress.set_postfix(
+                token_ce=f"{(total_ce / max(n_tokens, 1.0)):.4f}",
+                action_mse=f"{(total_mse / max(n_samples, 1)):.4f}",
+                samples=n_samples,
+            )
 
         if max_batches is not None and (batch_idx + 1) >= int(max_batches):
             break
@@ -164,6 +178,13 @@ def main(cfg: DictConfig) -> None:
     out_dir = os.getcwd()
     ensure_dir(out_dir)
     ensure_dir(os.path.join(out_dir, "checkpoints"))
+    wandb.init(
+        project="streaming_vla",
+        name=pathlib.Path(out_dir).name,
+        dir=out_dir,
+        mode="offline",
+        config=OmegaConf.to_container(cfg, resolve=True),
+    )
 
     vla = Qwen3VLA(config_path=str(cfg.model.vla_config_path))
     chunk_horizon = infer_chunk_horizon(vla, fixed_action_tokens=int(cfg.model.fixed_action_tokens))
@@ -261,6 +282,7 @@ def main(cfg: DictConfig) -> None:
             cfg=cfg,
             train=True,
             optimizer=optimizer,
+            epoch=epoch,
         )
         val_log = run_epoch(
             vla=vla,
@@ -268,6 +290,7 @@ def main(cfg: DictConfig) -> None:
             cfg=cfg,
             train=False,
             optimizer=None,
+            epoch=epoch,
         )
 
         metrics: Dict[str, float] = {**train_log, **val_log}
@@ -277,6 +300,7 @@ def main(cfg: DictConfig) -> None:
         print(json.dumps(metrics, ensure_ascii=False))
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+        wandb.log(metrics, step=global_step)
 
         if epoch % int(cfg.checkpoint.save_every) == 0:
             ep_path = os.path.join(out_dir, "checkpoints", f"epoch_{epoch:04d}.pt")
@@ -291,6 +315,8 @@ def main(cfg: DictConfig) -> None:
                 save_checkpoint(os.path.join(out_dir, "checkpoints", "best.pt"), vla, optimizer, epoch, global_step, cfg)
 
         global_step += int(train_log["train/updates"])
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

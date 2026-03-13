@@ -403,8 +403,10 @@ class CrossAttnDiTDecoder(nn.Module):
         time_emb_max_period: float = 4.0,
         time_emb_scale: float = 1.0,
         mlp_ratio: float = 4.0,
+        state_dim: int | None = None,
     ):
         super().__init__()
+        del state_dim
 
         self.sample_pos_emb = PositionalEmbedding(
             emb_dim,

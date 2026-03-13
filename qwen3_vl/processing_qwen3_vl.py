@@ -19,6 +19,7 @@
 # limitations under the License.
 
 import numpy as np
+import os
 
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
@@ -108,14 +109,41 @@ class Qwen3VLProcessor(ProcessorMixin):
             image_inputs = {}
             image_grid_thw = None
 
+        provided_video_metadata = kwargs.get("video_metadata", None)
         if videos is not None:
+            if os.getenv("STREAMING_VLA_DEBUG_PROCESSOR"):
+                try:
+                    top_level_len = len(videos)
+                except Exception:
+                    top_level_len = None
+                first_type = type(videos[0]) if top_level_len not in (None, 0) else None
+                first_shape = getattr(videos[0], "shape", None) if top_level_len not in (None, 0) else None
+                print(
+                    "[debug processor.call] "
+                    f"videos_type={type(videos)} top_level_len={top_level_len} "
+                    f"first_type={first_type} first_shape={first_shape} "
+                    f"provided_video_metadata_type={type(provided_video_metadata)}"
+                )
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
             video_grid_thw = videos_inputs["video_grid_thw"]
-            # If user has not requested video metadata, pop it
-            if not kwargs.get("return_metadata"):
+            if provided_video_metadata is not None:
+                video_metadata = provided_video_metadata
+            elif not kwargs.get("return_metadata"):
                 video_metadata = videos_inputs.pop("video_metadata")
             else:
                 video_metadata = videos_inputs["video_metadata"]
+            if os.getenv("STREAMING_VLA_DEBUG_PROCESSOR"):
+                try:
+                    metadata_len = len(video_metadata)
+                except Exception:
+                    metadata_len = None
+                grid_len = int(video_grid_thw.shape[0]) if video_grid_thw is not None else None
+                print(
+                    "[debug processor.call] "
+                    f"video_inputs_keys={list(videos_inputs.keys())} "
+                    f"metadata_type={type(video_metadata)} metadata_len={metadata_len} "
+                    f"video_grid_len={grid_len} video_grid_shape={tuple(video_grid_thw.shape) if video_grid_thw is not None else None}"
+                )
         else:
             videos_inputs = {}
             video_grid_thw = None
@@ -139,6 +167,16 @@ class Qwen3VLProcessor(ProcessorMixin):
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
+                    if os.getenv("STREAMING_VLA_DEBUG_PROCESSOR"):
+                        try:
+                            metadata_len = len(video_metadata)
+                        except Exception:
+                            metadata_len = None
+                        print(
+                            "[debug processor.call] "
+                            f"text_idx={i} video_token_index={index} metadata_len={metadata_len} "
+                            f"text_preview={text[i][:120]!r}"
+                        )
                     metadata = video_metadata[index]
                     if metadata.fps is None:
                         logger.warning_once(

@@ -1,5 +1,13 @@
+output/
+outputs/
+checkpoints/
+wandb/
+train_log.jsonl
 .venv
 */output/
+*/outputs/
+*/checkpoints/
+*/wandb/
 */data/
 *.DS_Store
 *__pycache__/

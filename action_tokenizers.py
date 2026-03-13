@@ -55,6 +55,7 @@ class OATActionTokenizer:
         if actions.dim() != 3:
             raise ValueError(f"Expected actions shape [B, T, D] or [B, D], got {tuple(actions.shape)}")
 
+        self.oat_tokenizer.to(actions.device)
         with torch.inference_mode():
             oat_ids = self.oat_tokenizer.tokenize(actions.to(torch.float32))
         return self._map_oat_to_hf(oat_ids)
@@ -67,6 +68,7 @@ class OATActionTokenizer:
             raise ValueError(f"Expected token ids shape [B, K] or [K], got {tuple(token_ids.shape)}")
 
         oat_ids = self._map_hf_to_oat(token_ids)
+        self.oat_tokenizer.to(oat_ids.device)
         with torch.inference_mode():
             return self.oat_tokenizer.detokenize(oat_ids)
 

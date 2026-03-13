@@ -48,7 +48,7 @@ training:
   resume: True
   allow_bf16: True
   max_grad_norm: 1.0
-  num_epochs: 5001
+  num_epochs: 1001
   checkpoint_every: 10
   val_every: 10
   sample_every: 10
@@ -60,7 +60,7 @@ training:
   max_reconst_steps: null
   seed: ${seed}
   use_ema: True
-  num_demo: 500
+  num_demo: 4500
   tqdm_interval_sec: 1.0
 
 ema:

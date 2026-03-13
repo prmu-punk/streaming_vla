@@ -346,8 +346,11 @@ class Qwen3VLStreamRunner:
         if now - self.state.last_state_time < self.state_interval_s:
             return False
 
-        state_tokens = state_tokens.to(self.model.device)
+        state_encoder_dtype = next(self.state_encoder.parameters()).dtype
+        state_tokens = state_tokens.to(self.model.device, dtype=state_encoder_dtype)
         inputs_embeds = self.state_encoder(state_tokens)
+        model_dtype = self.model.get_input_embeddings().weight.dtype
+        inputs_embeds = inputs_embeds.to(dtype=model_dtype)
         if inputs_embeds.dim() == 2:
             inputs_embeds = inputs_embeds.unsqueeze(0)
 
@@ -397,10 +400,9 @@ class Qwen3VLStreamRunner:
         parts = ["<step>"]
         if ts is not None:
             parts.append(f"<ts>{int(ts)}</ts>")
-        parts.append(f"<obs>{video_token}</obs>")
         parts.append("<state>")
         prefix_text = "".join(parts)
-        prefix_text_same = prefix_text.replace(video_token, self.obs_same_token, 1)
+        prefix_text_same = prefix_text
 
         video_payload = video if video is not None else video_path
         messages = [

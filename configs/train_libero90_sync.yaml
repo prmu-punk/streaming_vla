@@ -1,11 +1,11 @@
 model:
   vla_config_path: configs/vla_qwen3.yaml
   state_dim: 16
-  fixed_action_tokens: 5
+  fixed_action_tokens: 8
   num_frames: 3
 
 dataset:
-  zarr_path: data/libero/libero90_N500.zarr
+  zarr_path: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero/libero90_N4500.zarr
   image_key: agentview_rgb
   action_key: action
   prompt_key: prompt

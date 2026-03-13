@@ -30,7 +30,7 @@ tokenizer:
     _target_: oat.tokenizer.oat.decoder.dit_decoder.DiTDecoder
     sample_dim: ${action_dim}
     sample_horizon: ${horizon}
-    emb_dim: 1024
+    emb_dim: 256
     head_dim: 64
     depth: 4
     pdropout: 0.1
