@@ -14,7 +14,7 @@ dataset:
     - robot0_eef_pos
     - robot0_eef_quat
     - robot0_gripper_qpos
-  context_steps: 8
+  context_steps: 14
   chunk_horizon: null
   anchor_stride_steps: null
   max_episodes: null
@@ -35,14 +35,14 @@ optimizer:
   weight_decay: 0.0
 
 dataloader:
-  batch_size: 4
+  batch_size: 12
   shuffle: true
   num_workers: 2
   pin_memory: true
   drop_last: false
 
 val_dataloader:
-  batch_size: 4
+  batch_size: 12
   shuffle: false
   num_workers: 2
   pin_memory: true

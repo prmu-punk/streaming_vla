@@ -11,9 +11,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 
-from action_tokenizers import OATActionTokenizer
-from qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-from qwen3_vl.stream_runner import Qwen3VLStreamRunner
+from .action_tokenizers import OATActionTokenizer
+from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from .qwen3_vl.stream_runner import Qwen3VLStreamRunner
 from utils.pipeline_queue import PipelineState
 from utils.pipeline_types import ChunkPacket, StepPacket
 from utils.stages import action_head_forward, backbone_forward, vision_forward
@@ -23,7 +23,6 @@ from utils.stages import action_head_forward, backbone_forward, vision_forward
 class StreamConfig:
     state_interval_s: float = 0.0
     vision_interval_s: float = 0.0
-    obs_same_token: str = "<obs_same>"
     max_context_len: Optional[int] = None
 
 
@@ -47,7 +46,6 @@ def _load_vla_config(config_path: str) -> VLAConfig:
     stream_cfg = StreamConfig(
         state_interval_s=float(stream_raw.get("state_interval_s", 0.0)),
         vision_interval_s=float(stream_raw.get("vision_interval_s", 0.0)),
-        obs_same_token=str(stream_raw.get("obs_same_token", "<obs_same>")),
         max_context_len=max_context_len,
     )
 
@@ -69,7 +67,7 @@ class Qwen3VLA(nn.Module):
     ) -> None:
         super().__init__()
         if config_path is None:
-            config_path = str(pathlib.Path(__file__).parent / "configs" / "vla_qwen3.yaml")
+            config_path = str(pathlib.Path(__file__).resolve().parent.parent / "configs" / "vla_qwen3.yaml")
         cfg = _load_vla_config(config_path)
 
         device = cfg.device
@@ -101,7 +99,7 @@ class Qwen3VLA(nn.Module):
             self.processor.tokenizer.add_special_tokens(
                 {"additional_special_tokens": [self.state_placeholder_token]}
             )
-            self.model.resize_token_embeddings(len(self.processor.tokenizer))
+            self.model.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
         self.state_placeholder_token_id = int(
             self.processor.tokenizer.convert_tokens_to_ids(self.state_placeholder_token)
         )
@@ -117,7 +115,6 @@ class Qwen3VLA(nn.Module):
             state_token_id=0,
             max_context_len=self.stream_cfg.max_context_len,
             tokenizer=self.processor.tokenizer,
-            obs_same_token=self.stream_cfg.obs_same_token,
         )
 
     def prefill(self, runner: Qwen3VLStreamRunner, prompt: Optional[str] = None) -> None:

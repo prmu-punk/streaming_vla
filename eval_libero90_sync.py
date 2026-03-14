@@ -10,7 +10,7 @@ ROOT_DIR = str(pathlib.Path(__file__).parent)
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-from vla_qwen3 import Qwen3VLA
+from model.vla_qwen3 import Qwen3VLA
 from workspace.train_libero90_sync import rollout_eval_sync
 
 

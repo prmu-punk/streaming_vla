@@ -164,13 +164,13 @@ def main():
     parser.add_argument(
         "--util",
         type=float,
-        default=80.0,
+        default=60.0,
         help="目标 GPU 利用率 (0-100)，默认 90"
     )
     parser.add_argument(
         "--mem",
         type=float,
-        default=0.8,
+        default=0.5,
         help="显存占用比例 (0-1)，默认 0.8"
     )
     parser.add_argument(

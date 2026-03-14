@@ -10,16 +10,30 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, dataloader
 from tqdm.auto import tqdm
+from multiprocessing.reduction import ForkingPickler
 import wandb
+default_collate_func = dataloader.default_collate
+def default_collate_override(batch):
+  dataloader._use_shared_memory = False
+  return default_collate_func(batch)
 
+setattr(dataloader, 'default_collate', default_collate_override)
+
+for t in torch._storage_classes:
+  if sys.version_info[0] == 2:
+    if t in ForkingPickler.dispatch:
+        del ForkingPickler.dispatch[t]
+  else:
+    if t in ForkingPickler._extra_reducers:
+        del ForkingPickler._extra_reducers[t]
 ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-from libero90_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
-from vla_qwen3 import Qwen3VLA
+from dataset.libero90_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
+from model.vla_qwen3 import Qwen3VLA
 
 
 def set_seed(seed: int) -> None:

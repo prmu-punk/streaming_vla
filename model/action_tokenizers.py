@@ -28,7 +28,7 @@ class OATActionTokenizer:
         new_tokens = [t for t in all_tokens if t not in vocab]
         if new_tokens:
             tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
-            model.resize_token_embeddings(len(tokenizer))
+            model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 
         hf_ids = [tokenizer.convert_tokens_to_ids(t) for t in token_strings]
         self._oat_to_hf = torch.tensor(hf_ids, dtype=torch.long)

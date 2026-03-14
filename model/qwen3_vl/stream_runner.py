@@ -31,7 +31,6 @@ class Qwen3VLStreamRunner:
         max_context_len: Optional[int] = None,
         use_step_eviction: bool = True,
         tokenizer=None,
-        obs_same_token: str = "<obs_same>",
         vision_sim_std_weight: float = 0.5,
     ) -> None:
         self.model = model
@@ -55,9 +54,6 @@ class Qwen3VLStreamRunner:
         self.vision_sim_history: list[float] = []
         self.vision_sim_window = 5
         self.vision_sim_std_weight = float(vision_sim_std_weight)
-        self.obs_same_token = obs_same_token
-        if tokenizer is not None:
-            self._ensure_special_token(tokenizer, obs_same_token)
 
     def reset(self) -> None:
         self.state = StreamState()

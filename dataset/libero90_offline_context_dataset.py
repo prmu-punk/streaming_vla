@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Sequence
 import torch
 from torch.utils.data import Dataset
 
-from libero90_dataset import LiberoEpisodeDataset
+from .libero90_dataset import LiberoEpisodeDataset
 
 
 @dataclass(frozen=True)

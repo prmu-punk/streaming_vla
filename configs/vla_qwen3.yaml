@@ -1,10 +1,9 @@
 model_name_or_path: Alibaba-DAMO-Academy/RynnBrain-2B
 state_dim: 16
-oat_tokenizer_checkpoint: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/output/20260311/003039_train_oattok_crossattn_dit_libero90_N4500/checkpoints/ep-0130_mse-0.002.ckpt
+oat_tokenizer_checkpoint: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/output/20260311/003039_train_oattok_crossattn_dit_libero90_N4500/checkpoints/ep-0110_mse-0.002.ckpt
 device: null
 
 stream:
   state_interval_s: 0.0
   vision_interval_s: 0.0
-  obs_same_token: "<obs_same>"
   max_context_len: 1e5
