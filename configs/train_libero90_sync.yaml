@@ -3,6 +3,7 @@ model:
   state_dim: 16
   fixed_action_tokens: 8
   num_frames: 6
+  max_context_len: 1e4
 
 dataset:
   zarr_path: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero/libero90_N4500.zarr
@@ -14,7 +15,6 @@ dataset:
     - robot0_eef_pos
     - robot0_eef_quat
     - robot0_gripper_qpos
-  context_steps: 14
   chunk_horizon: null
   anchor_stride_steps: null
   max_episodes: null
@@ -25,7 +25,8 @@ training:
   num_epochs: 50
   max_grad_norm: 1.0
   source_dt_ms: 50
-  step_dt_ms: 250
+  step_dt_min_ms: 200
+  step_dt_max_ms: 300
   max_train_batches: null
 
 optimizer:

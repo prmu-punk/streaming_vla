@@ -241,7 +241,7 @@ def main(cfg: DictConfig) -> None:
 
     anchor_stride = cfg.dataset.get("anchor_stride_steps", None)
     if anchor_stride is None:
-        anchor_stride = chunk_horizon
+        anchor_stride = 1
     anchor_stride = int(anchor_stride)
 
     base_ep = LiberoOfflineContextDataset(
@@ -251,10 +251,13 @@ def main(cfg: DictConfig) -> None:
         state_keys=[str(k) for k in cfg.dataset.state_keys],
         prompt_key=str(cfg.dataset.prompt_key),
         source_dt_ms=int(cfg.training.source_dt_ms),
-        step_dt_ms=int(cfg.training.step_dt_ms),
-        context_steps=int(cfg.dataset.context_steps),
+        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
+        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
+        num_frames=int(cfg.model.num_frames),
         chunk_horizon=int(chunk_horizon),
         anchor_stride_steps=anchor_stride,
+        max_context_len=int(float(cfg.model.max_context_len)),
+        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
         max_episodes=cfg.dataset.max_episodes,
     )
 
@@ -278,10 +281,13 @@ def main(cfg: DictConfig) -> None:
         state_keys=[str(k) for k in cfg.dataset.state_keys],
         prompt_key=str(cfg.dataset.prompt_key),
         source_dt_ms=int(cfg.training.source_dt_ms),
-        step_dt_ms=int(cfg.training.step_dt_ms),
-        context_steps=int(cfg.dataset.context_steps),
+        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
+        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
+        num_frames=int(cfg.model.num_frames),
         chunk_horizon=int(chunk_horizon),
         anchor_stride_steps=anchor_stride,
+        max_context_len=int(float(cfg.model.max_context_len)),
+        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
         max_episodes=cfg.dataset.max_episodes,
         episode_indices=train_eps,
     )
@@ -292,10 +298,13 @@ def main(cfg: DictConfig) -> None:
         state_keys=[str(k) for k in cfg.dataset.state_keys],
         prompt_key=str(cfg.dataset.prompt_key),
         source_dt_ms=int(cfg.training.source_dt_ms),
-        step_dt_ms=int(cfg.training.step_dt_ms),
-        context_steps=int(cfg.dataset.context_steps),
+        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
+        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
+        num_frames=int(cfg.model.num_frames),
         chunk_horizon=int(chunk_horizon),
         anchor_stride_steps=anchor_stride,
+        max_context_len=int(float(cfg.model.max_context_len)),
+        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
         max_episodes=cfg.dataset.max_episodes,
         episode_indices=val_eps,
     )
