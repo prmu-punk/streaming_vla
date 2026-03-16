@@ -2,7 +2,7 @@ model:
   vla_config_path: configs/vla_qwen3.yaml
   state_dim: 16
   fixed_action_tokens: 8
-  num_frames: 3
+  num_frames: 6
 
 dataset:
   zarr_path: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero/libero90_N4500.zarr
@@ -25,7 +25,7 @@ training:
   num_epochs: 50
   max_grad_norm: 1.0
   source_dt_ms: 50
-  step_dt_ms: 100
+  step_dt_ms: 250
   max_train_batches: null
 
 optimizer:
@@ -35,16 +35,16 @@ optimizer:
   weight_decay: 0.0
 
 dataloader:
-  batch_size: 12
+  batch_size: 6
   shuffle: true
-  num_workers: 2
+  num_workers: 4
   pin_memory: true
   drop_last: false
 
 val_dataloader:
-  batch_size: 12
+  batch_size: 6
   shuffle: false
-  num_workers: 2
+  num_workers: 4
   pin_memory: true
   drop_last: false
 
@@ -55,3 +55,4 @@ checkpoint:
   save_every: 5
   best_monitor: val/token_ce
   best_mode: min
+  resume_from: null

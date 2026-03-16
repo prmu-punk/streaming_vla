@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import yaml
 
 from .action_tokenizers import OATActionTokenizer
+from .template_qwen3_vla import build_prompt_prefill_text, build_step_assistant_prefix, build_step_user_prefix
 from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from .qwen3_vl.stream_runner import Qwen3VLStreamRunner
 from utils.pipeline_queue import PipelineState
@@ -112,7 +113,7 @@ class Qwen3VLA(nn.Module):
             state_interval_s=self.stream_cfg.state_interval_s,
             vision_interval_s=self.stream_cfg.vision_interval_s,
             state_encoder=self.state_encoder,
-            state_token_id=0,
+            state_token_id=self.state_placeholder_token_id,
             max_context_len=self.stream_cfg.max_context_len,
             tokenizer=self.processor.tokenizer,
         )
@@ -124,7 +125,8 @@ class Qwen3VLA(nn.Module):
                 raise ValueError("tokenizer.eos_token_id is required for prefill.")
             input_ids = torch.tensor([[eos_id]], device=self.device, dtype=torch.long)
         else:
-            encoded = self.processor.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
+            prefill_text = build_prompt_prefill_text(str(prompt))
+            encoded = self.processor.tokenizer(prefill_text, add_special_tokens=False, return_tensors="pt")
             input_ids = encoded["input_ids"].to(self.device)
         runner.prefill_text(input_ids=input_ids)
 
@@ -334,7 +336,7 @@ class Qwen3VLA(nn.Module):
             prompt = sample.get("prompt", None)
             parts: List[str] = []
             if prompt is not None:
-                parts.append(str(prompt))
+                parts.append(build_prompt_prefill_text(str(prompt)))
 
             videos: List[torch.Tensor] = []
             state_vectors: List[torch.Tensor] = []
@@ -356,8 +358,15 @@ class Qwen3VLA(nn.Module):
                     )
                 hist_text = self._tokens_to_text(hist_tokens)
                 parts.append(
-                    f"<step><ts>{ts_ms}</ts>{video_token}<state>{self.state_placeholder_token}</state><act_bos>"
-                    f"{hist_text}{act_eos_text}"
+                    build_step_user_prefix(
+                        ts_ms=ts_ms,
+                        video_token=video_token,
+                        close_previous_assistant=(i > 0),
+                    )
+                    + self.state_placeholder_token
+                    + build_step_assistant_prefix()
+                    + hist_text
+                    + act_eos_text
                 )
                 videos.append(self._make_video_tensor(context_videos[i], num_frames))
                 state_vectors.append(context_states[i].to(self.device))
@@ -372,8 +381,14 @@ class Qwen3VLA(nn.Module):
                 )
             tgt_text = self._tokens_to_text(tgt_tokens)
             parts.append(
-                f"<step><ts>{anchor_ts_ms}</ts>{video_token}<state>{self.state_placeholder_token}</state><act_bos>"
-                f"{tgt_text}"
+                build_step_user_prefix(
+                    ts_ms=anchor_ts_ms,
+                    video_token=video_token,
+                    close_previous_assistant=(n_context > 0),
+                )
+                + self.state_placeholder_token
+                + build_step_assistant_prefix()
+                + tgt_text
             )
             videos.append(self._make_video_tensor(sample["anchor_video"], num_frames))
             state_vectors.append(sample["anchor_state"].to(self.device))

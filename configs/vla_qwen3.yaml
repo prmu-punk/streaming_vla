@@ -6,4 +6,4 @@ device: null
 stream:
   state_interval_s: 0.0
   vision_interval_s: 0.0
-  max_context_len: 1e5
+  max_context_len: 1e4

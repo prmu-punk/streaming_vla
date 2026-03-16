@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 import torch
-import torch.nn.functional as F
 
 from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from ..template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix
 
 
 @dataclass
@@ -31,7 +31,6 @@ class Qwen3VLStreamRunner:
         max_context_len: Optional[int] = None,
         use_step_eviction: bool = True,
         tokenizer=None,
-        vision_sim_std_weight: float = 0.5,
     ) -> None:
         self.model = model
         self.state_interval_s = float(state_interval_s)
@@ -50,10 +49,6 @@ class Qwen3VLStreamRunner:
         if state_token_id is None:
             state_token_id = 0
         self.state_token_id = int(state_token_id)
-        self.latest_vision: Optional[torch.Tensor] = None
-        self.vision_sim_history: list[float] = []
-        self.vision_sim_window = 5
-        self.vision_sim_std_weight = float(vision_sim_std_weight)
 
     def reset(self) -> None:
         self.state = StreamState()
@@ -63,8 +58,6 @@ class Qwen3VLStreamRunner:
         self.prefill_len = 0
         self.step_spans = []
         self.model.model.rope_deltas = None
-        self.latest_vision = None
-        self.vision_sim_history = []
         self.last_logits = None
 
     def _evict_steps_if_needed(self, incoming_step_len: int) -> None:
@@ -140,30 +133,6 @@ class Qwen3VLStreamRunner:
             self.video_grid_log = video_grid_thw
         else:
             self.video_grid_log = torch.cat([self.video_grid_log, video_grid_thw], dim=0)
-
-    def _append_vision_sim(self, sim: float) -> None:
-        self.vision_sim_history.append(float(sim))
-        if len(self.vision_sim_history) > self.vision_sim_window:
-            self.vision_sim_history = self.vision_sim_history[-self.vision_sim_window :]
-
-    def _compute_vision_embedding(
-        self,
-        *,
-        pixel_values_videos: torch.FloatTensor,
-        video_grid_thw: torch.LongTensor,
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            video_outputs = self.model.model.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                return_dict=True,
-            )
-            pooled = video_outputs.pooler_output
-            if isinstance(pooled, (list, tuple)):
-                pooled = torch.cat(pooled, dim=0)
-            embed = pooled.mean(dim=0)
-        embed = F.normalize(embed.float(), dim=0)
-        return embed.detach().cpu()
 
     def _ensure_special_token(self, tokenizer, token: str) -> None:
         if token in tokenizer.get_vocab():
@@ -392,100 +361,39 @@ class Qwen3VLStreamRunner:
             return encoded["input_ids"].to(self.model.device)
 
         video_token = getattr(processor, "video_token", "<|video_pad|>")
-
-        parts = ["<step>"]
-        if ts is not None:
-            parts.append(f"<ts>{int(ts)}</ts>")
-        parts.append("<state>")
-        prefix_text = "".join(parts)
-        prefix_text_same = prefix_text
-
-        video_payload = video if video is not None else video_path
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prefix_text},
-                    {"type": "video", "video": video_payload},
-                ],
-            }
-        ]
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
+        prefix_text = build_step_user_prefix(
+            ts_ms=int(ts) if ts is not None else None,
+            video_token=video_token,
+            close_previous_assistant=(len(self.step_spans) > 0),
         )
-        input_ids = inputs["input_ids"].to(self.model.device)
-        pixel_values_videos = inputs["pixel_values_videos"].to(self.model.device)
-        video_grid_thw = inputs["video_grid_thw"].to(self.model.device)
-
-        with torch.no_grad():
-            video_outputs = self.model.model.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                return_dict=True,
-            )
-        pooled = video_outputs.pooler_output
-        if isinstance(pooled, (list, tuple)):
-            pooled = torch.cat(pooled, dim=0)
-        current_vision = F.normalize(pooled.mean(dim=0).float(), dim=0).detach().cpu()
-
-        skip_vision = False
-        if self.latest_vision is not None:
-            sim = float(torch.dot(current_vision, self.latest_vision).item())
-            if self.vision_sim_history:
-                mean = sum(self.vision_sim_history) / len(self.vision_sim_history)
-                var = sum((v - mean) ** 2 for v in self.vision_sim_history) / len(self.vision_sim_history)
-                std = var**0.5
-                required = mean - self.vision_sim_std_weight * std
-            else:
-                required = None
-            if required is not None and sim >= required:
-                skip_vision = True
-            self._append_vision_sim(sim)
-            if os.getenv("QWEN3VL_DEBUG"):
-                print(f"[debug vision_sim] sim={sim:.4f} required={required}")
-        self.latest_vision = current_vision
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        if eos_id is None:
-            raise ValueError("tokenizer.eos_token_id is required to close assistant.")
-        prefix = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
-
-        if skip_vision:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prefix_text_same},
-                    ],
-                }
-            ]
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            input_ids = inputs["input_ids"].to(self.model.device)
-            input_ids = torch.cat([prefix, input_ids], dim=1)
-            self.append_text_tokens(input_ids=input_ids)
-        else:
-            input_ids = torch.cat([prefix, input_ids], dim=1)
-            did_append = self.append_vision_tokens(
-                input_ids=input_ids,
-                pixel_values_videos=pixel_values_videos,
-                precomputed_video_outputs=video_outputs,
-                video_grid_thw=video_grid_thw,
-                now=now,
-            )
-            if not did_append:
-                return False
+        video_payload = video if video is not None else video_path
+        proc = processor(
+            text=[prefix_text],
+            videos=[[video_payload]],
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        input_ids = proc["input_ids"].to(self.model.device)
+        attention_mask = proc["attention_mask"].to(self.model.device)
+        pixel_values_videos = proc["pixel_values_videos"].to(self.model.device)
+        video_grid_thw = proc["video_grid_thw"].to(self.model.device)
+        seq_len = int(attention_mask[0].sum().item())
+        input_ids = input_ids[:, :seq_len]
+        attention_mask = attention_mask[:, :seq_len]
+        did_append = self.append_vision_tokens(
+            input_ids=input_ids,
+            pixel_values_videos=pixel_values_videos,
+            precomputed_video_outputs=None,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+            now=now,
+        )
+        if not did_append:
+            return False
         self.append_state_tokens(state_tokens=state_tokens, now=now)
 
-        suffix_ids = _encode("</state>" + act_bos)
+        suffix_ids = _encode(build_step_assistant_prefix())
         self.append_text_tokens(input_ids=suffix_ids)
         step_end = self.token_log.shape[1]
         self.step_spans.append((step_start, step_end))
@@ -531,14 +439,8 @@ class Qwen3VLStreamRunner:
         """Generate logits for next token given current KV cache."""
         device = input_ids.device
         ones = torch.ones_like(input_ids, device=device)
-        self._append_attention_mask(ones)
-        self._append_token_log(input_ids)
-        out = self.model(
+        self._forward_append(
             input_ids=input_ids,
-            attention_mask=self.state.attention_mask,
-            past_key_values=self.state.past_key_values,
-            use_cache=True,
+            attention_mask=ones,
         )
-        self.state.past_key_values = out.past_key_values
-        self.last_logits = out.logits[:, -1, :].detach()
         return self.last_logits

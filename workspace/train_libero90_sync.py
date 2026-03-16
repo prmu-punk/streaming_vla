@@ -128,10 +128,27 @@ def run_epoch(
                 n_updates += 1
 
         with torch.no_grad():
-            valid_rows = (tgt_tokens != -100).all(dim=1)
-            if bool(valid_rows.any()):
-                detok = vla.action_tokenizer.detokenize(tgt_tokens[valid_rows])
-                mse = torch.nn.functional.mse_loss(detok, tgt_chunk[valid_rows]).item()
+            allowed_action_ids = vla.action_tokenizer.allowed_hf_token_ids(
+                device=logits.device,
+                include_eos=False,
+            )
+            masked_logits = torch.full_like(logits, -float("inf"))
+            masked_logits[..., allowed_action_ids] = logits[..., allowed_action_ids]
+            pred_tokens = torch.argmax(masked_logits, dim=-1)
+            pred_target_tokens = []
+            target_chunks = []
+            for row_idx in range(pred_tokens.shape[0]):
+                valid_mask = (labels[row_idx] != -100)
+                row_tokens = pred_tokens[row_idx][valid_mask]
+                if row_tokens.numel() == 0:
+                    continue
+                pred_target_tokens.append(row_tokens)
+                target_chunks.append(tgt_chunk[row_idx])
+            if pred_target_tokens:
+                pred_target_tokens = torch.stack(pred_target_tokens, dim=0)
+                target_chunks = torch.stack(target_chunks, dim=0)
+                detok = vla.action_tokenizer.detokenize(pred_target_tokens)
+                mse = torch.nn.functional.mse_loss(detok, target_chunks).item()
             else:
                 mse = 0.0
 
@@ -178,6 +195,20 @@ def save_checkpoint(
         "cfg": OmegaConf.to_container(cfg, resolve=True),
     }
     torch.save(payload, path)
+
+
+def load_checkpoint(
+    path: str,
+    vla: Qwen3VLA,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> tuple[int, int]:
+    payload = torch.load(path, map_location=vla.device)
+    vla.load_state_dict(payload["model"], strict=True)
+    if optimizer is not None and "optimizer" in payload:
+        optimizer.load_state_dict(payload["optimizer"])
+    epoch = int(payload.get("epoch", -1))
+    global_step = int(payload.get("global_step", 0))
+    return epoch, global_step
 
 
 @hydra.main(
@@ -289,7 +320,24 @@ def main(cfg: DictConfig) -> None:
     best_val = math.inf if str(cfg.checkpoint.best_mode) == "min" else -math.inf
 
     global_step = 0
-    for epoch in range(int(cfg.training.num_epochs)):
+    start_epoch = 0
+    resume_from = cfg.checkpoint.get("resume_from", None)
+    if resume_from:
+        resumed_epoch, global_step = load_checkpoint(str(resume_from), vla, optimizer)
+        start_epoch = resumed_epoch + 1
+        print(
+            json.dumps(
+                {
+                    "resume_from": str(resume_from),
+                    "resumed_epoch": int(resumed_epoch),
+                    "start_epoch": int(start_epoch),
+                    "global_step": int(global_step),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    for epoch in range(start_epoch, int(cfg.training.num_epochs)):
         train_log = run_epoch(
             vla=vla,
             dataloader=train_loader,

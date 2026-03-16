@@ -11,13 +11,18 @@ if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
 from model.vla_qwen3 import Qwen3VLA
-from workspace.train_libero90_sync import rollout_eval_sync
+from workspace.libero_rollout import evaluate_libero_rollouts
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/train_libero90_sync.yaml")
+    parser.add_argument("--task", type=str, required=True)
+    parser.add_argument("--n-eval", type=int, default=10)
+    parser.add_argument("--save-videos", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=None)
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -28,7 +33,16 @@ def main() -> None:
     vla.load_state_dict(payload["model"], strict=True)
     vla.eval()
 
-    metrics = rollout_eval_sync(vla, cfg)
+    metrics = evaluate_libero_rollouts(
+        vla=vla,
+        cfg=cfg,
+        task_name=str(args.task),
+        n_eval=int(args.n_eval),
+        save_videos=bool(args.save_videos),
+        output_dir=str(pathlib.Path.cwd()),
+        temperature=float(args.temperature),
+        top_k=args.top_k,
+    )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
