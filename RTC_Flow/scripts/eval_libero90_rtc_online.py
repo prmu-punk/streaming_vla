@@ -4,6 +4,9 @@ import argparse
 import json
 import pathlib
 import sys
+import os
+# 添加项目根目录到 sys.path 以解决找不到 model.qwen3_vl 的问题
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from collections import deque
 from typing import Any, Dict, List, Optional
 

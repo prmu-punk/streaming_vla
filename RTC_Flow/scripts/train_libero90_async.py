@@ -4,6 +4,10 @@ import os
 import pathlib
 import random
 import sys
+import os
+# 添加项目根目录到 sys.path 以解决找不到 model.qwen3_vl 的问题
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -289,11 +293,43 @@ def run_epoch(
         if target_chunk is None or past_key_values is None:
             continue
 
-        kv_cache = export_selected_kv_cache(
-            past_key_values=past_key_values,
-            selected_layers=rtc_cfg.selected_layers,
-            clone=False,
-        )
+        all_kvs = past_key_values
+
+        # 处理不同的 KV Cache 格式
+        if isinstance(all_kvs, list) and len(all_kvs) > 0 and hasattr(all_kvs[0], "keys") and hasattr(all_kvs[0], "values"):
+            all_kvs_list = [(c.keys, c.values) for c in all_kvs]
+        elif hasattr(all_kvs, "to_legacy_cache"):
+            all_kvs_list = all_kvs.to_legacy_cache()
+        elif type(all_kvs).__name__ == "DynamicCache":
+            if hasattr(all_kvs, "key_cache"):
+                all_kvs_list = list(zip(all_kvs.key_cache, all_kvs.value_cache))
+            else:
+                all_kvs_list = list(all_kvs)
+        elif isinstance(all_kvs, tuple) and isinstance(all_kvs[0], tuple):
+            all_kvs_list = list(all_kvs)
+        else:
+            raise ValueError(f"未知的 KV Cache 格式: {type(all_kvs)}")
+
+        # 导出指定层的 KV
+        # 如果配置文件没有指定，默认取最后3层
+        if hasattr(rtc_cfg, "selected_layers") and rtc_cfg.selected_layers:
+            selected_kvs = [all_kvs_list[i] for i in rtc_cfg.selected_layers]
+        else:
+            selected_kvs = all_kvs_list[-3:] if len(all_kvs_list) >= 3 else all_kvs_list
+        
+        # 格式化给 Action Expert
+        kv_cache = []
+        for layer_kv in selected_kvs:
+            if hasattr(layer_kv, "keys") and hasattr(layer_kv, "values"):
+                kv_cache.append((layer_kv.keys, layer_kv.values))
+            elif isinstance(layer_kv, tuple) and len(layer_kv) == 2:
+                kv_cache.append(layer_kv)
+            elif isinstance(layer_kv, tuple) and len(layer_kv) == 3 and layer_kv[2] is None:
+                kv_cache.append((layer_kv[0], layer_kv[1]))
+            elif isinstance(layer_kv, tuple) and hasattr(layer_kv[0], "keys"):
+                kv_cache.append((layer_kv[0].keys, layer_kv[0].values))
+            else:
+                raise ValueError(f"层 KV 格式不支持拆包: {type(layer_kv)}")
 
         state = _stack_anchor_state(sample_list, vla.device)
         if state_adapter is not None:
