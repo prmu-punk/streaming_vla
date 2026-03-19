@@ -2,22 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import pathlib
-import os
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 
 from .action_tokenizers import OATActionTokenizer
-from .template_qwen3_vla import build_prompt_prefill_text, build_step_assistant_prefix, build_step_user_prefix
+from .template_qwen3_vla import (
+    build_video_text,
+    build_prompt_prefill_text,
+    build_step_assistant_prefix,
+    build_step_user_prefix,
+)
 from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from .qwen3_vl.stream_runner import Qwen3VLStreamRunner
 from utils.pipeline_queue import PipelineState
-from utils.pipeline_types import ChunkPacket, StepPacket
-from utils.stages import action_head_forward, backbone_forward, vision_forward
+from utils.pipeline_types import StepPacket
+from utils.stages import action_head_forward, backbone_forward
+from utils.vla_utils import decode_token_ids, make_video_tensor, module_device
 
 
 @dataclass
@@ -74,22 +78,17 @@ class Qwen3VLA(nn.Module):
         device = cfg.device
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
 
         self.processor = Qwen3VLProcessor.from_pretrained(cfg.model_name_or_path, trust_remote_code=False)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(cfg.model_name_or_path, trust_remote_code=False)
-        self.model.to(self.device)
-        if os.getenv("STREAMING_VLA_DEBUG_PROCESSOR"):
-            print(f"[debug processor] processor_type={type(self.processor)}")
-            print(f"[debug processor] video_processor_type={type(self.processor.video_processor)}")
-
+        self.model.to(device)
         hidden_size = self.model.config.text_config.hidden_size
         self.state_encoder = nn.Sequential(
             nn.Linear(cfg.state_dim, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
-        self.state_encoder.to(self.device)
+        self.state_encoder.to(device)
 
         if action_tokenizer is None:
             action_tokenizer = OATActionTokenizer(checkpoint=cfg.oat_tokenizer_checkpoint)
@@ -107,6 +106,10 @@ class Qwen3VLA(nn.Module):
 
         self.stream_cfg = cfg.stream
 
+    @property
+    def device(self) -> torch.device:
+        return module_device(self.model)
+
     def new_runner(self) -> Qwen3VLStreamRunner:
         return Qwen3VLStreamRunner(
             model=self.model,
@@ -119,34 +122,17 @@ class Qwen3VLA(nn.Module):
         )
 
     def prefill(self, runner: Qwen3VLStreamRunner, prompt: Optional[str] = None) -> None:
+        device = module_device(self.model)
         if prompt is None:
             eos_id = getattr(self.processor.tokenizer, "eos_token_id", None)
             if eos_id is None:
                 raise ValueError("tokenizer.eos_token_id is required for prefill.")
-            input_ids = torch.tensor([[eos_id]], device=self.device, dtype=torch.long)
+            input_ids = torch.tensor([[eos_id]], device=device, dtype=torch.long)
         else:
             prefill_text = build_prompt_prefill_text(str(prompt))
             encoded = self.processor.tokenizer(prefill_text, add_special_tokens=False, return_tensors="pt")
-            input_ids = encoded["input_ids"].to(self.device)
+            input_ids = encoded["input_ids"].to(device)
         runner.prefill_text(input_ids=input_ids)
-
-    def _make_video_tensor(
-        self, frames: np.ndarray | torch.Tensor, num_frames: int
-    ) -> torch.Tensor:
-        if isinstance(frames, np.ndarray):
-            frames_t = torch.from_numpy(frames)
-        else:
-            frames_t = frames
-        if frames_t.dim() == 3:
-            frames_t = frames_t.unsqueeze(0)
-        if frames_t.shape[-1] == 3:
-            frames_t = frames_t.permute(0, 3, 1, 2)
-        if frames_t.shape[0] < num_frames:
-            repeat = num_frames - frames_t.shape[0]
-            frames_t = torch.cat([frames_t, frames_t[-1:].repeat(repeat, 1, 1, 1)], dim=0)
-        elif frames_t.shape[0] > num_frames:
-            frames_t = frames_t[:num_frames]
-        return frames_t
 
     def new_pipeline_state(self) -> PipelineState:
         return PipelineState()
@@ -156,6 +142,7 @@ class Qwen3VLA(nn.Module):
         pipeline: PipelineState,
         frames: np.ndarray | torch.Tensor,
         *,
+        aux_frames: Optional[np.ndarray | torch.Tensor] = None,
         state: torch.Tensor,
         ts: Optional[int] = None,
         num_frames: int = 4,
@@ -165,6 +152,7 @@ class Qwen3VLA(nn.Module):
             StepPacket(
                 step_id=step_id,
                 frames=frames,
+                aux_frames=aux_frames,
                 state=state,
                 ts=ts,
                 num_frames=num_frames,
@@ -172,91 +160,32 @@ class Qwen3VLA(nn.Module):
         )
         return step_id
 
-    def run_pipeline_once(
-        self,
-        runner: Qwen3VLStreamRunner,
-        pipeline: PipelineState,
-        *,
-        fixed_action_tokens: int = 5,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> bool:
-        did_work = False
-
-        if pipeline.step_queue:
-            step_packet = pipeline.step_queue[0]
-            inserted = vision_forward(self, runner, step_packet)
-            if not inserted:
-                return did_work
-            pipeline.step_queue.popleft()
-            token_packet = backbone_forward(
-                self,
-                runner,
-                step_packet.step_id,
-                fixed_action_tokens=fixed_action_tokens,
-                temperature=temperature,
-                top_k=top_k,
-            )
-            pipeline.token_queue.append(token_packet)
-            did_work = True
-
-        if pipeline.token_queue:
-            token_packet = pipeline.token_queue.popleft()
-            chunk_packet = action_head_forward(self, token_packet)
-            pipeline.chunk_queue.append(chunk_packet)
-            did_work = True
-
-        return did_work
-
-    def pop_action_chunk(self, pipeline: PipelineState) -> Optional[ChunkPacket]:
-        return pipeline.pop_action_chunk()
-
     def insert_step(
         self,
         runner: Qwen3VLStreamRunner,
         frames: np.ndarray | torch.Tensor,
         *,
+        aux_frames: Optional[np.ndarray | torch.Tensor] = None,
         state: torch.Tensor,
         ts: Optional[int] = None,
         num_frames: int = 4,
         source_dt_ms: int = 50,
     ) -> bool:
-        video = self._make_video_tensor(frames, num_frames)
-        state_tokens = state.to(self.device)
-        if os.getenv("STREAMING_VLA_DEBUG_PROCESSOR"):
-            print(
-                "[debug insert_step] "
-                f"raw_frames_type={type(frames)} raw_frames_shape={getattr(frames, 'shape', None)} "
-                f"video_shape={tuple(video.shape)} state_shape={tuple(state_tokens.shape)} "
-                f"ts={ts} num_frames={num_frames} source_dt_ms={source_dt_ms}"
-            )
+        del source_dt_ms
+        device = module_device(self.model)
+        video = make_video_tensor(frames, num_frames)
+        aux_video = make_video_tensor(aux_frames, 1) if aux_frames is not None else None
+        state_tokens = state if state.device == device else state.to(device)
         return runner.insert_step(
             processor=self.processor,
             video=video,
+            aux_video=aux_video,
             state_tokens=state_tokens,
             ts=str(ts) if ts is not None else None,
         )
 
     def action_tokens(self, actions: torch.Tensor) -> torch.LongTensor:
         return self.action_tokenizer.tokenize(actions)
-
-    def _tokens_to_text(self, token_ids: torch.LongTensor) -> str:
-        token_ids = token_ids.detach().to("cpu")
-        return self.processor.tokenizer.decode(
-            token_ids.tolist(),
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-
-    def append_action_tokens_and_loss(
-        self,
-        runner: Qwen3VLStreamRunner,
-        action_tokens: torch.LongTensor,
-    ) -> torch.Tensor:
-        action_tokens = action_tokens.to(self.device)
-        logits = runner.append_text_tokens_with_logits(input_ids=action_tokens)
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), action_tokens.reshape(-1))
-        return loss
 
     def _sample_masked_next_token(
         self,
@@ -308,8 +237,23 @@ class Qwen3VLA(nn.Module):
         return {
             "action_token_ids": chunk_packet.action_token_ids,
             "action_chunk": chunk_packet.action_chunk,
-            "ended_by_eos": torch.tensor([token_packet.ended_by_eos], device=self.device),
+            "ended_by_eos": torch.tensor([token_packet.ended_by_eos], device=module_device(self.model)),
         }
+
+    def forward(
+        self,
+        *,
+        samples: List[Dict[str, Any]],
+        fixed_action_tokens: int,
+        num_frames: int,
+        source_dt_ms: int = 50,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        return self.forward_offline_context_batch(
+            samples=samples,
+            fixed_action_tokens=fixed_action_tokens,
+            num_frames=num_frames,
+            source_dt_ms=source_dt_ms,
+        )
 
     def forward_offline_context_batch(
         self,
@@ -319,6 +263,7 @@ class Qwen3VLA(nn.Module):
         num_frames: int,
         source_dt_ms: int = 50,
     ) -> Dict[str, Optional[torch.Tensor]]:
+        device = module_device(self.model)
         batch_texts: List[str] = []
         batch_videos: List[List[torch.Tensor]] = []
         batch_state_embeds: List[torch.Tensor] = []
@@ -342,6 +287,7 @@ class Qwen3VLA(nn.Module):
             state_vectors: List[torch.Tensor] = []
 
             context_videos = sample["context_videos"]
+            context_aux_videos = sample.get("context_aux_videos", None)
             context_states = sample["context_states"]
             context_action_chunks = sample["context_action_chunks"]
             context_time_indices = sample["context_time_indices"]
@@ -349,18 +295,23 @@ class Qwen3VLA(nn.Module):
 
             for i in range(n_context):
                 ts_ms = int(context_time_indices[i].item()) * int(source_dt_ms)
-                hist_chunk = context_action_chunks[i].to(self.device).unsqueeze(0)
-                hist_tokens = self.action_tokens(hist_chunk)[0]
+                hist_chunk = context_action_chunks[i].unsqueeze(0)
+                hist_tokens = self.action_tokens(hist_chunk.to(device))[0]
                 if int(hist_tokens.shape[0]) > int(fixed_action_tokens):
                     raise ValueError(
                         f"history token length {hist_tokens.shape[0]} exceeds "
                         f"fixed_action_tokens={fixed_action_tokens}."
                     )
-                hist_text = self._tokens_to_text(hist_tokens)
+                hist_text = decode_token_ids(self.processor.tokenizer, hist_tokens)
+                has_aux = (
+                    context_aux_videos is not None
+                    and int(context_aux_videos.shape[0]) > i
+                    and int(context_aux_videos[i].shape[0]) > 0
+                )
                 parts.append(
                     build_step_user_prefix(
                         ts_ms=ts_ms,
-                        video_token=video_token,
+                        video_token=build_video_text(video_token=video_token, has_aux=has_aux),
                         close_previous_assistant=(i > 0),
                     )
                     + self.state_placeholder_token
@@ -368,34 +319,40 @@ class Qwen3VLA(nn.Module):
                     + hist_text
                     + act_eos_text
                 )
-                videos.append(self._make_video_tensor(context_videos[i], num_frames))
-                state_vectors.append(context_states[i].to(self.device))
+                videos.append(make_video_tensor(context_videos[i], num_frames))
+                if has_aux:
+                    videos.append(make_video_tensor(context_aux_videos[i], 1))
+                state_vectors.append(context_states[i])
 
             anchor_ts_ms = int(sample["anchor_time_idx"].item()) * int(source_dt_ms)
-            tgt_chunk = sample["target_chunk"].to(self.device).unsqueeze(0)
-            tgt_tokens = self.action_tokens(tgt_chunk)[0]
+            tgt_chunk = sample["target_chunk"].unsqueeze(0)
+            tgt_tokens = self.action_tokens(tgt_chunk.to(device))[0]
             if int(tgt_tokens.shape[0]) > int(fixed_action_tokens):
                 raise ValueError(
                     f"target token length {tgt_tokens.shape[0]} exceeds "
                     f"fixed_action_tokens={fixed_action_tokens}."
                 )
-            tgt_text = self._tokens_to_text(tgt_tokens)
+            tgt_text = decode_token_ids(self.processor.tokenizer, tgt_tokens)
+            anchor_aux_video = sample.get("anchor_aux_video", None)
+            has_anchor_aux = anchor_aux_video is not None and int(anchor_aux_video.shape[0]) > 0
             parts.append(
                 build_step_user_prefix(
                     ts_ms=anchor_ts_ms,
-                    video_token=video_token,
+                    video_token=build_video_text(video_token=video_token, has_aux=has_anchor_aux),
                     close_previous_assistant=(n_context > 0),
                 )
                 + self.state_placeholder_token
                 + build_step_assistant_prefix()
                 + tgt_text
             )
-            videos.append(self._make_video_tensor(sample["anchor_video"], num_frames))
-            state_vectors.append(sample["anchor_state"].to(self.device))
+            videos.append(make_video_tensor(sample["anchor_video"], num_frames))
+            if has_anchor_aux:
+                videos.append(make_video_tensor(anchor_aux_video, 1))
+            state_vectors.append(sample["anchor_state"])
 
             batch_texts.append("".join(parts))
             batch_videos.append(videos)
-            batch_state_embeds.append(self.state_encoder(torch.stack(state_vectors, dim=0).to(self.device)))
+            batch_state_embeds.append(self.state_encoder(torch.stack(state_vectors, dim=0).to(device)))
             batch_target_tokens.append(tgt_tokens)
             batch_target_chunks.append(tgt_chunk[0])
 
@@ -406,10 +363,10 @@ class Qwen3VLA(nn.Module):
             return_tensors="pt",
             add_special_tokens=False,
         )
-        input_ids = proc["input_ids"].to(self.device)
-        attention_mask = proc["attention_mask"].to(self.device)
-        pixel_values_videos = proc["pixel_values_videos"].to(self.device)
-        video_grid_thw = proc["video_grid_thw"].to(self.device)
+        input_ids = proc["input_ids"].to(device)
+        attention_mask = proc["attention_mask"].to(device)
+        pixel_values_videos = proc["pixel_values_videos"].to(device)
+        video_grid_thw = proc["video_grid_thw"].to(device)
 
         inputs_embeds = self.model.get_input_embeddings()(input_ids)
         model_dtype = inputs_embeds.dtype
@@ -445,8 +402,8 @@ class Qwen3VLA(nn.Module):
             "logits": logits,
             "target_tokens": torch.nn.utils.rnn.pad_sequence(
                 batch_target_tokens, batch_first=True, padding_value=-100
-            ).to(self.device),
-            "target_chunk": torch.stack(batch_target_chunks, dim=0),
+            ),
+            "target_chunk": torch.stack(batch_target_chunks, dim=0).to(device),
             "token_mask": shifted_labels != -100,
             "n_valid_tokens": (shifted_labels != -100).sum().to(torch.float32),
             "labels": shifted_labels,

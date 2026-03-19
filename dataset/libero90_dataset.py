@@ -150,6 +150,7 @@ class LiberoEpisodeDataset(Dataset[Dict[str, Any]]):
         zarr_path: str,
         *,
         image_key: str = "agentview_rgb",
+        extra_image_keys: Sequence[str] = (),
         action_key: str = "action",
         state_keys: Sequence[str] = (
             "robot0_joint_pos",
@@ -161,15 +162,15 @@ class LiberoEpisodeDataset(Dataset[Dict[str, Any]]):
         max_episodes: int | None = None,
     ) -> None:
         super().__init__()
+        self.extra_image_keys = list(extra_image_keys)
         self.buffer = ReplayBuffer.copy_from_path(
             zarr_path,
-            keys=[image_key, action_key, *state_keys, prompt_key],
+            keys=[image_key, *self.extra_image_keys, action_key, *state_keys, prompt_key],
         )
         self.image_key = image_key
         self.action_key = action_key
         self.state_keys = list(state_keys)
         self.prompt_key = prompt_key
-
         episode_ends = np.asarray(self.buffer.episode_ends[:], dtype=np.int64)
         n_episodes = int(len(episode_ends))
         if n_episodes == 0:
@@ -190,7 +191,6 @@ class LiberoEpisodeDataset(Dataset[Dict[str, Any]]):
                 f"Expected action array rank 2 [T, D], got shape {tuple(action_arr.shape)}"
             )
         self.action_dim = int(action_arr.shape[1])
-
         self.state_dim = int(self._build_states_slice(slice(0, 1)).shape[-1])
 
     def __len__(self) -> int:
@@ -220,6 +220,10 @@ class LiberoEpisodeDataset(Dataset[Dict[str, Any]]):
         sl = slice(ep_start, ep_end)
 
         images = np.asarray(self.buffer[self.image_key][sl], dtype=np.uint8)
+        extra_images = {
+            key: torch.from_numpy(np.asarray(self.buffer[key][sl], dtype=np.uint8))
+            for key in self.extra_image_keys
+        }
         actions = np.asarray(self.buffer[self.action_key][sl], dtype=np.float32)
         states = self._build_states_slice(sl)
 
@@ -228,6 +232,7 @@ class LiberoEpisodeDataset(Dataset[Dict[str, Any]]):
 
         return {
             "images": torch.from_numpy(images),
+            "extra_images": extra_images,
             "states": torch.from_numpy(states),
             "actions": torch.from_numpy(actions),
             "prompt": prompt,

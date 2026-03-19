@@ -10,4 +10,4 @@ train_log.jsonl
 */wandb/
 */data/
 *.DS_Store
-*__pycache__/
+*__pycache__/profiler_traces/*.trace.json

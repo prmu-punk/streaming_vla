@@ -54,10 +54,11 @@ from libero.libero import benchmark
 from libero.libero import get_libero_path
 from model.vla_qwen3 import Qwen3VLA
 from oat.oat.env.libero.env import LiberoEnv, task_name_to_suite_and_ids
+from utils.vla_utils import module_device
 
 
 def infer_chunk_horizon(vla: Qwen3VLA, fixed_action_tokens: int) -> int:
-    allowed = vla.action_tokenizer.allowed_hf_token_ids(device=vla.device, include_eos=False)
+    allowed = vla.action_tokenizer.allowed_hf_token_ids(device=module_device(vla.model), include_eos=False)
     if allowed.numel() == 0:
         raise ValueError("No allowed action token ids found.")
     probe = allowed[0].view(1, 1).repeat(1, fixed_action_tokens)
@@ -141,6 +142,7 @@ def rollout_one_episode(
     warmup_steps: int = 5,
     save_video_path: Optional[str] = None,
 ) -> Dict[str, Any]:
+    device = module_device(vla.model)
     obs, _ = env.reset()
     del obs
     obs = _set_init_state(env, init_state)
@@ -167,9 +169,9 @@ def rollout_one_episode(
 
     while not done:
         decision_t0 = time.perf_counter()
-        state = _build_state_tensor(obs, state_keys, device=vla.device)
+        state = _build_state_tensor(obs, state_keys, device=device)
         inserted, insert_dt = _timed_call(
-            vla.device,
+            device,
             vla.insert_step,
             runner,
             _window_array(frame_window),
@@ -183,7 +185,7 @@ def rollout_one_episode(
             raise RuntimeError("Failed to insert rollout step into runner.")
 
         gen, generate_dt = _timed_call(
-            vla.device,
+            device,
             vla.generate_action_chunk,
             runner,
             fixed_action_tokens=fixed_action_tokens,
@@ -198,7 +200,7 @@ def rollout_one_episode(
         action_chunk_np = action_chunk[0].detach().to("cpu").numpy().astype(np.float32)
 
         for action in action_chunk_np:
-            step_out, step_dt = _timed_call(vla.device, env.step, action)
+            step_out, step_dt = _timed_call(device, env.step, action)
             obs, reward, done, _, _ = step_out
             env_step_time += step_dt
             executed_actions += 1

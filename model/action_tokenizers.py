@@ -19,7 +19,7 @@ class OATActionTokenizer:
         self._hf_to_oat: dict[int, int] = {}
         self._act_eos_hf_id: Optional[int] = None
 
-    def add_tokens(self, tokenizer, model) -> None:
+    def add_tokens(self, tokenizer, model=None) -> None:
         token_strings = [f"<act_oat_{i}>" for i in range(self.codebook_size)]
         act_eos = "<act_eos>"
 
@@ -28,7 +28,8 @@ class OATActionTokenizer:
         new_tokens = [t for t in all_tokens if t not in vocab]
         if new_tokens:
             tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
-            model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+            if model is not None:
+                model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 
         hf_ids = [tokenizer.convert_tokens_to_ids(t) for t in token_strings]
         self._oat_to_hf = torch.tensor(hf_ids, dtype=torch.long)

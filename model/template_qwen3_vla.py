@@ -9,6 +9,12 @@ def build_prompt_prefill_text(prompt: str) -> str:
     return f"{IM_START}user\n{prompt}{IM_END}\n"
 
 
+def build_video_text(*, video_token: str, has_aux: bool) -> str:
+    if has_aux:
+        return f"main view: {video_token} wrist view: {video_token}"
+    return video_token
+
+
 def build_step_user_prefix(*, ts_ms: int | None, video_token: str, close_previous_assistant: bool) -> str:
     parts: list[str] = []
     if close_previous_assistant:

@@ -9,7 +9,7 @@ from typing import Optional, Callable
 import torch
 
 from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-from ..template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix
+from ..template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix, build_video_text
 
 
 @dataclass
@@ -341,6 +341,7 @@ class Qwen3VLStreamRunner:
         *,
         processor,
         video: Optional[object] = None,
+        aux_video: Optional[object] = None,
         video_path: Optional[str] = None,
         state_tokens: torch.Tensor,
         ts: Optional[str] = None,
@@ -361,15 +362,19 @@ class Qwen3VLStreamRunner:
             return encoded["input_ids"].to(self.model.device)
 
         video_token = getattr(processor, "video_token", "<|video_pad|>")
+        has_aux = aux_video is not None
         prefix_text = build_step_user_prefix(
             ts_ms=int(ts) if ts is not None else None,
-            video_token=video_token,
+            video_token=build_video_text(video_token=video_token, has_aux=has_aux),
             close_previous_assistant=(len(self.step_spans) > 0),
         )
         video_payload = video if video is not None else video_path
+        videos = [video_payload]
+        if aux_video is not None:
+            videos.append(aux_video)
         proc = processor(
             text=[prefix_text],
-            videos=[[video_payload]],
+            videos=[videos],
             padding=True,
             return_tensors="pt",
             add_special_tokens=False,
@@ -404,7 +409,7 @@ class Qwen3VLStreamRunner:
         self,
         *,
         input_ids: torch.LongTensor,
-        pixel_values_videos: torch.FloatTensor,
+        pixel_values_videos: Optional[torch.FloatTensor],
         video_grid_thw: torch.LongTensor,
         precomputed_video_outputs=None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -413,6 +418,8 @@ class Qwen3VLStreamRunner:
         now = time.monotonic() if now is None else now
         if now - self.state.last_vision_time < self.vision_interval_s:
             return False
+        if pixel_values_videos is None and precomputed_video_outputs is None:
+            raise ValueError("append_vision_tokens requires pixel_values_videos or precomputed_video_outputs.")
         batch_size, seq_len = input_ids.shape
         local_mask = attention_mask
         if local_mask is None:

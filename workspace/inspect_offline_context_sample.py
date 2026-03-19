@@ -19,6 +19,7 @@ from model.qwen3_vl import Qwen3VLProcessor
 from model.template_qwen3_vla import (
     build_prompt_prefill_text,
     build_step_assistant_prefix,
+    build_video_text,
     build_step_user_prefix,
 )
 
@@ -36,6 +37,15 @@ def load_vla_model_name(vla_config_path: str) -> str:
     return str(raw.model_name_or_path)
 
 
+def oat_chunk_to_text(tokenizer: OATActionTokenizer, chunk: torch.Tensor) -> str:
+    if chunk.dim() == 2:
+        chunk = chunk.unsqueeze(0)
+    tokenizer.oat_tokenizer.to(chunk.device)
+    with torch.no_grad():
+        oat_ids = tokenizer.oat_tokenizer.tokenize(chunk.to(torch.float32))[0]
+    return "".join(f"<act_oat_{int(tok)}>" for tok in oat_ids.tolist())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/train_libero90_sync.yaml")
@@ -49,11 +59,16 @@ def main() -> None:
     action_tokenizer = OATActionTokenizer(
         checkpoint=str(OmegaConf.load(str(cfg.model.vla_config_path)).oat_tokenizer_checkpoint)
     )
+    processor = Qwen3VLProcessor.from_pretrained(
+        load_vla_model_name(str(cfg.model.vla_config_path)),
+        trust_remote_code=False,
+    )
     chunk_horizon = infer_chunk_horizon(action_tokenizer)
 
     dataset = LiberoOfflineContextDataset(
         zarr_path=str(cfg.dataset.zarr_path),
         image_key=str(cfg.dataset.image_key),
+        aux_image_key=str(cfg.dataset.aux_image_key) if cfg.dataset.get("aux_image_key", None) else None,
         action_key=str(cfg.dataset.action_key),
         state_keys=[str(k) for k in cfg.dataset.state_keys],
         prompt_key=str(cfg.dataset.prompt_key),
@@ -66,6 +81,9 @@ def main() -> None:
         max_context_len=int(float(cfg.model.max_context_len)),
         fixed_action_tokens=int(cfg.model.fixed_action_tokens),
         max_episodes=cfg.dataset.max_episodes,
+        processor=processor,
+        action_tokenizer=action_tokenizer,
+        state_placeholder_token="<state_token>",
     )
 
     sample = dataset[int(args.sample_idx)]
@@ -97,10 +115,6 @@ def main() -> None:
     }
 
     if args.print_text:
-        processor = Qwen3VLProcessor.from_pretrained(
-            load_vla_model_name(str(cfg.model.vla_config_path)),
-            trust_remote_code=False,
-        )
         token_strings = [f"<act_oat_{i}>" for i in range(action_tokenizer.codebook_size)]
         extra_tokens = token_strings + ["<act_eos>", "<state_token>"]
         vocab = processor.tokenizer.get_vocab()
@@ -120,15 +134,20 @@ def main() -> None:
             parts.append(build_prompt_prefill_text(str(sample["prompt"])))
 
         videos = []
+        context_aux_videos = sample.get("context_aux_videos", None)
         context_action_chunks = sample["context_action_chunks"]
         for i in range(int(context_action_chunks.shape[0])):
             hist_chunk = context_action_chunks[i].unsqueeze(0)
-            hist_tokens = action_tokenizer.tokenize(hist_chunk)[0]
-            hist_text = "".join(processor.tokenizer.convert_ids_to_tokens(hist_tokens.tolist()))
+            hist_text = oat_chunk_to_text(action_tokenizer, hist_chunk)
+            has_aux = (
+                context_aux_videos is not None
+                and int(context_aux_videos.shape[0]) > i
+                and int(context_aux_videos[i].shape[0]) > 0
+            )
             parts.append(
                 build_step_user_prefix(
                     ts_ms=int(history_t[i]) * int(cfg.training.source_dt_ms),
-                    video_token=video_token,
+                    video_token=build_video_text(video_token=video_token, has_aux=has_aux),
                     close_previous_assistant=(i > 0),
                 )
                 + "<state_token>"
@@ -137,13 +156,16 @@ def main() -> None:
                 + act_eos_text
             )
             videos.append(sample["context_videos"][i])
+            if has_aux:
+                videos.append(sample["context_aux_videos"][i])
 
-        tgt_tokens = action_tokenizer.tokenize(sample["target_chunk"].unsqueeze(0))[0]
-        tgt_text = "".join(processor.tokenizer.convert_ids_to_tokens(tgt_tokens.tolist()))
+        tgt_text = oat_chunk_to_text(action_tokenizer, sample["target_chunk"].unsqueeze(0))
+        anchor_aux_video = sample.get("anchor_aux_video", None)
+        has_anchor_aux = anchor_aux_video is not None and int(anchor_aux_video.shape[0]) > 0
         parts.append(
             build_step_user_prefix(
                 ts_ms=anchor_t * int(cfg.training.source_dt_ms),
-                video_token=video_token,
+                video_token=build_video_text(video_token=video_token, has_aux=has_anchor_aux),
                 close_previous_assistant=(len(history_t) > 0),
             )
             + "<state_token>"
@@ -151,6 +173,8 @@ def main() -> None:
             + tgt_text
         )
         videos.append(sample["anchor_video"])
+        if has_anchor_aux:
+            videos.append(anchor_aux_video)
         text = "".join(parts)
         encoded = processor(
             text=[text],
@@ -159,7 +183,13 @@ def main() -> None:
             return_tensors="pt",
             add_special_tokens=False,
         )
-        out["text_head"] = text[: int(args.max_text_chars)]
+        decoded = processor.tokenizer.decode(
+            encoded["input_ids"][0].tolist(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        out["template_text_head"] = text[: int(args.max_text_chars)]
+        out["expanded_text_head"] = decoded[: int(args.max_text_chars)]
         out["input_token_len"] = int(encoded["input_ids"].shape[1])
 
     print(json.dumps(out, ensure_ascii=False, indent=2))

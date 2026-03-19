@@ -4,12 +4,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Optional
 
-from .pipeline_types import ChunkPacket, StepPacket, TokenPacket
+from .pipeline_types import ChunkPacket, EncodedStepPacket, StepPacket, TokenPacket
 
 
 @dataclass
 class PipelineState:
     step_queue: Deque[StepPacket] = field(default_factory=deque)
+    encoded_step_queue: Deque[EncodedStepPacket] = field(default_factory=deque)
     token_queue: Deque[TokenPacket] = field(default_factory=deque)
     chunk_queue: Deque[ChunkPacket] = field(default_factory=deque)
     next_step_id: int = 0

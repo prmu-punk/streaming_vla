@@ -5,9 +5,8 @@ import json
 import pathlib
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -17,19 +16,10 @@ if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
 
+from dataset.libero90_offline_context_dataset import LiberoOfflineContextDataset
 from model.vla_qwen3 import Qwen3VLA
 from utils.stages import action_head_forward, backbone_forward, vision_forward
-from workspace.libero_rollout import (
-    LiberoEnv,
-    _build_state_tensor,
-    _initial_frame_window,
-    _load_task_init_states,
-    _set_init_state,
-    _warmup_env,
-    _window_array,
-    benchmark,
-    task_name_to_suite_and_ids,
-)
+from utils.vla_utils import module_device
 
 
 def sync_device(device: str) -> None:
@@ -42,79 +32,75 @@ def timed_call(device: str, fn, *args, **kwargs):
     t0 = time.perf_counter()
     out = fn(*args, **kwargs)
     sync_device(device)
-    dt = time.perf_counter() - t0
-    return out, dt
+    return out, time.perf_counter() - t0
 
 
-def rollout_one_episode_pipeline(
+def infer_chunk_horizon(vla: Qwen3VLA, fixed_action_tokens: int) -> int:
+    allowed = vla.action_tokenizer.allowed_hf_token_ids(device=module_device(vla.model), include_eos=False)
+    if allowed.numel() == 0:
+        raise ValueError("No allowed action token ids found.")
+    probe = allowed[0].view(1, 1).repeat(1, fixed_action_tokens)
+    with torch.no_grad():
+        chunk = vla.action_tokenizer.detokenize(probe)
+    return int(chunk.shape[1])
+
+
+def profile_one_sample(
     *,
     vla: Qwen3VLA,
-    env: LiberoEnv,
-    init_state: np.ndarray,
-    image_key: str,
-    state_keys: List[str],
+    sample: Dict[str, Any],
     num_frames: int,
     fixed_action_tokens: int,
     source_dt_ms: int,
     temperature: float = 0.0,
     top_k: Optional[int] = None,
-    warmup_steps: int = 5,
-    execute_prefix_actions: Optional[int] = None,
 ) -> Dict[str, Any]:
+    device = module_device(vla.model)
     with torch.inference_mode():
-        _, _ = timed_call(vla.device, env.reset)
-        obs, _ = timed_call(vla.device, _set_init_state, env, init_state)
-        obs, _ = timed_call(vla.device, _warmup_env, env, warmup_steps)
-
         runner = vla.new_runner()
-        prompt = str(obs["prompt"])
-        _, _ = timed_call(vla.device, vla.prefill, runner, prompt)
+        prompt = str(sample["prompt"])
+        _, prefill_dt = timed_call(device, vla.prefill, runner, prompt)
 
         pipeline = vla.new_pipeline_state()
-        frame_window = _initial_frame_window(obs[image_key], num_frames=num_frames)
-        step_idx = warmup_steps
-        done = bool(env.done)
-
         vision_time = 0.0
         backbone_time = 0.0
         action_head_time = 0.0
-        env_exec_time = 0.0
-        decision_count = 0
-        action_steps = 0
-        token_growths: List[int] = []
-        max_token_log_len = int(getattr(runner, "token_log", torch.empty(0)).shape[0])
+        token_growths = []
+        max_token_log_len = int(getattr(runner, "token_log", torch.empty((1, 0))).shape[1])
 
-        while not done:
-            token_len_before = int(runner.token_log.shape[0])
-            state = _build_state_tensor(obs, state_keys, device=vla.device)
+        history_times = sample["context_time_indices"].tolist()
+        context_videos = sample["context_videos"]
+        context_aux_videos = sample.get("context_aux_videos", None)
+        context_states = sample["context_states"]
+        context_action_chunks = sample["context_action_chunks"]
+
+        for i, hist_t in enumerate(history_times):
+            token_len_before = int(runner.token_log.shape[1])
+            aux_frames = None
+            if context_aux_videos is not None and int(context_aux_videos.shape[0]) > i and int(context_aux_videos[i].shape[0]) > 0:
+                aux_frames = context_aux_videos[i].detach().to("cpu").numpy()
 
             vla.push_step(
                 pipeline,
-                _window_array(frame_window),
-                state=state,
-                ts=step_idx * source_dt_ms,
+                context_videos[i].detach().to("cpu").numpy(),
+                aux_frames=aux_frames,
+                state=context_states[i].unsqueeze(0).to(device),
+                ts=int(hist_t) * source_dt_ms,
                 num_frames=num_frames,
             )
 
-            if not pipeline.step_queue:
-                raise RuntimeError("step_queue is empty right after push_step.")
-            step_packet = pipeline.step_queue[0]
-            inserted, dt = timed_call(vla.device, vision_forward, vla, runner, step_packet)
+            step_packet = pipeline.step_queue.popleft()
+            encoded_step, dt = timed_call(device, vision_forward, vla, runner, step_packet)
             vision_time += dt
-            if not inserted:
-                raise RuntimeError("vision_forward returned False.")
-            pipeline.step_queue.popleft()
+            pipeline.encoded_step_queue.append(encoded_step)
 
-            token_len_after_insert = int(runner.token_log.shape[0])
-            token_growths.append(token_len_after_insert - token_len_before)
-            max_token_log_len = max(max_token_log_len, token_len_after_insert)
-
+            encoded_step = pipeline.encoded_step_queue.popleft()
             token_packet, dt = timed_call(
-                vla.device,
+                device,
                 backbone_forward,
                 vla,
                 runner,
-                step_packet.step_id,
+                encoded_step,
                 fixed_action_tokens=fixed_action_tokens,
                 temperature=temperature,
                 top_k=top_k,
@@ -123,40 +109,80 @@ def rollout_one_episode_pipeline(
             pipeline.token_queue.append(token_packet)
 
             token_packet = pipeline.token_queue.popleft()
-            chunk_packet, dt = timed_call(vla.device, action_head_forward, vla, token_packet)
+            chunk_packet, dt = timed_call(device, action_head_forward, vla, token_packet)
             action_head_time += dt
-            pipeline.chunk_queue.append(chunk_packet)
+            _ = chunk_packet
 
-            chunk_packet = vla.pop_action_chunk(pipeline)
-            if chunk_packet is None:
-                raise RuntimeError("Failed to pop action chunk from pipeline.")
+            # Keep runner history aligned with training semantics by appending GT action tokens.
+            gt_chunk = context_action_chunks[i].unsqueeze(0).to(device)
+            gt_tokens = vla.action_tokens(gt_chunk)
+            eos_id = vla.action_tokenizer.act_eos_hf_id
+            eos_token = torch.tensor([[eos_id]], dtype=torch.long, device=device)
+            runner.append_text_tokens(input_ids=gt_tokens)
+            runner.append_text_tokens(input_ids=eos_token)
 
-            action_chunk_np = chunk_packet.action_chunk[0].detach().to("cpu").numpy().astype(np.float32)
-            if execute_prefix_actions is not None:
-                action_chunk_np = action_chunk_np[: int(execute_prefix_actions)]
-            decision_count += 1
+            token_len_after = int(runner.token_log.shape[1])
+            token_growths.append(token_len_after - token_len_before)
+            max_token_log_len = max(max_token_log_len, token_len_after)
 
-            for action in action_chunk_np:
-                step_out, dt = timed_call(vla.device, env.step, action)
-                obs, _, done, _, _ = step_out
-                env_exec_time += dt
-                action_steps += 1
-                step_idx += 1
-                frame_window.append(np.asarray(obs[image_key], dtype=np.uint8))
-                if done:
-                    break
+        token_len_before = int(runner.token_log.shape[1])
+        anchor_t = int(sample["anchor_time_idx"].item())
+        anchor_aux = sample.get("anchor_aux_video", None)
+        aux_frames = None
+        if anchor_aux is not None and int(anchor_aux.shape[0]) > 0:
+            aux_frames = anchor_aux.detach().to("cpu").numpy()
 
+        vla.push_step(
+            pipeline,
+            sample["anchor_video"].detach().to("cpu").numpy(),
+            aux_frames=aux_frames,
+            state=sample["anchor_state"].unsqueeze(0).to(device),
+            ts=anchor_t * source_dt_ms,
+            num_frames=num_frames,
+        )
+
+        step_packet = pipeline.step_queue.popleft()
+        encoded_step, dt = timed_call(device, vision_forward, vla, runner, step_packet)
+        vision_time += dt
+        pipeline.encoded_step_queue.append(encoded_step)
+
+        encoded_step = pipeline.encoded_step_queue.popleft()
+        token_packet, dt = timed_call(
+            device,
+            backbone_forward,
+            vla,
+            runner,
+            encoded_step,
+            fixed_action_tokens=fixed_action_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        backbone_time += dt
+        pipeline.token_queue.append(token_packet)
+
+        token_packet = pipeline.token_queue.popleft()
+        chunk_packet, dt = timed_call(device, action_head_forward, vla, token_packet)
+        action_head_time += dt
+
+        token_len_after = int(runner.token_log.shape[1])
+        token_growths.append(token_len_after - token_len_before)
+        max_token_log_len = max(max_token_log_len, token_len_after)
+
+        pred_chunk = chunk_packet.action_chunk[0].detach().to("cpu")
+        gt_chunk = sample["target_chunk"].detach().to("cpu")
+        chunk_mse = float(torch.nn.functional.mse_loss(pred_chunk, gt_chunk).item())
+
+        decision_count = int(len(history_times) + 1)
         return {
-            "decision_count": int(decision_count),
-            "action_steps": int(action_steps),
+            "history_steps": int(len(history_times)),
+            "prefill_ms": 1000.0 * prefill_dt,
             "vision_ms_per_step": 1000.0 * vision_time / max(decision_count, 1),
             "backbone_ms_per_step": 1000.0 * backbone_time / max(decision_count, 1),
             "decode_ms_per_step": 1000.0 * action_head_time / max(decision_count, 1),
-            "env_exec_ms_per_action": 1000.0 * env_exec_time / max(action_steps, 1),
-            "env_exec_ms_per_step": 1000.0 * env_exec_time / max(decision_count, 1),
-            "mean_step_token_growth": float(np.mean(token_growths)) if token_growths else 0.0,
-            "final_token_log_len": int(runner.token_log.shape[0]),
+            "mean_step_token_growth": float(sum(token_growths) / max(len(token_growths), 1)),
+            "final_token_log_len": int(runner.token_log.shape[1]),
             "max_token_log_len": int(max_token_log_len),
+            "anchor_chunk_mse": chunk_mse,
         }
 
 
@@ -164,76 +190,58 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/train_libero90_sync.yaml")
-    parser.add_argument("--task", type=str, required=True)
-    parser.add_argument("--episode-idx", type=int, default=0)
+    parser.add_argument("--sample-idx", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=None)
-    parser.add_argument("--num-frames", type=int, default=None)
-    parser.add_argument("--fixed-action-tokens", type=int, default=None)
-    parser.add_argument("--source-dt-ms", type=int, default=None)
-    parser.add_argument("--execute-prefix-actions", type=int, default=None)
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
     OmegaConf.resolve(cfg)
 
-    if args.task not in task_name_to_suite_and_ids:
-        raise ValueError(f"Unknown LIBERO task: {args.task}")
-
     vla = Qwen3VLA(config_path=str(cfg.model.vla_config_path))
-    payload = torch.load(args.checkpoint, map_location=vla.device)
+    payload = torch.load(args.checkpoint, map_location="cpu")
     vla.load_state_dict(payload["model"], strict=True)
     vla.eval()
 
-    suite_name, task_id, _ = task_name_to_suite_and_ids[args.task]
-    task_suite = benchmark.get_benchmark_dict()[suite_name]()
-    task = task_suite.get_task(task_id)
-    init_states = _load_task_init_states(task)
-    ep_idx = int(args.episode_idx)
-    if ep_idx < 0 or ep_idx >= int(init_states.shape[0]):
-        raise ValueError(f"episode-idx out of range: {ep_idx}, total={int(init_states.shape[0])}")
-
-    image_key = str(cfg.dataset.image_key)
-    state_keys = [str(k) for k in cfg.dataset.state_keys]
-    num_frames = int(args.num_frames) if args.num_frames is not None else int(cfg.model.num_frames)
-    fixed_action_tokens = (
-        int(args.fixed_action_tokens) if args.fixed_action_tokens is not None else int(cfg.model.fixed_action_tokens)
+    chunk_horizon = infer_chunk_horizon(vla, fixed_action_tokens=int(cfg.model.fixed_action_tokens))
+    dataset = LiberoOfflineContextDataset(
+        zarr_path=str(cfg.dataset.zarr_path),
+        image_key=str(cfg.dataset.image_key),
+        aux_image_key=str(cfg.dataset.aux_image_key) if cfg.dataset.get("aux_image_key", None) else None,
+        action_key=str(cfg.dataset.action_key),
+        state_keys=[str(k) for k in cfg.dataset.state_keys],
+        prompt_key=str(cfg.dataset.prompt_key),
+        source_dt_ms=int(cfg.training.source_dt_ms),
+        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
+        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
+        num_frames=int(cfg.model.num_frames),
+        chunk_horizon=int(chunk_horizon),
+        anchor_stride_steps=int(cfg.dataset.anchor_stride_steps or 1),
+        max_context_len=int(float(cfg.model.max_context_len)),
+        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
+        max_episodes=cfg.dataset.max_episodes,
+        processor=vla.processor,
+        action_tokenizer=vla.action_tokenizer,
+        state_placeholder_token=vla.state_placeholder_token,
     )
-    source_dt_ms = int(args.source_dt_ms) if args.source_dt_ms is not None else int(cfg.training.source_dt_ms)
 
-    env = LiberoEnv(
-        task_name=str(args.task),
-        image_size=128,
-        seed=int(cfg.training.seed),
-        camera_names=[image_key.replace("_rgb", "")],
-        state_ports=state_keys,
-        max_episode_steps=550,
+    sample = dataset[int(args.sample_idx)]
+    metrics = profile_one_sample(
+        vla=vla,
+        sample=sample,
+        num_frames=int(cfg.model.num_frames),
+        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
+        source_dt_ms=int(cfg.training.source_dt_ms),
+        temperature=float(args.temperature),
+        top_k=args.top_k,
     )
-    try:
-        metrics = rollout_one_episode_pipeline(
-            vla=vla,
-            env=env,
-            init_state=init_states[ep_idx],
-            image_key=image_key,
-            state_keys=state_keys,
-            num_frames=num_frames,
-            fixed_action_tokens=fixed_action_tokens,
-            source_dt_ms=source_dt_ms,
-            temperature=float(args.temperature),
-            top_k=args.top_k,
-            execute_prefix_actions=args.execute_prefix_actions,
-        )
-    finally:
-        env.close()
 
-    out: Dict[str, Any] = {
-        "task_name": task.name,
-        "task_prompt": task.language,
-        "episode_idx": ep_idx,
-        "num_frames": num_frames,
-        "fixed_action_tokens": fixed_action_tokens,
-        "source_dt_ms": source_dt_ms,
-        "execute_prefix_actions": int(args.execute_prefix_actions) if args.execute_prefix_actions is not None else None,
+    out = {
+        "sample_idx": int(args.sample_idx),
+        "num_frames": int(cfg.model.num_frames),
+        "fixed_action_tokens": int(cfg.model.fixed_action_tokens),
+        "source_dt_ms": int(cfg.training.source_dt_ms),
+        "max_context_len": int(float(cfg.model.max_context_len)),
         "metrics": metrics,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))

@@ -29,7 +29,7 @@ def main() -> None:
     OmegaConf.resolve(cfg)
 
     vla = Qwen3VLA(config_path=str(cfg.model.vla_config_path))
-    payload = torch.load(args.checkpoint, map_location=vla.device)
+    payload = torch.load(args.checkpoint, map_location="cpu")
     vla.load_state_dict(payload["model"], strict=True)
     vla.eval()
 

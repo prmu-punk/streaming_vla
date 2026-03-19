@@ -9,6 +9,7 @@ from typing import Dict
 import hydra
 import numpy as np
 import torch
+from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, dataloader
 from tqdm.auto import tqdm
@@ -32,6 +33,7 @@ ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
+from dataset.bucket_sampler import BucketBatchSampler
 from dataset.libero90_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
 from model.vla_qwen3 import Qwen3VLA
 
@@ -67,7 +69,9 @@ def run_epoch(
     train: bool,
     optimizer: torch.optim.Optimizer | None,
     epoch: int,
+    accelerator: Accelerator,
 ) -> Dict[str, float]:
+    raw_vla = accelerator.unwrap_model(vla)
     if train:
         vla.train()
     else:
@@ -82,24 +86,28 @@ def run_epoch(
     max_batches_key = "max_train_batches" if train else "max_val_batches"
     max_batches = cfg.training.get(max_batches_key, None) if train else cfg.eval.get(max_batches_key, None)
 
-    progress = tqdm(
-        dataloader,
-        desc=f"{'train' if train else 'val'} epoch {epoch}",
-        leave=False,
-        dynamic_ncols=True,
-    )
+    if accelerator.is_local_main_process:
+        progress = tqdm(
+            dataloader,
+            desc=f"{'train' if train else 'val'} epoch {epoch}",
+            leave=False,
+            dynamic_ncols=True,
+        )
+    else:
+        progress = dataloader
     for batch_idx, sample_list in enumerate(progress):
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            out = vla.forward_offline_context_batch(
+            out = vla(
                 samples=sample_list,
                 fixed_action_tokens=int(cfg.model.fixed_action_tokens),
                 num_frames=int(cfg.model.num_frames),
                 source_dt_ms=int(cfg.training.source_dt_ms),
             )
+            
             logits = out["logits"]
             tgt_tokens = out["target_tokens"]
             tgt_chunk = out["target_chunk"]
@@ -112,7 +120,7 @@ def run_epoch(
                 or n_valid_tokens is None
                 or labels is None
             ):
-                continue
+                raise ValueError("Output miss")
 
             ce = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
@@ -121,14 +129,14 @@ def run_epoch(
             )
 
             if train:
-                ce.backward()
-                if cfg.training.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(vla.parameters(), float(cfg.training.max_grad_norm))
+                accelerator.backward(ce)
+                if cfg.training.max_grad_norm is not None and accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(vla.parameters(), float(cfg.training.max_grad_norm))
                 optimizer.step()
                 n_updates += 1
 
         with torch.no_grad():
-            allowed_action_ids = vla.action_tokenizer.allowed_hf_token_ids(
+            allowed_action_ids = raw_vla.action_tokenizer.allowed_hf_token_ids(
                 device=logits.device,
                 include_eos=False,
             )
@@ -147,7 +155,7 @@ def run_epoch(
             if pred_target_tokens:
                 pred_target_tokens = torch.stack(pred_target_tokens, dim=0)
                 target_chunks = torch.stack(target_chunks, dim=0)
-                detok = vla.action_tokenizer.detokenize(pred_target_tokens)
+                detok = raw_vla.action_tokenizer.detokenize(pred_target_tokens)
                 mse = torch.nn.functional.mse_loss(detok, target_chunks).item()
             else:
                 mse = 0.0
@@ -158,24 +166,32 @@ def run_epoch(
             total_mse += float(mse) * bs
             n_samples += bs
             n_tokens += token_weight
-            progress.set_postfix(
-                token_ce=f"{(total_ce / max(n_tokens, 1.0)):.4f}",
-                action_mse=f"{(total_mse / max(n_samples, 1)):.4f}",
-                samples=n_samples,
-            )
+            if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
+                progress.set_postfix(
+                    token_ce=f"{(total_ce / max(n_tokens, 1.0)):.4f}",
+                    action_mse=f"{(total_mse / max(n_samples, 1)):.4f}",
+                    samples=n_samples,
+                )
 
         if max_batches is not None and (batch_idx + 1) >= int(max_batches):
             break
 
-    sample_denom = max(n_samples, 1)
-    token_denom = max(n_tokens, 1.0)
+    local_stats = torch.tensor(
+        [[total_ce, total_mse, float(n_samples), float(n_tokens), float(n_updates)]],
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    gathered_stats = accelerator.gather(local_stats)
+    summed_stats = gathered_stats[:, :4].sum(dim=0)
+    max_updates = gathered_stats[:, 4].max()
+
     prefix = "train" if train else "val"
     return {
-        f"{prefix}/token_ce": total_ce / token_denom,
-        f"{prefix}/action_mse": total_mse / sample_denom,
-        f"{prefix}/samples": float(n_samples),
-        f"{prefix}/tokens": float(n_tokens),
-        f"{prefix}/updates": float(n_updates),
+        f"{prefix}/token_ce": float(summed_stats[0].item() / max(summed_stats[3].item(), 1.0)),
+        f"{prefix}/action_mse": float(summed_stats[1].item() / max(summed_stats[2].item(), 1.0)),
+        f"{prefix}/samples": float(summed_stats[2].item()),
+        f"{prefix}/tokens": float(summed_stats[3].item()),
+        f"{prefix}/updates": float(max_updates.item()),
     }
 
 
@@ -186,15 +202,16 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     cfg: DictConfig,
+    accelerator: Accelerator,
 ) -> None:
     payload = {
         "epoch": int(epoch),
         "global_step": int(global_step),
-        "model": vla.state_dict(),
+        "model": accelerator.get_state_dict(vla),
         "optimizer": optimizer.state_dict(),
         "cfg": OmegaConf.to_container(cfg, resolve=True),
     }
-    torch.save(payload, path)
+    accelerator.save(payload, path)
 
 
 def load_checkpoint(
@@ -202,7 +219,7 @@ def load_checkpoint(
     vla: Qwen3VLA,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[int, int]:
-    payload = torch.load(path, map_location=vla.device)
+    payload = torch.load(path, map_location="cpu")
     vla.load_state_dict(payload["model"], strict=True)
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
@@ -218,20 +235,26 @@ def load_checkpoint(
 )
 def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
+    accelerator = Accelerator()
     set_seed(int(cfg.training.seed))
 
     out_dir = os.getcwd()
-    ensure_dir(out_dir)
-    ensure_dir(os.path.join(out_dir, "checkpoints"))
-    wandb.init(
-        project="streaming_vla",
-        name=pathlib.Path(out_dir).name,
-        dir=out_dir,
-        mode="offline",
-        config=OmegaConf.to_container(cfg, resolve=True),
-    )
+    if accelerator.is_main_process:
+        ensure_dir(out_dir)
+        ensure_dir(os.path.join(out_dir, "checkpoints"))
+        wandb.init(
+            project="streaming_vla",
+            name=pathlib.Path(out_dir).name,
+            dir=out_dir,
+            mode="offline",
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+    accelerator.wait_for_everyone()
 
     vla = Qwen3VLA(config_path=str(cfg.model.vla_config_path))
+    vla.model.to(accelerator.device)
+    vla.state_encoder.to(accelerator.device)
+
     chunk_horizon = infer_chunk_horizon(vla, fixed_action_tokens=int(cfg.model.fixed_action_tokens))
 
     if cfg.dataset.get("chunk_horizon", None) is not None and int(cfg.dataset.chunk_horizon) != int(chunk_horizon):
@@ -244,9 +267,10 @@ def main(cfg: DictConfig) -> None:
         anchor_stride = 1
     anchor_stride = int(anchor_stride)
 
-    base_ep = LiberoOfflineContextDataset(
+    full_set = LiberoOfflineContextDataset(
         zarr_path=str(cfg.dataset.zarr_path),
         image_key=str(cfg.dataset.image_key),
+        aux_image_key=str(cfg.dataset.aux_image_key) if cfg.dataset.get("aux_image_key", None) else None,
         action_key=str(cfg.dataset.action_key),
         state_keys=[str(k) for k in cfg.dataset.state_keys],
         prompt_key=str(cfg.dataset.prompt_key),
@@ -259,9 +283,12 @@ def main(cfg: DictConfig) -> None:
         max_context_len=int(float(cfg.model.max_context_len)),
         fixed_action_tokens=int(cfg.model.fixed_action_tokens),
         max_episodes=cfg.dataset.max_episodes,
+        processor=vla.processor,
+        action_tokenizer=vla.action_tokenizer,
+        state_placeholder_token=vla.state_placeholder_token,
     )
 
-    n_episodes = len(base_ep.base)
+    n_episodes = len(full_set.base)
     val_ratio = float(cfg.dataset.val_ratio)
     if not (0.0 < val_ratio < 1.0):
         raise ValueError(f"val_ratio must be in (0,1), got {val_ratio}")
@@ -274,48 +301,48 @@ def main(cfg: DictConfig) -> None:
     train_eps = perm[:n_train_eps]
     val_eps = perm[n_train_eps:]
 
-    train_set = LiberoOfflineContextDataset(
-        zarr_path=str(cfg.dataset.zarr_path),
-        image_key=str(cfg.dataset.image_key),
-        action_key=str(cfg.dataset.action_key),
-        state_keys=[str(k) for k in cfg.dataset.state_keys],
-        prompt_key=str(cfg.dataset.prompt_key),
-        source_dt_ms=int(cfg.training.source_dt_ms),
-        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
-        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
-        num_frames=int(cfg.model.num_frames),
-        chunk_horizon=int(chunk_horizon),
-        anchor_stride_steps=anchor_stride,
-        max_context_len=int(float(cfg.model.max_context_len)),
-        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
-        max_episodes=cfg.dataset.max_episodes,
-        episode_indices=train_eps,
-    )
-    val_set = LiberoOfflineContextDataset(
-        zarr_path=str(cfg.dataset.zarr_path),
-        image_key=str(cfg.dataset.image_key),
-        action_key=str(cfg.dataset.action_key),
-        state_keys=[str(k) for k in cfg.dataset.state_keys],
-        prompt_key=str(cfg.dataset.prompt_key),
-        source_dt_ms=int(cfg.training.source_dt_ms),
-        step_dt_min_ms=int(cfg.training.step_dt_min_ms),
-        step_dt_max_ms=int(cfg.training.step_dt_max_ms),
-        num_frames=int(cfg.model.num_frames),
-        chunk_horizon=int(chunk_horizon),
-        anchor_stride_steps=anchor_stride,
-        max_context_len=int(float(cfg.model.max_context_len)),
-        fixed_action_tokens=int(cfg.model.fixed_action_tokens),
-        max_episodes=cfg.dataset.max_episodes,
-        episode_indices=val_eps,
-    )
+    train_indices = full_set.sample_indices_for_episodes(train_eps)
+    val_indices = full_set.sample_indices_for_episodes(val_eps)
 
-    if int(cfg.model.state_dim) != train_set.state_dim:
+    if int(cfg.model.state_dim) != full_set.state_dim:
         raise ValueError(
-            f"state_dim mismatch: model expects {cfg.model.state_dim}, dataset provides {train_set.state_dim}."
+            f"state_dim mismatch: model expects {cfg.model.state_dim}, dataset provides {full_set.state_dim}."
         )
 
-    train_loader = DataLoader(train_set, collate_fn=offline_context_collate, **cfg.dataloader)
-    val_loader = DataLoader(val_set, collate_fn=offline_context_collate, **cfg.val_dataloader)
+    train_bs = int(cfg.dataloader.batch_size)
+    val_bs = int(cfg.val_dataloader.batch_size)
+    all_lengths = [full_set.get_estimated_length(i) for i in range(len(full_set))]
+
+    train_bucket_sampler = BucketBatchSampler(
+        all_lengths,
+        batch_size=train_bs,
+        shuffle=bool(cfg.dataloader.shuffle),
+        drop_last=bool(cfg.dataloader.drop_last),
+        indices=train_indices,
+        seed=int(cfg.training.seed),
+    )
+    val_bucket_sampler = BucketBatchSampler(
+        all_lengths,
+        batch_size=val_bs,
+        shuffle=False,
+        drop_last=bool(cfg.val_dataloader.drop_last),
+        indices=val_indices,
+        seed=int(cfg.training.seed),
+    )
+    train_loader = DataLoader(
+        full_set,
+        batch_sampler=train_bucket_sampler,
+        collate_fn=offline_context_collate,
+        num_workers=int(cfg.dataloader.num_workers),
+        pin_memory=bool(cfg.dataloader.pin_memory),
+    )
+    val_loader = DataLoader(
+        full_set,
+        batch_sampler=val_bucket_sampler,
+        collate_fn=offline_context_collate,
+        num_workers=int(cfg.val_dataloader.num_workers),
+        pin_memory=bool(cfg.val_dataloader.pin_memory),
+    )
 
     optimizer = torch.optim.AdamW(
         vla.parameters(),
@@ -334,7 +361,7 @@ def main(cfg: DictConfig) -> None:
     if resume_from:
         resumed_epoch, global_step = load_checkpoint(str(resume_from), vla, optimizer)
         start_epoch = resumed_epoch + 1
-        print(
+        accelerator.print(
             json.dumps(
                 {
                     "resume_from": str(resume_from),
@@ -346,7 +373,15 @@ def main(cfg: DictConfig) -> None:
             )
         )
 
+    vla, optimizer, train_loader, val_loader = accelerator.prepare(
+        vla,
+        optimizer,
+        train_loader,
+        val_loader,
+    )
+
     for epoch in range(start_epoch, int(cfg.training.num_epochs)):
+        train_bucket_sampler.set_epoch(epoch)
         train_log = run_epoch(
             vla=vla,
             dataloader=train_loader,
@@ -354,6 +389,7 @@ def main(cfg: DictConfig) -> None:
             train=True,
             optimizer=optimizer,
             epoch=epoch,
+            accelerator=accelerator,
         )
         val_log = run_epoch(
             vla=vla,
@@ -362,32 +398,52 @@ def main(cfg: DictConfig) -> None:
             train=False,
             optimizer=None,
             epoch=epoch,
+            accelerator=accelerator,
         )
 
         metrics: Dict[str, float] = {**train_log, **val_log}
         metrics["epoch"] = float(epoch)
         metrics["global_step"] = float(global_step)
 
-        print(json.dumps(metrics, ensure_ascii=False))
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
-        wandb.log(metrics, step=global_step)
+        if accelerator.is_main_process:
+            print(json.dumps(metrics, ensure_ascii=False))
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+            wandb.log(metrics, step=global_step)
 
-        if epoch % int(cfg.checkpoint.save_every) == 0:
+        if accelerator.is_main_process and epoch % int(cfg.checkpoint.save_every) == 0:
             ep_path = os.path.join(out_dir, "checkpoints", f"epoch_{epoch:04d}.pt")
-            save_checkpoint(ep_path, vla, optimizer, epoch, global_step, cfg)
-            save_checkpoint(os.path.join(out_dir, "checkpoints", "latest.pt"), vla, optimizer, epoch, global_step, cfg)
+            save_checkpoint(ep_path, vla, optimizer, epoch, global_step, cfg, accelerator)
+            save_checkpoint(
+                os.path.join(out_dir, "checkpoints", "latest.pt"),
+                vla,
+                optimizer,
+                epoch,
+                global_step,
+                cfg,
+                accelerator,
+            )
 
-        if best_key in metrics:
+        if accelerator.is_main_process and best_key in metrics:
             cur = float(metrics[best_key])
             better = cur < best_val if str(cfg.checkpoint.best_mode) == "min" else cur > best_val
             if better:
                 best_val = cur
-                save_checkpoint(os.path.join(out_dir, "checkpoints", "best.pt"), vla, optimizer, epoch, global_step, cfg)
+                save_checkpoint(
+                    os.path.join(out_dir, "checkpoints", "best.pt"),
+                    vla,
+                    optimizer,
+                    epoch,
+                    global_step,
+                    cfg,
+                    accelerator,
+                )
 
         global_step += int(train_log["train/updates"])
+        accelerator.wait_for_everyone()
 
-    wandb.finish()
+    if accelerator.is_main_process:
+        wandb.finish()
 
 
 if __name__ == "__main__":

@@ -2,12 +2,13 @@ model:
   vla_config_path: configs/vla_qwen3.yaml
   state_dim: 16
   fixed_action_tokens: 8
-  num_frames: 6
-  max_context_len: 1e4
+  num_frames: 5
+  max_context_len: 1024
 
 dataset:
   zarr_path: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero/libero90_N4500.zarr
   image_key: agentview_rgb
+  aux_image_key: robot0_eye_in_hand_rgb
   action_key: action
   prompt_key: prompt
   state_keys:
@@ -16,7 +17,7 @@ dataset:
     - robot0_eef_quat
     - robot0_gripper_qpos
   chunk_horizon: null
-  anchor_stride_steps: null
+  anchor_stride_steps: 8
   max_episodes: null
   val_ratio: 0.1
 
@@ -30,7 +31,7 @@ training:
   max_train_batches: null
 
 optimizer:
-  lr: 1.0e-5
+  lr: 5e-5
   beta1: 0.9
   beta2: 0.95
   weight_decay: 0.0
@@ -53,7 +54,7 @@ eval:
   max_val_batches: null
 
 checkpoint:
-  save_every: 5
+  save_every: 1
   best_monitor: val/token_ce
   best_mode: min
   resume_from: null

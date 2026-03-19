@@ -1195,6 +1195,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
+        precomputed_video_outputs: BaseModelOutputWithDeepstackFeatures | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
@@ -1205,9 +1206,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        precomputed_video_outputs (`BaseModelOutputWithDeepstackFeatures`, *optional*):
+            Precomputed video encoder outputs to use instead of recomputing features from `pixel_values_videos`.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if pixel_values_videos is not None and precomputed_video_outputs is not None:
+            raise ValueError("Specify at most one of pixel_values_videos or precomputed_video_outputs.")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1227,10 +1232,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
-            video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True
-            )
+        video_outputs = precomputed_video_outputs
+        if video_outputs is None and pixel_values_videos is not None:
+            video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+        if video_outputs is not None:
             video_embeds = video_outputs.pooler_output
             deepstack_video_embeds = video_outputs.deepstack_features
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1383,6 +1388,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
+        precomputed_video_outputs: BaseModelOutputWithDeepstackFeatures | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
@@ -1398,6 +1404,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        precomputed_video_outputs (`BaseModelOutputWithDeepstackFeatures`, *optional*):
+            Precomputed video encoder outputs to use instead of recomputing features from `pixel_values_videos`.
 
         Example:
 
@@ -1440,6 +1448,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
+            precomputed_video_outputs=precomputed_video_outputs,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             position_ids=position_ids,
