@@ -1,0 +1,103 @@
+model:
+  # RTC_Flow 内独立的 VLA 条件编码配置
+  # 可改为绝对路径；相对路径按 RTC_Flow 根目录解析
+  vla_config_path: configs/vla_qwen3_rtc.yaml
+  # 必须与 dataset.state_keys 拼接后的维度一致（当前默认 16）
+  state_dim: 16
+  # 仅用于离线上下文预算估算（不是 token 训练）
+  # 建议先保持默认；显存不足时可下调
+  context_budget_tokens: 8
+  # 每个 step 输入给 VLM 的帧数，需与采样逻辑一致
+  num_frames: 6
+  # 上下文 token 预算上限（会影响历史截断）
+  max_context_len: 1e4
+
+rtc_async:
+  # RTC_Flow 内独立的 async 结构配置
+  # 可改为绝对路径；相对路径按 RTC_Flow 根目录解析
+  config_path: configs/rtc_async_vla.yaml
+  # true: 联合训练 VLA；false: 冻结 VLA 仅训练动作专家（推荐先 false）
+  train_vla: false
+  # 是否启用状态映射层，state_dim 不匹配时可开
+  use_state_adapter: false
+  # 是否把 VLM attention_mask 传给动作专家 cross-attn
+  use_attention_mask: true
+  # 每 N 个 batch 做一次采样评估（0 表示关闭）
+  sample_eval_every: 20
+
+dataset:
+  # zarr 根路径（支持绝对/相对路径）
+  # 待填：改成你的 libero90 zarr 实际路径
+  zarr_path: /path/to/libero90.zarr
+  # 键名支持两种布局：{key} 或 data/{key}
+  image_key: agentview_rgb
+  action_key: action
+  prompt_key: prompt
+  # state_keys 会按给定顺序拼接成 state 向量
+  state_keys:
+    - robot0_joint_pos
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+  # null: 自动使用 rtc_async.action_expert.horizon；建议先保持 null
+  chunk_horizon: null
+  # anchor 步长，null 时默认 1；增大可降训练样本量
+  anchor_stride_steps: null
+  # null: 全量 episode；调试时可设 50/100
+  max_episodes: null
+  # 验证集比例，范围 (0,1)
+  val_ratio: 0.1
+
+training:
+  # 全局随机种子
+  seed: 42
+  # 训练轮数
+  num_epochs: 50
+  # 梯度裁剪阈值，null 表示关闭
+  max_grad_norm: 1.0
+  # 原始数据时间步（毫秒），需与数据采样频率一致
+  source_dt_ms: 50
+  # 历史上下文采样步距下限（毫秒）
+  step_dt_min_ms: 200
+  # 历史上下文采样步距上限（毫秒）
+  step_dt_max_ms: 300
+  # 仅用于快速调试；null 表示完整 epoch
+  max_train_batches: null
+
+optimizer:
+  # AdamW 学习率
+  lr: 1.0e-4
+  beta1: 0.9
+  beta2: 0.95
+  # 权重衰减
+  weight_decay: 0.0
+
+dataloader:
+  # 受显存影响最大，OOM 时优先下调
+  batch_size: 6
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  drop_last: false
+
+val_dataloader:
+  # 验证建议与训练 batch_size 保持一致或更小
+  batch_size: 6
+  shuffle: false
+  num_workers: 4
+  pin_memory: true
+  drop_last: false
+
+eval:
+  # 验证阶段 batch 上限；null 表示全量验证集
+  max_val_batches: null
+
+checkpoint:
+  # 每 N 个 epoch 保存一次
+  save_every: 5
+  # 最优模型选择指标（需与 run_epoch 返回键一致）
+  best_monitor: val/rtc_loss
+  # min / max
+  best_mode: min
+  # 待填（可选）：断点恢复路径；null 表示从头训练
+  resume_from: null

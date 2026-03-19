@@ -1,0 +1,39 @@
+mode: rtc_async
+
+stream:
+  # 状态写入最小时间间隔（秒）；0.0 表示每步都可写入
+  state_interval_s: 0.0
+  # 视觉写入最小时间间隔（秒）；0.0 表示每步都可写入
+  vision_interval_s: 0.0
+  # 流式上下文最大长度（token 预算）
+  max_context_len: 10000
+  # 从 VLM 导出 KV 的层索引（需与模型层数匹配）
+  selected_layers: [8, 16, 24]
+
+rtc:
+  # 推理延迟 d：执行 chunk 前缀来自上一轮
+  inference_delay: 2
+  # 执行视野 h：每轮实际下发动作步数
+  execute_horizon: 4
+  # 训练时模拟延迟上限（用于 action inpainting）
+  simulated_delay: 5
+
+action_expert:
+  # 必须与 train_libero90_async.yaml 中 model.state_dim 对齐
+  state_dim: 16
+  # 待核对：必须与数据集 action 维度一致（LIBERO 常见为 7）
+  action_dim: 7
+  # chunk 长度，需与 dataset.chunk_horizon（或其自动推导）一致
+  horizon: 5
+  # 网络宽度，显存不足可尝试降到 384/256
+  hidden_size: 512
+  num_layers: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  time_embed_dim: 256
+  norm_eps: 1.0e-6
+  ffn_multiple_of: 256
+  # null 表示按默认公式推导 FFN 维度
+  ffn_dim_multiplier: null
+  # 扩散采样步数，越大通常越稳但越慢
+  num_inference_steps: 5

@@ -1,0 +1,15 @@
+# RTC_Flow 专用 VLM 条件编码配置（与旧 OAT/token 路径解耦）
+# 待填/待确认：可替换为你的本地模型目录或 HF 可访问模型名
+model_name_or_path: Alibaba-DAMO-Academy/RynnBrain-2B
+# 必须与 train_libero90_async.yaml:model.state_dim 一致
+state_dim: 16
+# null: 自动选择 cuda/cpu；可显式设为 "cuda" 或 "cpu"
+device: null
+
+stream:
+  # 状态写入最小间隔（秒）；0.0 表示不做时间门控
+  state_interval_s: 0.0
+  # 视觉写入最小间隔（秒）；0.0 表示不做时间门控
+  vision_interval_s: 0.0
+  # 流式上下文上限，超出后触发 step 级淘汰
+  max_context_len: 1e4
