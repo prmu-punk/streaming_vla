@@ -103,7 +103,7 @@ RTC_Flow/
 
 - `model.vla_config_path` -> `configs/vla_qwen3_rtc.yaml`
 - `rtc_async.config_path` -> `configs/rtc_async_vla.yaml`
-- `dataset.zarr_path`：必须填写实际 libero90 zarr 路径
+- `dataset.zarr_path`：默认已指向本地 `libero10_N500` zarr 路径；可按需覆盖
 
 VLM 配置：`configs/vla_qwen3_rtc.yaml`
 
@@ -119,33 +119,47 @@ RTC 配置：`configs/rtc_async_vla.yaml`
 
 ---
 
-## 训练样例
+## 训练脚本（CUDA）
 
-在 `Streaming_VLA` 根目录执行：
+推荐在本项目目录执行：
 
 ```bash
-uv run python RTC_Flow/scripts/train_async.py \
+cd /home/luye/data/Streaming_VLA/RTC_Flow
+uv sync --frozen
+```
+
+### 方式 1：包装入口（推荐）
+
+```bash
+cd /home/luye/data/Streaming_VLA
+CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python RTC_Flow/scripts/train_async.py \
   --run-name rtc_flow_exp_v1 \
   --extra \
-    dataset.zarr_path=/abs/path/to/libero90.zarr \
+    dataset.zarr_path=/home/luye/data/Streaming_VLA/RTC_Flow/data/libero/libero10_N500.zarr/libero10_N500.zarr \
     training.num_epochs=10 \
     dataloader.batch_size=4
 ```
 
-等价地，也可直接调用主脚本：
+### 方式 2：直接调用主训练脚本
 
 ```bash
-uv run python RTC_Flow/scripts/train_libero90_async.py \
-  --config-path RTC_Flow/configs \
+cd /home/luye/data/Streaming_VLA/RTC_Flow
+CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python scripts/train_libero90_async.py \
+  --config-path /home/luye/data/Streaming_VLA/RTC_Flow/configs \
   --config-name train_libero90_async \
-  dataset.zarr_path=/abs/path/to/libero90.zarr \
-  hydra.run.dir=/abs/path/to/Streaming_VLA/RTC_Flow/outputs/runs/manual_run
+  dataset.zarr_path=/home/luye/data/Streaming_VLA/RTC_Flow/data/libero/libero10_N500.zarr/libero10_N500.zarr \
+  hydra.run.dir=/home/luye/data/Streaming_VLA/RTC_Flow/outputs/runs/manual_run
 ```
 
-训练输出默认位于：
+说明：
 
-- `RTC_Flow/outputs/runs/<run-name>/`
-- checkpoint 常见位置：`.../checkpoints/best.pt`
+- `CUDA_VISIBLE_DEVICES=0` 指定使用第 0 块 GPU；多卡时可改为 `0,1` 等。
+- `hydra.run.dir` 必须是本机可写的真实绝对路径，不要使用 `/abs/path/...` 这类占位符。
+
+训练输出常见位置：
+
+- `/home/luye/data/Streaming_VLA/RTC_Flow/outputs/runs/<run-name>/`
+- checkpoint：`.../checkpoints/best.pt`
 
 ---
 

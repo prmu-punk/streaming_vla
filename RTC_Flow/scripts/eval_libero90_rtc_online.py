@@ -213,6 +213,7 @@ def main() -> None:
     接口对应:
     - 输入接口: 命令行参数传入 checkpoint、任务名与调度配置。
     - 输出接口: 打印 JSON 指标，支持可选视频落盘。
+    - 默认配置文件中的数据路径已可直接指向本地 libero10_N500。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)

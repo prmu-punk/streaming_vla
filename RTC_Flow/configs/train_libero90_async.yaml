@@ -27,8 +27,8 @@ rtc_async:
 
 dataset:
   # zarr 根路径（支持绝对/相对路径）
-  # 待填：改成你的 libero90 zarr 实际路径
-  zarr_path: /path/to/libero90.zarr
+  # 默认指向本地下载的 libero10_N500 数据集
+  zarr_path: /home/luye/data/Streaming_VLA/RTC_Flow/data/libero/libero10_N500.zarr/libero10_N500.zarr
   # 键名支持两种布局：{key} 或 data/{key}
   image_key: agentview_rgb
   action_key: action
@@ -74,7 +74,7 @@ optimizer:
 
 dataloader:
   # 受显存影响最大，OOM 时优先下调
-  batch_size: 6
+  batch_size: 2
   shuffle: true
   num_workers: 4
   pin_memory: true

@@ -23,7 +23,7 @@ def main() -> None:
         "--config",
         type=str,
         default="RTC_Flow/configs/train_libero90_async.yaml",
-        help="Path to RTC_Flow training config used for eval settings.",
+        help="Path to RTC_Flow training config used for eval settings. Default config points to local libero10_N500 zarr_path.",
     )
     parser.add_argument("--match-rank", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=6)

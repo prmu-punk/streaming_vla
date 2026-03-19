@@ -22,7 +22,7 @@ def main() -> None:
         "--config",
         type=str,
         default="RTC_Flow/configs/train_libero90_async.yaml",
-        help="Path to RTC_Flow training config (relative to Streaming_VLA root or absolute).",
+        help="Path to RTC_Flow training config (relative to Streaming_VLA root or absolute). Default config points to local libero10_N500 zarr_path.",
     )
     parser.add_argument(
         "--run-name",

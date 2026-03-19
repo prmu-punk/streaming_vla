@@ -17,6 +17,7 @@ dependencies = [
   "transformers>=4.46",
   "accelerate>=1.0",
   "einops>=0.8",
+  "torchvision>=0.25.0",
 ]
 
 [tool.uv]

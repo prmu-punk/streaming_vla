@@ -49,8 +49,41 @@ for t in torch._storage_classes:
             del ForkingPickler._extra_reducers[t]
 
 ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
-if ROOT_DIR not in sys.path:
-    sys.path.append(ROOT_DIR)
+if ROOT_DIR in sys.path:
+    sys.path.remove(ROOT_DIR)
+sys.path.insert(0, ROOT_DIR)
+
+
+def _normalize_hydra_cli_config_path(argv: List[str]) -> List[str]:
+    normalized = list(argv)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    root_dir = pathlib.Path(ROOT_DIR).resolve()
+    root_parent = root_dir.parent
+
+    def _resolve_existing_dir(path_text: str) -> str:
+        p = pathlib.Path(path_text)
+        if p.is_absolute() and p.is_dir():
+            return str(p)
+        candidates = [
+            pathlib.Path.cwd() / p,
+            root_dir / p,
+            root_parent / p,
+            script_dir / p,
+        ]
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate.resolve())
+        return path_text
+
+    for i, arg in enumerate(normalized):
+        if arg.startswith("--config-path="):
+            value = arg.split("=", 1)[1]
+            normalized[i] = f"--config-path={_resolve_existing_dir(value)}"
+            return normalized
+        if arg == "--config-path" and i + 1 < len(normalized):
+            normalized[i + 1] = _resolve_existing_dir(normalized[i + 1])
+            return normalized
+    return normalized
 
 from dataset.libero90_async_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
 from model.rtc_async import ActionExpertRunner, ActionExpertRunnerConfig, RTCPipelineState, RTCVLAEntry, rtc_velocity_loss, schedule_rtc_chunk
@@ -746,5 +779,6 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    sys.argv = _normalize_hydra_cli_config_path(sys.argv)
     os.chdir(ROOT_DIR)
     main()

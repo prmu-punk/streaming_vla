@@ -19,7 +19,7 @@ rtc:
   simulated_delay: 5
 
 action_expert:
-  # 必须与 train_libero90_async.yaml 中 model.state_dim 对齐
+  # 必须与训练主配置中的 model.state_dim 对齐
   state_dim: 16
   # 待核对：必须与数据集 action 维度一致（LIBERO 常见为 7）
   action_dim: 7

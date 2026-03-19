@@ -1,7 +1,8 @@
 # RTC_Flow 专用 VLM 条件编码配置（与旧 OAT/token 路径解耦）
-# 待填/待确认：可替换为你的本地模型目录或 HF 可访问模型名
-model_name_or_path: Alibaba-DAMO-Academy/RynnBrain-2B
-# 必须与 train_libero90_async.yaml:model.state_dim 一致
+# RynnBrain-2B 本地路径（运行 scripts/download_rynnbrain2b.py 下载后替换此处）
+# 下载完成后将下方路径改为: /home/luye/data/Streaming_VLA/RTC_Flow/models/RynnBrain-2B
+model_name_or_path: /data/luye/Streaming_VLA/RTC_Flow/models/RynnBrain-2B
+# 必须与训练主配置的 model.state_dim 一致
 state_dim: 16
 # null: 自动选择 cuda/cpu；可显式设为 "cuda" 或 "cpu"
 device: null
