@@ -1,73 +1,199 @@
 # RTC_Flow
 
-`RTC_Flow` 是 `Streaming_VLA` 下的 RTC 全链路独立工程入口，包含：
-- 独立配置：`configs/`
-- 运行脚本：`scripts/`
-- 输出目录：`outputs/`
+`RTC_Flow` 是 `Streaming_VLA` 中用于 **离线训练 + 在线推理** 的 RTC 异步控制子工程。  
+核心思想是将动作生成与 token 解码路径解耦，采用：
 
-该目录默认走 **VLM KV 条件 + 扩散动作头 + RTC 异步调度**，不依赖旧 OAT token 训练接口。
+- VLM 流式上下文编码（Qwen3）
+- 从 VLM 导出 KV-Cache 作为条件
+- 扩散/流匹配动作专家生成动作 chunk
+- RTC 调度器按 `delay/horizon` 异步拼接并执行动作
 
-## 目录结构
+---
+
+## 宏观架构
+
+整体执行链路如下：
+
+1. 视觉帧、状态、任务语言输入到 VLM 编码器；
+2. 从 VLM 的 `past_key_values` 中导出指定层 KV 条件；
+3. `ActionExpertRunner` 在 KV 条件下预测动作 chunk；
+4. `RTCChunkScheduler` 根据 `inference_delay` 与 `execute_horizon` 形成可执行片段；
+5. 在线循环中执行 `execute_chunk`，再滚动进入下一控制周期。
+
+对应模块分层：
+
+- `dataset/`：libero90 数据读取与离线 context 采样
+- `model/vla_qwen3_rtc.py`：离线批量上下文编码与 KV 输出
+- `model/vla_qwen3_rtc_online.py`：在线统一入口 `Qwen3RTCVLAOnlinePipeline`
+- `model/rtc_async/`：动作专家、RTC 训练损失、调度器、stream 适配
+- `scripts/`：训练与评估入口脚本
+- `configs/`：训练/VLM/RTC 三类配置
+
+---
+
+## 文件树
 
 ```text
 RTC_Flow/
-  configs/
-    train_libero90_async.yaml
-    vla_qwen3_rtc.yaml
-    rtc_async_vla.yaml
-  scripts/
-    train_async.py
-    eval_online.py
-    rtc_rollout_utils.py
-  outputs/
-    runs/
-    eval/
+├── configs/
+│   ├── train_libero90_async.yaml      # 训练总配置（数据/优化器/入口路径）
+│   ├── vla_qwen3_rtc.yaml             # VLM 编码器配置（模型路径、stream gate）
+│   └── rtc_async_vla.yaml             # RTC 与动作专家配置（delay/horizon 等）
+├── dataset/
+│   ├── libero90_async_dataset.py
+│   └── libero90_async_offline_context_dataset.py
+├── model/
+│   ├── __init__.py
+│   ├── vla_qwen3_rtc.py
+│   ├── vla_qwen3_rtc_online.py
+│   ├── template_qwen3_vla.py
+│   └── rtc_async/
+│       ├── __init__.py
+│       ├── action_expert/
+│       ├── adapters/
+│       ├── compat/
+│       ├── pipeline/
+│       ├── qwen3_stream/
+│       └── training/
+├── scripts/
+│   ├── train_async.py                  # 训练包装入口
+│   ├── train_libero90_async.py         # 训练主脚本
+│   ├── eval_online.py                  # 评估包装入口
+│   ├── eval_libero90_rtc_online.py     # 在线评估主脚本
+│   └── rtc_rollout_utils.py
+└── outputs/
+    ├── runs/
+    └── eval/
 ```
 
-## 关键配置说明
+---
 
-- `configs/train_libero90_async.yaml`
-  - `model.vla_config_path`: 指向 `configs/vla_qwen3_rtc.yaml`
-  - `rtc_async.config_path`: 指向 `configs/rtc_async_vla.yaml`
-  - `dataset.zarr_path`: 需要改成你的本地 zarr 数据路径
-- `context_budget_tokens`: 仅用于离线上下文预算估算，不是 token 训练长度。
+## 核心接口
 
-## 训练
+### 1) 训练侧接口
+
+- `Qwen3RTCVLAEncoder.forward_offline_context_batch(...)`
+  - 输入：离线样本列表（`context_* / anchor_* / target_chunk`）
+  - 输出：`target_chunk + past_key_values + attention_mask`
+- `export_selected_kv_cache(...)`
+  - 将 VLM 全层 KV 裁剪为 `selected_layers` 对应层
+- `build_rtc_inpainting_batch(...)`
+  - 构造训练期延迟掩码与噪声输入
+- `rtc_velocity_loss(...)`
+  - 在有效后缀位置聚合速度场损失
+- `ActionExpertRunner.forward(...)`
+  - 输入 `noisy_action/state/time/kv_cache`，输出 `pred_u_t`
+
+### 2) 推理侧接口
+
+- `Qwen3RTCVLAOnlinePipeline.reset(prompt)`
+  - 重置在线上下文与调度状态
+- `Qwen3RTCVLAOnlinePipeline.push_observation(frames, state, ts_ms, num_frames)`
+  - 写入当前观测到流式上下文
+- `Qwen3RTCVLAOnlinePipeline.sample_and_schedule(...)`
+  - 采样动作 chunk 并输出 `execute_chunk`
+- `Qwen3RTCVLAOnlinePipeline.set_runtime_schedule_params(...)`
+  - 运行时覆盖 `inference_delay / execute_horizon`
+
+---
+
+## 配置关系
+
+训练主配置：`configs/train_libero90_async.yaml`
+
+- `model.vla_config_path` -> `configs/vla_qwen3_rtc.yaml`
+- `rtc_async.config_path` -> `configs/rtc_async_vla.yaml`
+- `dataset.zarr_path`：必须填写实际 libero90 zarr 路径
+
+VLM 配置：`configs/vla_qwen3_rtc.yaml`
+
+- `model_name_or_path`：本地模型路径或 HF 模型名
+- `stream.state_interval_s / vision_interval_s`：在线流式写入门控间隔
+
+RTC 配置：`configs/rtc_async_vla.yaml`
+
+- `rtc.inference_delay`：推理延迟 `d`
+- `rtc.execute_horizon`：执行窗口 `h`
+- `rtc.simulated_delay`：训练期随机延迟上限
+- `action_expert.*`：动作专家网络结构与采样步数
+
+---
+
+## 训练样例
 
 在 `Streaming_VLA` 根目录执行：
 
 ```bash
-python RTC_Flow/scripts/train_async.py --run-name rtc_flow_exp \
-  --extra dataset.zarr_path=/abs/path/to/libero90.zarr training.num_epochs=10
+uv run python RTC_Flow/scripts/train_async.py \
+  --run-name rtc_flow_exp_v1 \
+  --extra \
+    dataset.zarr_path=/abs/path/to/libero90.zarr \
+    training.num_epochs=10 \
+    dataloader.batch_size=4
 ```
 
-输出默认写入：
-- `RTC_Flow/outputs/runs/<run-name>/`
-
-## 在线评估
+等价地，也可直接调用主脚本：
 
 ```bash
-python RTC_Flow/scripts/eval_online.py \
+uv run python RTC_Flow/scripts/train_libero90_async.py \
+  --config-path RTC_Flow/configs \
+  --config-name train_libero90_async \
+  dataset.zarr_path=/abs/path/to/libero90.zarr \
+  hydra.run.dir=/abs/path/to/Streaming_VLA/RTC_Flow/outputs/runs/manual_run
+```
+
+训练输出默认位于：
+
+- `RTC_Flow/outputs/runs/<run-name>/`
+- checkpoint 常见位置：`.../checkpoints/best.pt`
+
+---
+
+## 在线测试样例
+
+包装入口：
+
+```bash
+uv run python RTC_Flow/scripts/eval_online.py \
   --checkpoint /abs/path/to/checkpoints/best.pt \
   --task libero_spatial_task_name \
   --config RTC_Flow/configs/train_libero90_async.yaml \
-  --inference-delay 2 --execute-horizon 4 --save-video
+  --match-rank 0 \
+  --num-frames 6 \
+  --max-control-cycles 120 \
+  --inference-delay 2 \
+  --execute-horizon 4 \
+  --save-video
+```
 
-也可直接运行子项目主入口：
+直接主脚本：
 
 ```bash
-python RTC_Flow/scripts/train_libero90_async.py --config-path RTC_Flow/configs --config-name train_libero90_async
-python RTC_Flow/scripts/eval_libero90_rtc_online.py --checkpoint /abs/path/to/best.pt --task <task_name> --config RTC_Flow/configs/train_libero90_async.yaml
+uv run python RTC_Flow/scripts/eval_libero90_rtc_online.py \
+  --checkpoint /abs/path/to/checkpoints/best.pt \
+  --config RTC_Flow/configs/train_libero90_async.yaml \
+  --task libero_spatial_task_name \
+  --match-rank 0 \
+  --num-frames 6 \
+  --max-control-cycles 120 \
+  --inference-delay 2 \
+  --execute-horizon 4 \
+  --save-video
 ```
+
+评估脚本会输出 JSON 指标（success、total_env_steps、配置回显等），启用 `--save-video` 时会写入视频文件。
+
+---
+
+## 依赖与运行环境
+
+请使用 `uv` 管理环境与依赖（项目已提供 `pyproject.toml`、`uv.lock`、`.python-version`）：
+
+```bash
+cd /home/luye/data/Streaming_VLA/RTC_Flow
+uv sync --frozen
 ```
 
-## 依赖
+若你在 `Streaming_VLA` 根目录执行脚本，直接使用 `uv run` 即可自动使用该环境。
 
-请确保环境具备：
-- `hydra-core`
-- `omegaconf`
-- `wandb`
-- `imageio`
-- `zarr`
-
-并使用当前项目的 Python 环境运行。
+默认关键依赖由锁文件统一管理（例如 `torch`、`hydra-core`、`omegaconf`、`wandb`、`imageio`、`zarr`、`numpy`）。
