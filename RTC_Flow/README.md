@@ -35,35 +35,46 @@
 
 ```text
 RTC_Flow/
+├── __init__.py
+├── .python-version                     # Python 版本声明（uv 使用）
+├── pyproject.toml                      # RTC_Flow 子项目依赖定义
+├── uv.lock                             # 依赖锁文件
+├── README.md
 ├── configs/
-│   ├── train_libero90_async.yaml      # 训练总配置（数据/优化器/入口路径）
-│   ├── vla_qwen3_rtc.yaml             # VLM 编码器配置（模型路径、stream gate）
-│   └── rtc_async_vla.yaml             # RTC 与动作专家配置（delay/horizon 等）
+│   ├── train_libero90_async.yaml       # 训练总配置（数据/优化器/入口路径）
+│   ├── vla_qwen3_rtc.yaml              # VLM 编码器配置（模型路径、stream gate）
+│   └── rtc_async_vla.yaml              # RTC 与动作专家配置（delay/horizon 等）
 ├── dataset/
-│   ├── libero90_async_dataset.py
-│   └── libero90_async_offline_context_dataset.py
+│   ├── __init__.py
+│   ├── libero90_async_dataset.py       # 基础 episode 数据读取
+│   └── libero90_async_offline_context_dataset.py  # 训练样本构造（context/anchor/target）
 ├── model/
 │   ├── __init__.py
-│   ├── vla_qwen3_rtc.py
-│   ├── vla_qwen3_rtc_online.py
 │   ├── template_qwen3_vla.py
+│   ├── vla_qwen3_rtc.py                # 训练侧 VLM 编码器（离线上下文 -> KV）
+│   ├── vla_qwen3_rtc_online.py         # 在线推理管线入口
+│   ├── qwen3_vl/                       # 本地化 Qwen3-VL 组件（配置/处理/stream runner）
 │   └── rtc_async/
 │       ├── __init__.py
-│       ├── action_expert/
-│       ├── adapters/
-│       ├── compat/
-│       ├── pipeline/
-│       ├── qwen3_stream/
-│       └── training/
+│       ├── README.md
+│       ├── action_expert/              # 动作专家网络、采样与 runner
+│       ├── adapters/                   # 状态/形状协议适配
+│       ├── compat/                     # 兼容层统一入口（RTCVLAEntry）
+│       ├── online/                     # 在线侧聚合导出
+│       ├── pipeline/                   # 调度队列、拼接与滚动逻辑
+│       ├── qwen3_stream/               # KV 导出与 stream snapshot
+│       └── training/                   # RTC 训练批构造与损失
 ├── scripts/
+│   ├── __init__.py
 │   ├── train_async.py                  # 训练包装入口
 │   ├── train_libero90_async.py         # 训练主脚本
 │   ├── eval_online.py                  # 评估包装入口
 │   ├── eval_libero90_rtc_online.py     # 在线评估主脚本
-│   └── rtc_rollout_utils.py
-└── outputs/
-    ├── runs/
-    └── eval/
+│   ├── rtc_rollout_utils.py            # rollout 公共工具
+│   └── smoke_test_full.py              # 端到端冒烟测试
+├── workspace/
+│   ├── train_libero90_async.py         # 历史/实验工作区脚本
+│   └── eval_libero90_rtc_online.py
 ```
 
 ---
@@ -121,10 +132,9 @@ RTC 配置：`configs/rtc_async_vla.yaml`
 
 ## 训练脚本（CUDA）
 
-推荐在本项目目录执行：
+推荐在本项目目录执行，注意对应脚本和数据集路径的修改：
 
 ```bash
-cd /home/luye/data/Streaming_VLA/RTC_Flow
 uv sync --frozen
 ```
 
