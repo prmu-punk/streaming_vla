@@ -18,6 +18,7 @@ class ActionExpertConfig:
     state_dim: int
     action_dim: int
     horizon: int
+    cond_dim: int
     hidden_size: int = 512
     num_layers: int = 8
     num_heads: int = 8
@@ -237,11 +238,12 @@ class ActionExpertBackbone(nn.Module):
         super().__init__()
         self.config = config
         self.action_in = nn.Linear(config.action_dim, config.hidden_size)
-        self.state_in = nn.Linear(config.state_dim, config.hidden_size)
         self.state_global_in = nn.Linear(config.state_dim, config.hidden_size)
         self.time_embed = TimestepEmbedder(config.hidden_size, freq_size=config.time_embed_dim)
-        self.k_proj = nn.LazyLinear(config.hidden_size)
-        self.v_proj = nn.LazyLinear(config.hidden_size)
+        self.prompt_k_proj = nn.Linear(config.cond_dim, config.hidden_size)
+        self.prompt_v_proj = nn.Linear(config.cond_dim, config.hidden_size)
+        self.step_k_proj = nn.Linear(config.cond_dim, config.hidden_size)
+        self.step_v_proj = nn.Linear(config.cond_dim, config.hidden_size)
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -301,7 +303,10 @@ class ActionExpertBackbone(nn.Module):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        attention_mask: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
+        step_mask: Optional[torch.Tensor] = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """将层级 KV 条件投影到动作主干 hidden 空间。
 
         参数:
@@ -315,7 +320,7 @@ class ActionExpertBackbone(nn.Module):
         """
         if not kv_cache:
             return []
-        layer_conds: list[tuple[torch.Tensor, torch.Tensor]] = []
+        layer_conds: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for k, v in kv_cache:
             if k.shape[0] != batch_size or v.shape[0] != batch_size:
                 raise ValueError(
@@ -323,7 +328,40 @@ class ActionExpertBackbone(nn.Module):
                 )
             k_tokens = self._kv_to_tokens(k.to(device=device, dtype=dtype))
             v_tokens = self._kv_to_tokens(v.to(device=device, dtype=dtype))
-            layer_conds.append((self.k_proj(k_tokens), self.v_proj(v_tokens)))
+            kv_len = int(k_tokens.shape[1])
+            valid_mask = self._align_condition_mask(
+                mask=attention_mask,
+                kv_len=kv_len,
+                device=device,
+                default=True,
+            )
+            prompt_valid = self._align_condition_mask(
+                mask=prompt_mask,
+                kv_len=kv_len,
+                device=device,
+                default=False,
+            )
+            step_valid = self._align_condition_mask(
+                mask=step_mask,
+                kv_len=kv_len,
+                device=device,
+                default=False,
+            )
+            if prompt_mask is not None or step_mask is not None:
+                cond_mask = valid_mask & (prompt_valid | step_valid)
+                k_proj = (
+                    self.prompt_k_proj(k_tokens) * prompt_valid.unsqueeze(-1).to(dtype)
+                    + self.step_k_proj(k_tokens) * step_valid.unsqueeze(-1).to(dtype)
+                )
+                v_proj = (
+                    self.prompt_v_proj(v_tokens) * prompt_valid.unsqueeze(-1).to(dtype)
+                    + self.step_v_proj(v_tokens) * step_valid.unsqueeze(-1).to(dtype)
+                )
+            else:
+                cond_mask = valid_mask
+                k_proj = self.prompt_k_proj(k_tokens)
+                v_proj = self.prompt_v_proj(v_tokens)
+            layer_conds.append((k_proj, v_proj, cond_mask))
         return layer_conds
 
     def forward(
@@ -334,6 +372,8 @@ class ActionExpertBackbone(nn.Module):
         time: torch.Tensor,
         kv_cache: KVCache | None = None,
         attention_mask: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
+        step_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         预测扩散速度场 u_t。
@@ -357,7 +397,7 @@ class ActionExpertBackbone(nn.Module):
                 f"attention_mask batch mismatch: got {attention_mask.shape[0]}, expected {batch_size}"
             )
 
-        x = self.action_in(noisy_action) + self.state_in(state)
+        x = self.action_in(noisy_action)
         time_cond = self.time_embed(time[:, 0])
         state_cond = self.state_global_in(state.mean(dim=1))
         ada_cond = torch.cat([time_cond, state_cond], dim=-1)
@@ -367,19 +407,15 @@ class ActionExpertBackbone(nn.Module):
             batch_size=batch_size,
             device=noisy_action.device,
             dtype=noisy_action.dtype,
+            attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
         )
 
         for i, block in enumerate(self.blocks):
             if kv_layer_conds:
-                ck, cv = kv_layer_conds[i % len(kv_layer_conds)]
-                if attention_mask is not None:
-                    key_padding_mask = self._align_key_padding_mask(
-                        attention_mask=attention_mask,
-                        kv_len=ck.shape[1],
-                        device=ck.device,
-                    )
-                else:
-                    key_padding_mask = None
+                ck, cv, cond_mask = kv_layer_conds[i % len(kv_layer_conds)]
+                key_padding_mask = ~cond_mask
             else:
                 ck = None
                 cv = None
@@ -397,15 +433,17 @@ class ActionExpertBackbone(nn.Module):
         return self.out_proj(x)
 
     @staticmethod
-    def _align_key_padding_mask(
+    def _align_condition_mask(
         *,
-        attention_mask: torch.Tensor,
+        mask: Optional[torch.Tensor],
         kv_len: int,
         device: torch.device,
+        default: bool,
     ) -> torch.Tensor:
-        """将上游 1=有效 的 attention_mask 对齐为 MHA 的 key_padding_mask（True=忽略）。"""
+        if mask is None:
+            return torch.full((1, kv_len), bool(default), device=device, dtype=torch.bool)
 
-        valid_mask = attention_mask.to(device=device)
+        valid_mask = mask.to(device=device)
         if valid_mask.dtype != torch.bool:
             valid_mask = valid_mask > 0
 
@@ -413,7 +451,7 @@ class ActionExpertBackbone(nn.Module):
         if seq_len > kv_len:
             valid_mask = valid_mask[:, -kv_len:]
         elif seq_len < kv_len:
-            pad = torch.ones((valid_mask.shape[0], kv_len - seq_len), device=device, dtype=torch.bool)
+            pad_value = bool(default)
+            pad = torch.full((valid_mask.shape[0], kv_len - seq_len), pad_value, device=device, dtype=torch.bool)
             valid_mask = torch.cat([pad, valid_mask], dim=1)
-
-        return ~valid_mask
+        return valid_mask

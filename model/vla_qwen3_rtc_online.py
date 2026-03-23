@@ -12,14 +12,14 @@ from model.rtc_async.action_expert.runner import ActionExpertRunner, ActionExper
 from model.rtc_async.pipeline.scheduler import RTCChunkScheduler
 from model.rtc_async.qwen3_stream.kv_export import export_selected_kv_cache
 from model.rtc_async.qwen3_stream.stream_runner_snapshot import Qwen3VLStreamRunnerSnapshot
+from normalization import RTCNormalizer
 
-from .template_qwen3_vla import build_prompt_prefill_text
+from .template_qwen3_vla import build_prompt_prefill_text, build_step_assistant_prefix
 from .vla_qwen3_rtc import Qwen3RTCVLAEncoder
 
 
 @dataclass
 class RTCOnlineResolvedConfig:
-    state_interval_s: float
     vision_interval_s: float
     max_context_len: int | None
     selected_layers: list[int]
@@ -49,7 +49,6 @@ def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
         raise ValueError("rtc_async.stream.selected_layers must be non-empty for online pipeline.")
 
     return RTCOnlineResolvedConfig(
-        state_interval_s=float(stream.get("state_interval_s", 0.0)),
         vision_interval_s=float(stream.get("vision_interval_s", 0.0)),
         max_context_len=(None if stream.get("max_context_len", None) is None else int(float(stream["max_context_len"]))),
         selected_layers=selected_layers,
@@ -99,12 +98,11 @@ class Qwen3RTCVLAOnlinePipeline:
             self.encoder.device = runtime_device
             model_obj = cast(Any, self.encoder.model)
             model_obj.to(runtime_device)
-            self.encoder.state_encoder.to(runtime_device)
 
         self.rtc_cfg = _load_rtc_async_runtime_config(rtc_config_path)
 
         action_cfg = dict(self.rtc_cfg.action_expert)
-        state_dim = int(action_cfg.get("state_dim", self.encoder.state_encoder[0].in_features))
+        state_dim = int(self.encoder.state_dim)
         action_dim = int(action_cfg["action_dim"])
         horizon = int(action_cfg["horizon"])
 
@@ -112,6 +110,7 @@ class Qwen3RTCVLAOnlinePipeline:
             state_dim=state_dim,
             action_dim=action_dim,
             horizon=horizon,
+            cond_dim=int(self.encoder.kv_cache_dim),
             hidden_size=int(action_cfg.get("hidden_size", 512)),
             num_layers=int(action_cfg.get("num_layers", 8)),
             num_heads=int(action_cfg.get("num_heads", 8)),
@@ -134,14 +133,12 @@ class Qwen3RTCVLAOnlinePipeline:
 
         self.inference_delay = int(self.rtc_cfg.inference_delay)
         self.execute_horizon = int(self.rtc_cfg.execute_horizon)
+        self.normalizer: RTCNormalizer | None = None
 
         tokenizer = cast(Any, self.encoder.processor).tokenizer
         self.runner = Qwen3VLStreamRunnerSnapshot(
             model=self.encoder.model,
-            state_interval_s=self.rtc_cfg.state_interval_s,
             vision_interval_s=self.rtc_cfg.vision_interval_s,
-            state_encoder=self.encoder.state_encoder,
-            state_token_id=self.encoder.state_placeholder_token_id,
             max_context_len=self.rtc_cfg.max_context_len,
             use_step_eviction=True,
             tokenizer=tokenizer,
@@ -174,6 +171,9 @@ class Qwen3RTCVLAOnlinePipeline:
         payload = torch.load(checkpoint_path, map_location=self.device)
         state_dict = payload.get("action_expert", payload)
         self.action_expert.load_state_dict(state_dict, strict=strict)
+        normalization_payload = payload.get("normalization", None)
+        if normalization_payload is not None:
+            self.normalizer = RTCNormalizer.from_payload(normalization_payload)
         self.action_expert.eval()
 
     def reset(self, prompt: Optional[str] = None) -> None:
@@ -223,15 +223,14 @@ class Qwen3RTCVLAOnlinePipeline:
         """
         video = self.encoder._make_video_tensor(frames, num_frames)
         aux_video = self.encoder._make_video_tensor(aux_frames, 1) if aux_frames is not None else None
-        state_tokens = state.to(self.device)
-        if state_tokens.dim() == 1:
-            state_tokens = state_tokens.unsqueeze(0)
-        self._latest_state = state_tokens
+        latest_state = state.to(self.device)
+        if latest_state.dim() == 1:
+            latest_state = latest_state.unsqueeze(0)
+        self._latest_state = latest_state
         return self.runner.insert_step(
             processor=self.encoder.processor,
             video=video,
             aux_video=aux_video,
-            state_tokens=state_tokens,
             ts=str(ts_ms) if ts_ms is not None else None,
         )
 
@@ -268,14 +267,43 @@ class Qwen3RTCVLAOnlinePipeline:
             clone=False,
         )
         attention_mask = self.runner.state.attention_mask
+        prompt_mask = None
+        step_mask = None
+        if attention_mask is not None:
+            prompt_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+            step_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+            prompt_mask[:, : self.runner.prefill_len] = True
+            if self.runner.step_spans:
+                step_start, step_end = self.runner.step_spans[-1]
+                tokenizer = cast(Any, self.encoder.processor).tokenizer
+                assistant_len = int(
+                    len(
+                        tokenizer(
+                            build_step_assistant_prefix(),
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                            return_token_type_ids=False,
+                        )["input_ids"]
+                    )
+                )
+                step_end = max(step_start, step_end - assistant_len)
+                step_mask[:, step_start:step_end] = True
+
+        sample_state = self._latest_state
+        if self.normalizer is not None:
+            sample_state = self.normalizer.normalize_state(sample_state)
 
         sampled_chunk = self.action_expert.sample(
-            state=self._latest_state,
+            state=sample_state,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
             kv_cache_key=kv_cache_key,
             generator=generator,
         )
+        if self.normalizer is not None:
+            sampled_chunk = self.normalizer.unnormalize_action(sampled_chunk)
 
         step_id = self._next_step_id
         self._next_step_id += 1

@@ -39,7 +39,7 @@ def main() -> None:
 
     command = [
         sys.executable,
-        str(repo_root / "scripts" / "train_libero90_async.py"),
+        str(repo_root / "workspace" / "train_libero90_async.py"),
         f"--config-path={repo_root / 'configs'}",
         "--config-name=train_libero90_async",
         f"hydra.run.dir={run_dir}",

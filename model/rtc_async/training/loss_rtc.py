@@ -16,26 +16,21 @@ class RTCInpaintingBatch:
     time: torch.Tensor
 
 
-def _sample_delay(
+def _sample_time(
     *,
     batch_size: int,
-    simulated_delay: int,
     device: torch.device,
+    dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """按指数衰减分布采样每个样本的 simulated delay。"""
-
-    if simulated_delay <= 0:
-        return torch.zeros((batch_size,), device=device, dtype=torch.long)
-    weights = torch.exp(torch.arange(simulated_delay, 0, -1, device=device, dtype=torch.float32))
-    weights = weights / weights.sum()
-    return torch.multinomial(weights, num_samples=batch_size, replacement=True, generator=generator)
+    z = torch.randn((batch_size,), device=device, dtype=dtype, generator=generator)
+    return torch.sigmoid(z)
 
 
 def build_rtc_inpainting_batch(
     *,
     action: torch.Tensor,
-    simulated_delay: int | None,
+    delay: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> RTCInpaintingBatch:
     """构造训练时 action inpainting 批次，前缀强制已知、后缀参与学习。"""
@@ -47,34 +42,27 @@ def build_rtc_inpainting_batch(
     dtype = action.dtype
 
     noise = torch.randn(action.shape, device=device, dtype=dtype, generator=generator)
-    time = torch.rand((batch_size,), device=device, dtype=dtype, generator=generator)
-    u_t = action - noise
-
-    if simulated_delay is None or simulated_delay <= 0:
-        time_chunk = time[:, None, None]
-        x_t = (1 - time_chunk) * noise + time_chunk * action
-        loss_mask = torch.ones((batch_size, horizon), device=device, dtype=torch.bool)
-        delay = torch.zeros((batch_size,), device=device, dtype=torch.long)
-        return RTCInpaintingBatch(
-            x_t=x_t,
-            u_t=u_t,
-            loss_mask=loss_mask,
-            delay=delay,
-            time=time,
-        )
-
-    delay = _sample_delay(
+    base_time = _sample_time(
         batch_size=batch_size,
-        simulated_delay=simulated_delay,
         device=device,
+        dtype=dtype,
         generator=generator,
     )
+    u_t = action - noise
+
+    if delay is None:
+        delay = torch.zeros((batch_size,), device=device, dtype=torch.long)
+    else:
+        delay = delay.to(device=device, dtype=torch.long)
+    if delay.shape != (batch_size,):
+        raise ValueError(f"delay must be [B], got {tuple(delay.shape)}")
+    delay = delay.clamp(min=0, max=max(horizon - 1, 0))
+
     pos = torch.arange(horizon, device=device)[None, :]
     prefix_mask = pos < delay[:, None]
-
-    time_expanded = time[:, None].expand(batch_size, horizon)
-    time_expanded = torch.where(prefix_mask, torch.ones_like(time_expanded), time_expanded)
-    x_t = (1 - time_expanded[:, :, None]) * noise + time_expanded[:, :, None] * action
+    time = base_time[:, None].expand(batch_size, horizon)
+    time = torch.where(prefix_mask, torch.ones_like(time), time)
+    x_t = (1 - time[:, :, None]) * noise + time[:, :, None] * action
     loss_mask = ~prefix_mask
 
     return RTCInpaintingBatch(

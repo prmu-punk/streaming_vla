@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
+import json
+import pathlib
 from typing import Any, Dict, List, Sequence
 
 import numpy as np
@@ -31,7 +34,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
     async 训练专用离线 context dataset（OAT 解耦版）。
 
     说明：
-    - 不依赖 OAT ReplayBuffer；直接读取 zarr。
     - 样本规划与 bucket 组织已对齐主干，但上下文中不包含 action token。
     """
 
@@ -60,7 +62,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         max_episodes: int | None = None,
         episode_indices: Sequence[int] | None = None,
         processor: Any,
-        state_placeholder_token: str = "<state_token>",
     ) -> None:
         """构建离线 context 采样数据集，用于 rtc_async 训练。
 
@@ -81,8 +82,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             max_episodes: 可选 episode 数量上限。
             episode_indices: 可选子集 episode 索引。
             processor: 用于真实估算多模态输入 token 长度的 processor。
-            state_placeholder_token: 状态占位 special token。
-
         接口对应:
             `__getitem__` 产出的 `context_* / anchor_* / target_chunk`
             直接对应 `Qwen3RTCVLAEncoder.forward_offline_context_batch` 输入契约。
@@ -132,7 +131,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         self.aux_image_key = aux_image_key
         self.state_dim = self.base.state_dim
         self.action_dim = self.base.action_dim
-        self._state_placeholder_token = str(state_placeholder_token)
 
         if episode_indices is None:
             episode_indices = list(range(len(self.base)))
@@ -142,24 +140,31 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
 
         self._planning_processor = processor
         self._prompt_length_cache: Dict[int, int] = {}
-        self._step_length_cache: Dict[tuple[int, int, bool], int] = {}
+        self._step_length_cache: Dict[int, int] = {}
         self._episode_cache: OrderedDict[int, Dict[str, Any]] = OrderedDict()
+        self._action_mean: torch.Tensor | None = None
+        self._action_std: torch.Tensor | None = None
+        self._state_mean: torch.Tensor | None = None
+        self._state_std: torch.Tensor | None = None
+        self._plan_cache_path = self._build_plan_cache_path(
+            zarr_path=zarr_path,
+            episode_indices=episode_indices,
+        )
 
-        if self._state_placeholder_token not in self._planning_processor.tokenizer.get_vocab():
-            self._planning_processor.tokenizer.add_special_tokens(
-                {"additional_special_tokens": [self._state_placeholder_token]}
-            )
-
-        for ep_idx in episode_indices:
-            ep = self._get_episode(int(ep_idx))
-            t_len = int(ep["actions"].shape[0])
-            anchor_end = t_len - self.chunk_horizon + 1
-            if anchor_end <= 0:
-                continue
-            for anchor_t in range(0, anchor_end, self.anchor_stride_steps):
-                meta = AnchorMeta(episode_idx=int(ep_idx), anchor_t=int(anchor_t))
-                self._anchors.append(meta)
-                self._plans.append(self._build_sample_plan(meta))
+        if self._plan_cache_path.exists():
+            self._load_plans_from_cache()
+        else:
+            for ep_idx in episode_indices:
+                ep = self._get_episode(int(ep_idx))
+                t_len = int(ep["actions"].shape[0])
+                anchor_end = t_len - self.chunk_horizon + 1
+                if anchor_end <= 0:
+                    continue
+                for anchor_t in range(0, anchor_end, self.anchor_stride_steps):
+                    meta = AnchorMeta(episode_idx=int(ep_idx), anchor_t=int(anchor_t))
+                    self._anchors.append(meta)
+                    self._plans.append(self._build_sample_plan(meta))
+            self._save_plans_to_cache()
 
         if not self._anchors:
             raise ValueError("No valid anchor samples produced. Check dataset settings.")
@@ -182,10 +187,76 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             idx for idx, plan in enumerate(self._plans) if int(plan.episode_idx) in keep
         ]
 
+    def set_normalization_stats(
+        self,
+        *,
+        action_mean: torch.Tensor,
+        action_std: torch.Tensor,
+        state_mean: torch.Tensor,
+        state_std: torch.Tensor,
+    ) -> None:
+        self._action_mean = action_mean.detach().float().cpu()
+        self._action_std = action_std.detach().float().cpu()
+        self._state_mean = state_mean.detach().float().cpu()
+        self._state_std = state_std.detach().float().cpu()
+
     def _make_rng(self, episode_idx: int, anchor_t: int) -> np.random.Generator:
         """为指定 episode-anchor 对生成可复现随机数源。"""
         seed = int((episode_idx + 1) * 1_000_003 + anchor_t * 97 + self.source_dt_ms * 17)
         return np.random.default_rng(seed)
+
+    def _build_plan_cache_path(
+        self,
+        *,
+        zarr_path: str,
+        episode_indices: Sequence[int],
+    ) -> pathlib.Path:
+        cache_dir = pathlib.Path(__file__).resolve().parents[1] / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = {
+            "zarr_path": str(zarr_path),
+            "source_dt_ms": self.source_dt_ms,
+            "step_dt_min_ms": self.step_dt_min_ms,
+            "step_dt_max_ms": self.step_dt_max_ms,
+            "num_frames": self.num_frames,
+            "chunk_horizon": self.chunk_horizon,
+            "anchor_stride_steps": self.anchor_stride_steps,
+            "max_context_len": self.max_context_len,
+            "episode_indices": [int(x) for x in episode_indices],
+        }
+        digest = hashlib.sha1(json.dumps(cache_key, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return cache_dir / f"libero_async_plan_{digest}.pt"
+
+    def _load_plans_from_cache(self) -> None:
+        payload = torch.load(self._plan_cache_path, map_location="cpu")
+        self._anchors = [AnchorMeta(**item) for item in payload["anchors"]]
+        self._plans = [
+            SamplePlan(
+                episode_idx=int(item["episode_idx"]),
+                anchor_t=int(item["anchor_t"]),
+                history_t=tuple(int(x) for x in item["history_t"]),
+                sample_length=int(item["sample_length"]),
+            )
+            for item in payload["plans"]
+        ]
+
+    def _save_plans_to_cache(self) -> None:
+        payload = {
+            "anchors": [
+                {"episode_idx": int(meta.episode_idx), "anchor_t": int(meta.anchor_t)}
+                for meta in self._anchors
+            ],
+            "plans": [
+                {
+                    "episode_idx": int(plan.episode_idx),
+                    "anchor_t": int(plan.anchor_t),
+                    "history_t": [int(x) for x in plan.history_t],
+                    "sample_length": int(plan.sample_length),
+                }
+                for plan in self._plans
+            ],
+        }
+        torch.save(payload, self._plan_cache_path)
 
     def _get_episode(self, episode_idx: int) -> Dict[str, Any]:
         cached = self._episode_cache.get(int(episode_idx), None)
@@ -227,8 +298,8 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
                 video_token=build_video_text(video_token=video_token, has_aux=has_aux),
                 close_previous_assistant=False,
             )
-            + self._state_placeholder_token
-            + f"</state>{IM_END}\n"
+            + IM_END
+            + "\n"
         )
 
     def _make_video_tensor(self, frames: np.ndarray | torch.Tensor, num_frames: int | None = None) -> torch.Tensor:
@@ -264,18 +335,17 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         self._prompt_length_cache[int(episode_idx)] = prompt_len
         return prompt_len
 
-    def _step_length(self, *, episode_idx: int, t_idx: int) -> int:
+    def _step_length(self, *, episode_idx: int) -> int:
+        cached = self._step_length_cache.get(int(episode_idx), None)
+        if cached is not None:
+            return int(cached)
+
         ep = self._get_episode(int(episode_idx))
         aux_images = ep.get("extra_images", {})
         aux_stack = aux_images.get(self.aux_image_key, None) if self.aux_image_key is not None else None
         has_aux = aux_stack is not None
-
-        key = (int(episode_idx), int(t_idx), bool(has_aux))
-        cached = self._step_length_cache.get(key, None)
-        if cached is not None:
-            return int(cached)
-
         images = ep["images"]
+        t_idx = max(0, int(images.shape[0] // 2))
         ts_ms = int(t_idx) * int(self.source_dt_ms)
         step_text = self._build_step_text(
             ts_ms=ts_ms,
@@ -294,30 +364,20 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             add_special_tokens=False,
         )
         step_len = int(proc["input_ids"].shape[1])
-        self._step_length_cache[key] = step_len
+        self._step_length_cache[int(episode_idx)] = step_len
         return step_len
 
     def _build_sample_plan(self, meta: AnchorMeta) -> SamplePlan:
         full_history_t = self._history_step_times(anchor_t=int(meta.anchor_t), episode_idx=int(meta.episode_idx))
         prompt_len = self._prompt_length(int(meta.episode_idx))
-        anchor_len = self._step_length(
-            episode_idx=int(meta.episode_idx),
-            t_idx=int(meta.anchor_t),
-        )
+        step_len = self._step_length(episode_idx=int(meta.episode_idx))
+        base_len = prompt_len + step_len
+        available_len = max(self.max_context_len - base_len, 0)
+        max_history_steps = available_len // max(step_len, 1)
+        kept = full_history_t[-max_history_steps:] if max_history_steps > 0 else []
+        total_len = base_len + len(kept) * step_len
 
-        kept_rev: List[int] = []
-        total_len = prompt_len + anchor_len
-        for t_idx in reversed(full_history_t):
-            candidate_len = total_len + self._step_length(
-                episode_idx=int(meta.episode_idx),
-                t_idx=int(t_idx),
-            )
-            if candidate_len > self.max_context_len:
-                break
-            kept_rev.append(int(t_idx))
-            total_len = int(candidate_len)
-
-        history_t = tuple(int(t) for t in reversed(kept_rev))
+        history_t = tuple(int(t) for t in kept)
         return SamplePlan(
             episode_idx=int(meta.episode_idx),
             anchor_t=int(meta.anchor_t),
@@ -356,31 +416,17 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
                 context_aux_videos.append(aux_stack[int(t_idx)].unsqueeze(0))
         if context_videos:
             context_videos_t = torch.stack(context_videos, dim=0)
-            context_states_t = states[torch.as_tensor(history_t, dtype=torch.long)]
         else:
             context_videos_t = torch.empty(
                 (0, self.num_frames, *images.shape[1:]),
                 dtype=images.dtype,
             )
-            context_states_t = torch.empty((0, states.shape[-1]), dtype=states.dtype)
         if context_aux_videos:
             context_aux_videos_t = torch.stack(context_aux_videos, dim=0)
         else:
             context_aux_videos_t = torch.empty(
                 (0, 1, *images.shape[1:]),
                 dtype=images.dtype,
-            )
-
-        history_chunks: List[torch.Tensor] = []
-        for t_idx in history_t:
-            chunk_ids = list(range(int(t_idx), int(t_idx) + self.chunk_horizon))
-            history_chunks.append(actions[torch.as_tensor(chunk_ids, dtype=torch.long)])
-        if history_chunks:
-            context_action_chunks_t = torch.stack(history_chunks, dim=0)
-        else:
-            context_action_chunks_t = torch.empty(
-                (0, self.chunk_horizon, actions.shape[-1]),
-                dtype=actions.dtype,
             )
 
         anchor_frame_ids = self._video_window_indices(anchor_t)
@@ -394,19 +440,21 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         target_t = list(range(anchor_t, anchor_t + self.chunk_horizon))
         target_chunk = actions[torch.as_tensor(target_t, dtype=torch.long)]
 
+        if self._state_mean is not None and self._state_std is not None:
+            anchor_state = (anchor_state - self._state_mean) / self._state_std
+        if self._action_mean is not None and self._action_std is not None:
+            target_chunk = (target_chunk - self._action_mean) / self._action_std
+
         return {
             "prompt": ep["prompt"],
             "context_videos": context_videos_t,
             "context_aux_videos": context_aux_videos_t,
-            "context_states": context_states_t,
-            "context_action_chunks": context_action_chunks_t,
             "context_time_indices": torch.tensor(history_t, dtype=torch.long),
             "anchor_video": anchor_video,
             "anchor_aux_video": anchor_aux_video,
             "anchor_state": anchor_state,
             "anchor_time_idx": torch.tensor(anchor_t, dtype=torch.long),
             "target_chunk": target_chunk,
-            "target_time_indices": torch.tensor(target_t, dtype=torch.long),
             "episode_idx": torch.tensor(plan.episode_idx, dtype=torch.long),
         }
 

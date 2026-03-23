@@ -26,7 +26,7 @@
 - `model/vla_qwen3_rtc.py`：离线批量上下文编码与 KV 输出
 - `model/vla_qwen3_rtc_online.py`：在线统一入口 `Qwen3RTCVLAOnlinePipeline`
 - `model/rtc_async/`：动作专家、RTC 训练损失、调度器、stream 适配
-- `scripts/`：训练与评估入口脚本
+- `workspace/`：训练、评估与便捷启动入口
 - `configs/`：训练/VLM/RTC 三类配置
 
 ---
@@ -61,16 +61,12 @@ Streaming_VLA/
 │       ├── pipeline/                   # RTC 调度逻辑
 │       ├── qwen3_stream/               # KV 导出与 stream snapshot
 │       └── training/                   # RTC 训练批构造与损失
-├── scripts/
-│   ├── __init__.py
-│   ├── train_async.py                  # 训练包装入口
-│   ├── train_libero90_async.py         # 训练薄包装
-│   ├── eval_online.py                  # 评估包装入口
-│   ├── eval_libero90_rtc_online.py     # 在线评估薄包装
-│   └── smoke_test_full.py              # 端到端冒烟测试
 ├── workspace/
+│   ├── train_async.py                  # 训练包装入口
 │   ├── train_libero90_async.py         # 训练主实现
-│   └── eval_libero90_rtc_online.py     # 在线评估主实现
+│   ├── eval_online.py                  # 评估包装入口
+│   ├── eval_libero90_rtc_online.py     # 在线评估主实现
+│   └── smoke_test_full.py              # 端到端冒烟测试
 ```
 
 ---
@@ -138,7 +134,7 @@ uv sync --frozen
 
 ```bash
 cd /home/luye/data/Streaming_VLA
-CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python scripts/train_async.py \
+CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python workspace/train_async.py \
   --run-name rtc_flow_exp_v1 \
   --extra \
     dataset.zarr_path=/home/luye/data/Streaming_VLA/data/libero/libero10_N500.zarr/libero10_N500.zarr \
@@ -150,7 +146,7 @@ CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python scripts/train_async.py \
 
 ```bash
 cd /home/luye/data/Streaming_VLA
-CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python scripts/train_libero90_async.py \
+CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python workspace/train_libero90_async.py \
   --config-path /home/luye/data/Streaming_VLA/configs \
   --config-name train_libero90_async \
   dataset.zarr_path=/home/luye/data/Streaming_VLA/data/libero/libero10_N500.zarr/libero10_N500.zarr \
@@ -174,7 +170,7 @@ CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run python scripts/train_libero90_a
 包装入口：
 
 ```bash
-uv run python scripts/eval_online.py \
+uv run python workspace/eval_online.py \
   --checkpoint /abs/path/to/checkpoints/best.pt \
   --task libero_spatial_task_name \
   --config configs/train_libero90_async.yaml \
@@ -189,7 +185,7 @@ uv run python scripts/eval_online.py \
 直接主脚本：
 
 ```bash
-uv run python scripts/eval_libero90_rtc_online.py \
+uv run python workspace/eval_libero90_rtc_online.py \
   --checkpoint /abs/path/to/checkpoints/best.pt \
   --config configs/train_libero90_async.yaml \
   --task libero_spatial_task_name \

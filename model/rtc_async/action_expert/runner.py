@@ -19,6 +19,7 @@ class ActionExpertRunnerConfig:
     state_dim: int
     action_dim: int
     horizon: int
+    cond_dim: int
     hidden_size: int = 512
     num_layers: int = 8
     num_heads: int = 8
@@ -44,6 +45,7 @@ class ActionExpertRunner(nn.Module):
                 state_dim=config.state_dim,
                 action_dim=config.action_dim,
                 horizon=config.horizon,
+                cond_dim=config.cond_dim,
                 hidden_size=config.hidden_size,
                 num_layers=config.num_layers,
                 num_heads=config.num_heads,
@@ -63,6 +65,8 @@ class ActionExpertRunner(nn.Module):
         time: torch.Tensor,
         kv_cache: KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
+        prompt_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """训练路径前向，输出速度场预测。"""
 
@@ -72,6 +76,8 @@ class ActionExpertRunner(nn.Module):
             time=time,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
         )
 
     @torch.inference_mode()
@@ -81,6 +87,8 @@ class ActionExpertRunner(nn.Module):
         state: torch.Tensor,
         kv_cache: KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
+        prompt_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None = None,
         kv_cache_key: Hashable | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
@@ -94,6 +102,8 @@ class ActionExpertRunner(nn.Module):
             num_steps=self.config.num_inference_steps,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
             kv_cache_store=self.kv_cache_store,
             kv_cache_key=kv_cache_key,
             generator=generator,

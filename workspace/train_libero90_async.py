@@ -11,7 +11,7 @@ import hydra
 import numpy as np
 import torch
 import yaml
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from multiprocessing.reduction import ForkingPickler
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, dataloader
@@ -37,18 +37,16 @@ if ROOT_DIR not in sys.path:
 from dataset.bucket_sampler import BucketBatchSampler
 from dataset.libero90_async_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
 from model.rtc_async.action_expert.runner import ActionExpertRunner, ActionExpertRunnerConfig
-from model.rtc_async.pipeline.scheduler import RTCChunkScheduler
 from model.rtc_async.qwen3_stream.kv_export import export_selected_kv_cache
 from model.rtc_async.training.loss_rtc import build_rtc_inpainting_batch, rtc_velocity_loss
 from model.vla_qwen3_rtc import Qwen3RTCVLAEncoder
+from normalization import RTCNormalizer
 
 
 @dataclass
 class RTCAsyncResolvedConfig:
+    max_context_len: int | None
     selected_layers: list[int]
-    inference_delay: int
-    execute_horizon: int
-    simulated_delay: int
     action_expert: Dict[str, Any]
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -66,21 +64,14 @@ def resolve_workspace_path(path_str: str) -> str:
     return str(pathlib.Path(ROOT_DIR) / p)
 def load_rtc_async_config(config_path: str) -> RTCAsyncResolvedConfig:
     with open(config_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+        raw = yaml.safe_load(f)
 
-    stream = raw.get("stream", {}) or {}
-    rtc = raw.get("rtc", {}) or {}
-    action_expert = raw.get("action_expert", {}) or {}
-
-    selected_layers = [int(x) for x in stream.get("selected_layers", [])]
-    if not selected_layers:
-        raise ValueError("rtc_async.stream.selected_layers must be non-empty.")
+    stream = raw["stream"]
+    action_expert = raw["action_expert"]
 
     return RTCAsyncResolvedConfig(
-        selected_layers=selected_layers,
-        inference_delay=int(rtc.get("inference_delay", 0)),
-        execute_horizon=int(rtc.get("execute_horizon", 1)),
-        simulated_delay=int(rtc.get("simulated_delay", 0)),
+        max_context_len=int(float(stream["max_context_len"])),
+        selected_layers=[int(x) for x in stream["selected_layers"]],
         action_expert=action_expert,
     )
 
@@ -91,46 +82,40 @@ def build_action_expert_runner(
     state_dim: int,
     action_dim: int,
     horizon: int,
+    cond_dim: int,
 ) -> ActionExpertRunner:
-    """按数据集维度约束构建动作专家运行器。
-
-    参数:
-        rtc_cfg: 解析后的 rtc_async 配置。
-        state_dim: 数据集状态维度。
-        action_dim: 数据集动作维度。
-        horizon: 数据集 chunk horizon。
-
-    返回:
-        维度对齐并通过校验的 `ActionExpertRunner` 实例。
-    """
     action_cfg = dict(rtc_cfg.action_expert)
-    action_cfg["state_dim"] = int(action_cfg.get("state_dim", state_dim))
-    action_cfg["action_dim"] = int(action_cfg.get("action_dim", action_dim))
-    action_cfg["horizon"] = int(action_cfg.get("horizon", horizon))
-
-    if action_cfg["state_dim"] != state_dim:
-        raise ValueError(f"rtc_async.action_expert.state_dim={action_cfg['state_dim']} but dataset state_dim={state_dim}")
-    if action_cfg["action_dim"] != action_dim:
-        raise ValueError(f"rtc_async.action_expert.action_dim={action_cfg['action_dim']} but dataset action_dim={action_dim}")
-    if action_cfg["horizon"] != horizon:
-        raise ValueError(f"rtc_async.action_expert.horizon={action_cfg['horizon']} but dataset horizon={horizon}")
-
-    runner_cfg = ActionExpertRunnerConfig(**action_cfg)
+    runner_cfg = ActionExpertRunnerConfig(
+        state_dim=state_dim,
+        action_dim=int(action_cfg.pop("action_dim")),
+        horizon=int(action_cfg.pop("horizon")),
+        cond_dim=int(cond_dim),
+        **action_cfg,
+    )
+    if runner_cfg.horizon != horizon:
+        raise ValueError(f"horizon mismatch: config={runner_cfg.horizon}, resolved={horizon}")
+    if runner_cfg.action_dim != action_dim:
+        raise ValueError(f"action_dim mismatch: config={runner_cfg.action_dim}, dataset={action_dim}")
     return ActionExpertRunner(runner_cfg)
 
 
 def _stack_anchor_state(sample_list: List[Dict[str, Any]], device: str) -> torch.Tensor:
-    """提取并堆叠批次 anchor_state，输出 `[B, Ds]` 状态张量。
-
-    参数:
-        sample_list: 离线样本字典列表。
-        device: 目标设备。
-
-    返回:
-        堆叠后的 anchor 状态张量。
-    """
     state = torch.stack([sample["anchor_state"] for sample in sample_list], dim=0)
     return state.to(device)
+
+
+def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device: torch.device) -> torch.Tensor:
+    delays = []
+    for sample in sample_list:
+        history = sample["context_time_indices"]
+        if int(history.numel()) == 0:
+            delays.append(0)
+            continue
+        anchor_t = int(sample["anchor_time_idx"].item())
+        prev_t = int(history[-1].item())
+        step_gap = max(anchor_t - prev_t, 0)
+        delays.append(max(horizon - step_gap, 0))
+    return torch.tensor(delays, device=device, dtype=torch.long)
 
 
 def run_epoch(
@@ -138,7 +123,6 @@ def run_epoch(
     vla: Qwen3RTCVLAEncoder,
     action_expert: ActionExpertRunner,
     rtc_cfg: RTCAsyncResolvedConfig,
-    scheduler: RTCChunkScheduler,
     dataloader: DataLoader,
     cfg: DictConfig,
     train: bool,
@@ -146,12 +130,6 @@ def run_epoch(
     epoch: int,
     accelerator: Accelerator,
 ) -> Dict[str, float]:
-    """执行单个训练或验证 epoch，并返回聚合指标。
-
-    接口对应:
-    - 输入接口: `dataloader -> vla.forward_offline_context_batch -> action_expert`。
-    - 输出接口: 返回 `rtc_loss/execute_mse/avg_delay` 等监控指标字典。
-    """
     train_vla = bool(cfg.rtc_async.train_vla)
     if train:
         action_expert.train()
@@ -161,11 +139,9 @@ def run_epoch(
         vla.eval()
 
     total_loss = 0.0
-    total_exec_mse = 0.0
     total_delay = 0.0
     n_samples = 0
     n_updates = 0
-
     max_batches_key = "max_train_batches" if train else "max_val_batches"
     max_batches = cfg.training.get(max_batches_key, None) if train else cfg.eval.get(max_batches_key, None)
 
@@ -178,12 +154,10 @@ def run_epoch(
         )
     else:
         progress = dataloader
-
     for batch_idx, sample_list in enumerate(progress):
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
-
         with torch.set_grad_enabled(train and train_vla):
             out = vla(
                 samples=sample_list,
@@ -191,10 +165,11 @@ def run_epoch(
                 source_dt_ms=int(cfg.training.source_dt_ms),
                 return_condition_cache=True,
             )
-
         target_chunk = out["target_chunk"]
         past_key_values = out.get("past_key_values", None)
         attention_mask = out.get("attention_mask", None)
+        prompt_mask = out.get("prompt_mask", None)
+        step_mask = out.get("step_mask", None)
         if target_chunk is None or past_key_values is None:
             continue
 
@@ -205,18 +180,15 @@ def run_epoch(
         )
 
         state = _stack_anchor_state(sample_list, accelerator.device)
-        if target_chunk.dim() != 3:
-            raise ValueError(f"Action chunk must be [B,H,D], got {tuple(target_chunk.shape)}")
-        if state.dim() != 2:
-            raise ValueError(f"State must be [B,Ds], got {tuple(state.shape)}")
-        if kv_cache and len(kv_cache) != len(rtc_cfg.selected_layers):
-            raise ValueError(
-                f"Exported KV layers={len(kv_cache)} != selected_layers={len(rtc_cfg.selected_layers)}"
-            )
+        delay = _stack_rtc_delay(
+            sample_list,
+            horizon=int(target_chunk.shape[1]),
+            device=accelerator.device,
+        )
 
         rtc_batch = build_rtc_inpainting_batch(
             action=target_chunk,
-            simulated_delay=rtc_cfg.simulated_delay,
+            delay=delay,
         )
 
         if not bool(cfg.rtc_async.use_attention_mask):
@@ -228,6 +200,8 @@ def run_epoch(
             time=rtc_batch.time,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
         )
         loss = rtc_velocity_loss(pred_u_t=pred_u_t, batch=rtc_batch)
 
@@ -242,57 +216,34 @@ def run_epoch(
             optimizer.step()
             n_updates += 1
 
-        with torch.no_grad():
-            sampled_chunk = None
-            if int(cfg.rtc_async.sample_eval_every) > 0 and (batch_idx % int(cfg.rtc_async.sample_eval_every) == 0):
-                sampled_chunk = action_expert.sample(
-                    state=state,
-                    kv_cache=kv_cache,
-                    attention_mask=attention_mask,
-                    kv_cache_key=("train" if train else "val", epoch, batch_idx),
-                )
+        bs = int(target_chunk.shape[0])
+        total_loss += float(loss.detach().item()) * bs
+        total_delay += float(rtc_batch.delay.float().mean().item()) * bs
+        n_samples += bs
 
-            execute_mse = 0.0
-            if sampled_chunk is not None:
-                execute_chunk, _ = scheduler.schedule(
-                    next_chunk=sampled_chunk,
-                    inference_delay=rtc_cfg.inference_delay,
-                    execute_horizon=rtc_cfg.execute_horizon,
-                )
-                target_exec = target_chunk[:, : execute_chunk.shape[1]]
-                execute_mse = float(torch.nn.functional.mse_loss(execute_chunk, target_exec).item())
-
-            bs = int(target_chunk.shape[0])
-            total_loss += float(loss.detach().item()) * bs
-            total_exec_mse += float(execute_mse) * bs
-            total_delay += float(rtc_batch.delay.float().mean().item()) * bs
-            n_samples += bs
-
-            if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
-                progress.set_postfix(
-                    rtc_loss=f"{(total_loss / max(n_samples, 1)):.4f}",
-                    exec_mse=f"{(total_exec_mse / max(n_samples, 1)):.4f}",
-                    samples=n_samples,
-                )
+        if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
+            progress.set_postfix(
+                rtc_loss=f"{(total_loss / max(n_samples, 1)):.4f}",
+                samples=n_samples,
+            )
 
         if max_batches is not None and (batch_idx + 1) >= int(max_batches):
             break
 
     local_stats = torch.tensor(
-        [[total_loss, total_exec_mse, total_delay, float(n_samples), float(n_updates)]],
+        [[total_loss, total_delay, float(n_samples), float(n_updates)]],
         device=accelerator.device,
         dtype=torch.float64,
     )
     gathered_stats = accelerator.gather(local_stats)
-    summed_stats = gathered_stats[:, :4].sum(dim=0)
-    max_updates = gathered_stats[:, 4].max()
+    summed_stats = gathered_stats[:, :3].sum(dim=0)
+    max_updates = gathered_stats[:, 3].max()
 
     prefix = "train" if train else "val"
     return {
-        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[3].item(), 1.0)),
-        f"{prefix}/execute_mse": float(summed_stats[1].item() / max(summed_stats[3].item(), 1.0)),
-        f"{prefix}/avg_delay": float(summed_stats[2].item() / max(summed_stats[3].item(), 1.0)),
-        f"{prefix}/samples": float(summed_stats[3].item()),
+        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[2].item(), 1.0)),
+        f"{prefix}/avg_delay": float(summed_stats[1].item() / max(summed_stats[2].item(), 1.0)),
+        f"{prefix}/samples": float(summed_stats[2].item()),
         f"{prefix}/updates": float(max_updates.item()),
     }
 
@@ -303,27 +254,18 @@ def save_checkpoint(
     action_expert: ActionExpertRunner,
     vla: Qwen3RTCVLAEncoder,
     optimizer: torch.optim.Optimizer,
+    normalizer: RTCNormalizer,
     epoch: int,
     global_step: int,
     cfg: DictConfig,
     accelerator: Accelerator,
 ) -> None:
-    """保存训练检查点，包含模型权重、优化器和配置快照。
-
-    参数:
-        path: 输出 checkpoint 路径。
-        action_expert: 动作专家模型。
-        vla: VLA 编码器。
-        optimizer: 优化器实例。
-        epoch: 当前 epoch。
-        global_step: 全局步数。
-        cfg: 训练配置对象。
-    """
     payload = {
         "epoch": int(epoch),
         "global_step": int(global_step),
         "action_expert": accelerator.get_state_dict(action_expert),
         "optimizer": optimizer.state_dict(),
+        "normalization": normalizer.to_payload(),
         "cfg": OmegaConf.to_container(cfg, resolve=True),
     }
     if bool(cfg.rtc_async.train_vla):
@@ -367,7 +309,11 @@ def main(cfg: DictConfig) -> None:
         cfg: Hydra 注入的训练配置。
     """
     OmegaConf.resolve(cfg)
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=False,
+        static_graph=bool(cfg.rtc_async.train_vla),
+    )
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(int(cfg.training.seed))
 
     out_dir = os.getcwd()
@@ -389,16 +335,8 @@ def main(cfg: DictConfig) -> None:
     vla = Qwen3RTCVLAEncoder(config_path=resolve_workspace_path(str(cfg.model.vla_config_path)))
     vla.device = str(accelerator.device)
     vla.model.to(accelerator.device)
-    vla.state_encoder.to(accelerator.device)
 
-    if cfg.dataset.get("chunk_horizon", None) is not None:
-        chunk_horizon = int(cfg.dataset.chunk_horizon)
-    else:
-        chunk_horizon = int(rtc_cfg.action_expert.get("horizon", 0))
-    if chunk_horizon <= 0:
-        raise ValueError(
-            "chunk_horizon is unresolved. Set dataset.chunk_horizon or rtc_async.action_expert.horizon > 0."
-        )
+    chunk_horizon = int(rtc_cfg.action_expert["horizon"])
 
     anchor_stride = cfg.dataset.get("anchor_stride_steps", None)
     if anchor_stride is None:
@@ -418,11 +356,10 @@ def main(cfg: DictConfig) -> None:
         num_frames=int(cfg.model.num_frames),
         chunk_horizon=int(chunk_horizon),
         anchor_stride_steps=anchor_stride,
-        max_context_len=int(float(cfg.model.max_context_len)),
+        max_context_len=int(rtc_cfg.max_context_len),
         episode_cache_size=int(cfg.dataset.get("episode_cache_size", 8)),
         max_episodes=cfg.dataset.max_episodes,
         processor=vla.processor,
-        state_placeholder_token=vla.state_placeholder_token,
     )
 
     n_episodes = len(full_set.base)
@@ -438,17 +375,27 @@ def main(cfg: DictConfig) -> None:
     train_eps = perm[:n_train_eps]
     val_eps = perm[n_train_eps:]
 
+    action_mean, action_std = full_set.base.compute_action_stats(train_eps)
+    state_mean, state_std = full_set.base.compute_state_stats(train_eps)
+    normalizer = RTCNormalizer.from_stats(
+        action_mean=action_mean,
+        action_std=action_std,
+        state_mean=state_mean,
+        state_std=state_std,
+    )
+    full_set.set_normalization_stats(
+        action_mean=action_mean,
+        action_std=action_std,
+        state_mean=state_mean,
+        state_std=state_std,
+    )
+
     train_indices = full_set.sample_indices_for_episodes(train_eps)
     val_indices = full_set.sample_indices_for_episodes(val_eps)
 
-    if int(cfg.model.state_dim) != full_set.state_dim:
+    if int(vla.state_dim) != full_set.state_dim:
         raise ValueError(
-            f"state_dim mismatch: model expects {cfg.model.state_dim}, dataset provides {full_set.state_dim}."
-        )
-
-    if int(chunk_horizon) != full_set.chunk_horizon:
-        raise ValueError(
-            f"chunk_horizon mismatch: inferred={chunk_horizon}, dataset={full_set.chunk_horizon}."
+            f"state_dim mismatch: VLA expects {vla.state_dim}, dataset provides {full_set.state_dim}."
         )
 
     action_expert = build_action_expert_runner(
@@ -456,13 +403,8 @@ def main(cfg: DictConfig) -> None:
         state_dim=full_set.state_dim,
         action_dim=full_set.action_dim,
         horizon=full_set.chunk_horizon,
+        cond_dim=int(vla.kv_cache_dim),
     ).to(accelerator.device)
-
-    scheduler = RTCChunkScheduler(
-        horizon=full_set.chunk_horizon,
-        action_dim=full_set.action_dim,
-        device=torch.device(accelerator.device),
-    )
 
     train_bs = int(cfg.dataloader.batch_size)
     val_bs = int(cfg.val_dataloader.batch_size)
@@ -562,7 +504,6 @@ def main(cfg: DictConfig) -> None:
             vla=vla,
             action_expert=action_expert,
             rtc_cfg=rtc_cfg,
-            scheduler=scheduler,
             dataloader=train_loader,
             cfg=cfg,
             train=True,
@@ -574,7 +515,6 @@ def main(cfg: DictConfig) -> None:
             vla=vla,
             action_expert=action_expert,
             rtc_cfg=rtc_cfg,
-            scheduler=scheduler,
             dataloader=val_loader,
             cfg=cfg,
             train=False,
@@ -600,6 +540,7 @@ def main(cfg: DictConfig) -> None:
                 action_expert=action_expert,
                 vla=vla,
                 optimizer=optimizer,
+                normalizer=normalizer,
                 epoch=epoch,
                 global_step=global_step,
                 cfg=cfg,
@@ -610,6 +551,7 @@ def main(cfg: DictConfig) -> None:
                 action_expert=action_expert,
                 vla=vla,
                 optimizer=optimizer,
+                normalizer=normalizer,
                 epoch=epoch,
                 global_step=global_step,
                 cfg=cfg,
@@ -626,6 +568,7 @@ def main(cfg: DictConfig) -> None:
                     action_expert=action_expert,
                     vla=vla,
                     optimizer=optimizer,
+                    normalizer=normalizer,
                     epoch=epoch,
                     global_step=global_step,
                     cfg=cfg,

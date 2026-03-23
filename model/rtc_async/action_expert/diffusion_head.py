@@ -9,7 +9,6 @@ KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
 
 class VelocityModel(Protocol):
-    """速度场模型协议，约束采样器调用签名。"""
 
     def __call__(
         self,
@@ -19,9 +18,9 @@ class VelocityModel(Protocol):
         time: torch.Tensor,
         kv_cache: KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
+        prompt_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """根据当前噪声状态预测速度场。"""
-
         ...
 
 
@@ -31,12 +30,16 @@ class DiffusionKVCache:
 
     store: dict[Hashable, KVCache] = field(default_factory=dict)
     attention_mask_store: dict[Hashable, torch.Tensor] = field(default_factory=dict)
+    prompt_mask_store: dict[Hashable, torch.Tensor] = field(default_factory=dict)
+    step_mask_store: dict[Hashable, torch.Tensor] = field(default_factory=dict)
 
     def put(
         self,
         key: Hashable,
         kv_cache: KVCache | None,
         attention_mask: torch.Tensor | None = None,
+        prompt_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None = None,
     ) -> None:
         """写入指定键对应的 KV 快照。"""
 
@@ -45,17 +48,30 @@ class DiffusionKVCache:
         self.store[key] = [(k.detach(), v.detach()) for k, v in kv_cache]
         if attention_mask is not None:
             self.attention_mask_store[key] = attention_mask.detach()
+        if prompt_mask is not None:
+            self.prompt_mask_store[key] = prompt_mask.detach()
+        if step_mask is not None:
+            self.step_mask_store[key] = step_mask.detach()
 
-    def get(self, key: Hashable) -> tuple[KVCache | None, torch.Tensor | None]:
+    def get(
+        self, key: Hashable
+    ) -> tuple[KVCache | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """读取指定键对应的 KV 快照。"""
 
-        return self.store.get(key), self.attention_mask_store.get(key)
+        return (
+            self.store.get(key),
+            self.attention_mask_store.get(key),
+            self.prompt_mask_store.get(key),
+            self.step_mask_store.get(key),
+        )
 
     def clear(self) -> None:
         """清空缓存。"""
 
         self.store.clear()
         self.attention_mask_store.clear()
+        self.prompt_mask_store.clear()
+        self.step_mask_store.clear()
 
 
 def euler_sample_actions(
@@ -67,6 +83,8 @@ def euler_sample_actions(
     num_steps: int,
     kv_cache: KVCache | None = None,
     attention_mask: torch.Tensor | None = None,
+    prompt_mask: torch.Tensor | None = None,
+    step_mask: torch.Tensor | None = None,
     kv_cache_store: DiffusionKVCache | None = None,
     kv_cache_key: Hashable | None = None,
     generator: torch.Generator | None = None,
@@ -84,11 +102,21 @@ def euler_sample_actions(
     device = state.device
     dtype = state.dtype
     if kv_cache is None and kv_cache_store is not None and kv_cache_key is not None:
-        kv_cache, cached_attention_mask = kv_cache_store.get(kv_cache_key)
+        kv_cache, cached_attention_mask, cached_prompt_mask, cached_step_mask = kv_cache_store.get(kv_cache_key)
         if attention_mask is None:
             attention_mask = cached_attention_mask
+        if prompt_mask is None:
+            prompt_mask = cached_prompt_mask
+        if step_mask is None:
+            step_mask = cached_step_mask
     elif kv_cache is not None and kv_cache_store is not None and kv_cache_key is not None:
-        kv_cache_store.put(kv_cache_key, kv_cache, attention_mask)
+        kv_cache_store.put(
+            kv_cache_key,
+            kv_cache,
+            attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
+        )
     x_t = torch.randn((batch_size, horizon, action_dim), device=device, dtype=dtype, generator=generator)
     t = torch.zeros((batch_size,), device=device, dtype=dtype)
     dt = 1.0 / float(num_steps)
@@ -99,6 +127,8 @@ def euler_sample_actions(
             time=t,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            step_mask=step_mask,
         )
         x_t = x_t + dt * v_t
         t = t + dt

@@ -1,0 +1,10 @@
+outputs/
+checkpoints/
+wandb/
+.cache/
+train_log.jsonl
+.venv
+data/
+__pycache__/
+*.DS_Store
+profiler_traces/*.trace.json

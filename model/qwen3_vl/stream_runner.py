@@ -1,38 +1,33 @@
+# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from __future__ import annotations
 
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
-from model.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-from model.template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix, build_video_text
+from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from ..template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix, build_video_text
 
 
 @dataclass
 class StreamState:
-    """维护流式推理 cache 与时间门控状态。"""
-
     past_key_values: Optional[object] = None
     attention_mask: Optional[torch.Tensor] = None
     last_vision_time: float = 0.0
 
 
-class Qwen3VLStreamRunnerSnapshot:
-    """Qwen3 流式运行器快照，实现上下文追加、逐步插入与缓存淘汰。"""
-
+class Qwen3VLStreamRunner:
     def __init__(
         self,
         model: Qwen3VLForConditionalGeneration,
         vision_interval_s: float,
         max_context_len: Optional[int] = None,
         use_step_eviction: bool = True,
-        tokenizer: Any = None,
+        tokenizer=None,
     ) -> None:
-        """初始化流式状态与上下文边界参数。"""
-
         self.model = model
         self.vision_interval_s = float(vision_interval_s)
         self.state = StreamState()
@@ -46,8 +41,6 @@ class Qwen3VLStreamRunnerSnapshot:
         self.last_logits: Optional[torch.Tensor] = None
 
     def reset(self) -> None:
-        """清空流状态，开始新的会话。"""
-
         self.state = StreamState()
         self.token_log = None
         self.image_grid_log = None
@@ -58,8 +51,6 @@ class Qwen3VLStreamRunnerSnapshot:
         self.last_logits = None
 
     def _evict_steps_if_needed(self, incoming_step_len: int) -> None:
-        """在超出上下文上限时按 step 粒度淘汰最旧片段。"""
-
         if self.max_context_len is None:
             return
         if self.token_log is None:
@@ -93,7 +84,9 @@ class Qwen3VLStreamRunnerSnapshot:
                 self.video_grid_log = self.video_grid_log[1:]
 
             removed_len = end - start
-            self.step_spans = [(s - removed_len, e - removed_len) for (s, e) in self.step_spans[1:]]
+            self.step_spans = [
+                (s - removed_len, e - removed_len) for (s, e) in self.step_spans[1:]
+            ]
 
         if self.token_log.shape[1] > self.max_context_len:
             available_len = self.max_context_len - self.prefill_len
@@ -103,8 +96,6 @@ class Qwen3VLStreamRunnerSnapshot:
             )
 
     def _append_attention_mask(self, local_mask: torch.Tensor) -> torch.Tensor:
-        """追加局部 attention mask 并返回全局 mask。"""
-
         if self.state.attention_mask is None:
             self.state.attention_mask = local_mask
         else:
@@ -112,16 +103,12 @@ class Qwen3VLStreamRunnerSnapshot:
         return self.state.attention_mask
 
     def _append_token_log(self, input_ids: torch.LongTensor) -> None:
-        """将输入 token 追加到全局 token_log。"""
-
         if self.token_log is None:
             self.token_log = input_ids
         else:
             self.token_log = torch.cat([self.token_log, input_ids], dim=1)
 
     def _append_image_grid(self, image_grid_thw: Optional[torch.LongTensor]) -> None:
-        """追加图像网格索引日志。"""
-
         if image_grid_thw is None:
             return
         if self.image_grid_log is None:
@@ -130,8 +117,6 @@ class Qwen3VLStreamRunnerSnapshot:
             self.image_grid_log = torch.cat([self.image_grid_log, image_grid_thw], dim=0)
 
     def _append_video_grid(self, video_grid_thw: Optional[torch.LongTensor]) -> None:
-        """追加视频网格索引日志。"""
-
         if video_grid_thw is None:
             return
         if self.video_grid_log is None:
@@ -139,24 +124,23 @@ class Qwen3VLStreamRunnerSnapshot:
         else:
             self.video_grid_log = torch.cat([self.video_grid_log, video_grid_thw], dim=0)
 
-    def _ensure_special_token(self, tokenizer: Any, token: str) -> None:
-        """确保 tokenizer 包含指定特殊 token。"""
-
+    def _ensure_special_token(self, tokenizer, token: str) -> None:
         if token in tokenizer.get_vocab():
             return
         tokenizer.add_special_tokens({"additional_special_tokens": [token]})
         self.model.resize_token_embeddings(len(tokenizer))
 
     def _compute_full_positions(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """重算全量 position_ids 与 rope_deltas，并与 token_log 对齐。"""
-
         if self.token_log is None:
             raise ValueError("token_log is empty; prefill_text must be called first.")
         if self.state.attention_mask is None:
             raise ValueError("attention_mask is empty; prefill_text must be called first.")
+
         total_len = self.token_log.shape[1]
         device = self.token_log.device
-        text_positions = torch.arange(total_len, device=device).view(1, 1, -1).expand(1, self.token_log.shape[0], -1)
+        text_positions = torch.arange(total_len, device=device).view(1, 1, -1).expand(
+            1, self.token_log.shape[0], -1
+        )
         vision_positions, rope_deltas = self.model.model.get_rope_index(
             self.token_log,
             image_grid_thw=self.image_grid_log,
@@ -174,22 +158,16 @@ class Qwen3VLStreamRunnerSnapshot:
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
-        precomputed_video_outputs: Any = None,
+        precomputed_video_outputs=None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         return_output: bool = False,
-    ) -> object | None:
-        """
-        统一的追加入口。
-
-        该函数与 append_text/append_state/append_vision 呼应：三者只负责准备各自输入，
-        由这里统一更新 token_log、attention_mask、position_ids 与 past_key_values。
-        """
-
+    ) -> None:
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must specify input_ids or inputs_embeds.")
-        if input_ids is not None and inputs_embeds is not None and input_ids.shape[:2] != inputs_embeds.shape[:2]:
-            raise ValueError("input_ids and inputs_embeds must have matching batch/seq shapes.")
+        if input_ids is not None and inputs_embeds is not None:
+            if input_ids.shape[:2] != inputs_embeds.shape[:2]:
+                raise ValueError("input_ids and inputs_embeds must have matching batch/seq shapes.")
 
         if inputs_embeds is not None:
             batch_size, seq_len, _ = inputs_embeds.shape
@@ -210,10 +188,13 @@ class Qwen3VLStreamRunnerSnapshot:
         self._append_video_grid(video_grid_thw)
         self._append_attention_mask(attention_mask)
         full_attention_mask = self.state.attention_mask
+
         full_position_ids, rope_deltas = self._compute_full_positions()
         position_ids = full_position_ids[..., -seq_len:]
+
         past_len = self.state.past_key_values.get_seq_length() if self.state.past_key_values is not None else 0
         cache_position = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long)
+
         self.model.model.rope_deltas = rope_deltas
         out = self.model(
             input_ids=input_ids if inputs_embeds is None else None,
@@ -236,15 +217,17 @@ class Qwen3VLStreamRunnerSnapshot:
         return None
 
     def get_last_logits(self) -> torch.Tensor:
-        """读取最近一次追加后缓存的最后一个位置 logits。"""
-
         if self.last_logits is None:
             raise ValueError("No logits cached yet. Call prefill/insert_step/append first.")
         return self.last_logits
 
-    def prefill_text(self, *, input_ids: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None) -> None:
-        """写入会话前缀文本，建立初始 cache。"""
-
+    
+    def prefill_text(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> None:
         device = input_ids.device
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=device)
@@ -258,11 +241,18 @@ class Qwen3VLStreamRunnerSnapshot:
                 f"mask_shape={tuple(attention_mask.shape)} mask_sum={int(attention_mask.sum())} "
                 f"cache_pos=(0->{seq_len - 1})"
             )
-        self._forward_append(input_ids=input_ids, attention_mask=attention_mask)
+        self._forward_append(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
-    def append_text_tokens(self, *, input_ids: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None) -> None:
-        """追加纯文本 token，不返回中间 logits。"""
 
+    def append_text_tokens(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> None:
         batch_size, seq_len = input_ids.shape
         local_mask = attention_mask
         if local_mask is None:
@@ -274,7 +264,10 @@ class Qwen3VLStreamRunnerSnapshot:
                 f"mask_shape={tuple(local_mask.shape)} mask_sum={int(local_mask.sum())} "
                 f"cache_pos=({past_len}->{past_len + seq_len - 1})"
             )
-        self._forward_append(input_ids=input_ids, attention_mask=local_mask)
+        self._forward_append(
+            input_ids=input_ids,
+            attention_mask=local_mask,
+        )
 
     def append_text_tokens_with_logits(
         self,
@@ -282,19 +275,21 @@ class Qwen3VLStreamRunnerSnapshot:
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """追加文本 token，并返回对应区间 logits。"""
-
         batch_size, seq_len = input_ids.shape
         local_mask = attention_mask
         if local_mask is None:
             local_mask = torch.ones((batch_size, seq_len), device=input_ids.device, dtype=torch.long)
-        out = self._forward_append(input_ids=input_ids, attention_mask=local_mask, return_output=True)
+        out = self._forward_append(
+            input_ids=input_ids,
+            attention_mask=local_mask,
+            return_output=True,
+        )
         return out.logits[:, -seq_len:, :]
 
     def insert_step(
         self,
         *,
-        processor: Any,
+        processor,
         video: Optional[object] = None,
         aux_video: Optional[object] = None,
         video_path: Optional[str] = None,
@@ -302,13 +297,6 @@ class Qwen3VLStreamRunnerSnapshot:
         act_bos: str = "<act_bos>",
         now: Optional[float] = None,
     ) -> bool:
-        """
-        插入完整 step（视频 + 状态 + assistant 前缀）。
-
-        该函数与 pipeline.step 概念呼应：在 token_log 中记录 step_spans，
-        供后续上下文淘汰与条件快照导出使用。
-        """
-
         if (video is None) == (video_path is None):
             raise ValueError("Provide exactly one of video or video_path.")
         if self.token_log is None:
@@ -319,8 +307,6 @@ class Qwen3VLStreamRunnerSnapshot:
             raise ValueError("processor.tokenizer is required for insert_step.")
 
         def _encode(text: str) -> torch.LongTensor:
-            """将文本编码为模型所在设备上的 token 张量。"""
-
             encoded = tokenizer(text, add_special_tokens=False, return_tensors="pt")
             return encoded["input_ids"].to(self.model.device)
 
@@ -365,22 +351,22 @@ class Qwen3VLStreamRunnerSnapshot:
         self.step_spans.append((step_start, step_end))
         self._evict_steps_if_needed(step_end - step_start)
         return True
-
+    
     def append_vision_tokens(
         self,
         *,
         input_ids: torch.LongTensor,
-        pixel_values_videos: torch.FloatTensor,
+        pixel_values_videos: Optional[torch.FloatTensor],
         video_grid_thw: torch.LongTensor,
-        precomputed_video_outputs: Any = None,
+        precomputed_video_outputs=None,
         attention_mask: Optional[torch.Tensor] = None,
         now: Optional[float] = None,
     ) -> bool:
-        """按时间门控追加视觉 token，返回是否实际写入。"""
-
         now = time.monotonic() if now is None else now
         if now - self.state.last_vision_time < self.vision_interval_s:
             return False
+        if pixel_values_videos is None and precomputed_video_outputs is None:
+            raise ValueError("append_vision_tokens requires pixel_values_videos or precomputed_video_outputs.")
         batch_size, seq_len = input_ids.shape
         local_mask = attention_mask
         if local_mask is None:
@@ -402,10 +388,13 @@ class Qwen3VLStreamRunnerSnapshot:
         self.state.last_vision_time = now
         return True
 
+    
     def generate_next(self, input_ids: torch.LongTensor) -> torch.Tensor:
-        """执行一步文本追加并返回最新 logits。"""
-
+        """Generate logits for next token given current KV cache."""
         device = input_ids.device
         ones = torch.ones_like(input_ids, device=device)
-        self._forward_append(input_ids=input_ids, attention_mask=ones)
+        self._forward_append(
+            input_ids=input_ids,
+            attention_mask=ones,
+        )
         return self.last_logits

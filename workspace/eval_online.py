@@ -31,7 +31,7 @@ def main() -> None:
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     command = [
         sys.executable,
-        str(repo_root / "scripts" / "eval_libero90_rtc_online.py"),
+        str(repo_root / "workspace" / "eval_libero90_rtc_online.py"),
         "--checkpoint",
         args.checkpoint,
         "--task",
