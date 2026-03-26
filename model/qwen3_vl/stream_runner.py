@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -40,6 +40,13 @@ class Qwen3VLStreamRunner:
         self.step_spans: list[tuple[int, int]] = []
         self.last_logits: Optional[torch.Tensor] = None
 
+    def _get_rope_model(self) -> Any:
+        base_model = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        rope_model = getattr(base_model, "model", None)
+        if rope_model is None or not hasattr(rope_model, "get_rope_index"):
+            raise AttributeError("unable to resolve model object with `get_rope_index`")
+        return rope_model
+
     def reset(self) -> None:
         self.state = StreamState()
         self.token_log = None
@@ -47,8 +54,31 @@ class Qwen3VLStreamRunner:
         self.video_grid_log = None
         self.prefill_len = 0
         self.step_spans = []
-        self.model.model.rope_deltas = None
+        self._get_rope_model().rope_deltas = None
         self.last_logits = None
+
+    def _select_cache_mask(self, keep_mask: torch.BoolTensor) -> None:
+        if self.state.past_key_values is None:
+            return
+        select_fn = getattr(self.state.past_key_values, "select_mask", None)
+        if select_fn is not None:
+            select_fn(keep_mask)
+            return
+
+        keep_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
+        layers = getattr(self.state.past_key_values, "layers", None)
+        if layers is None:
+            raise ValueError("past_key_values does not support masked selection")
+
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None or keys.numel() == 0:
+                continue
+            layer.keys = keys.index_select(-2, keep_idx.to(keys.device))
+            layer.values = values.index_select(-2, keep_idx.to(values.device))
+            if hasattr(layer, "cumulative_length"):
+                layer.cumulative_length = int(layer.keys.shape[-2])
 
     def _evict_steps_if_needed(self, incoming_step_len: int) -> None:
         if self.max_context_len is None:
@@ -75,10 +105,7 @@ class Qwen3VLStreamRunner:
                 self.state.attention_mask = self.state.attention_mask.index_select(1, keep_idx)
 
             if self.state.past_key_values is not None:
-                select_fn = getattr(self.state.past_key_values, "select_mask", None)
-                if select_fn is None:
-                    raise ValueError("past_key_values does not support select_mask")
-                select_fn(keep_mask)
+                self._select_cache_mask(keep_mask)
 
             if self.video_grid_log is not None and self.video_grid_log.shape[0] > 0:
                 self.video_grid_log = self.video_grid_log[1:]
@@ -141,7 +168,8 @@ class Qwen3VLStreamRunner:
         text_positions = torch.arange(total_len, device=device).view(1, 1, -1).expand(
             1, self.token_log.shape[0], -1
         )
-        vision_positions, rope_deltas = self.model.model.get_rope_index(
+        rope_model = self._get_rope_model()
+        vision_positions, rope_deltas = rope_model.get_rope_index(
             self.token_log,
             image_grid_thw=self.image_grid_log,
             video_grid_thw=self.video_grid_log,
@@ -195,7 +223,7 @@ class Qwen3VLStreamRunner:
         past_len = self.state.past_key_values.get_seq_length() if self.state.past_key_values is not None else 0
         cache_position = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long)
 
-        self.model.model.rope_deltas = rope_deltas
+        self._get_rope_model().rope_deltas = rope_deltas
         out = self.model(
             input_ids=input_ids if inputs_embeds is None else None,
             inputs_embeds=inputs_embeds,
@@ -286,6 +314,54 @@ class Qwen3VLStreamRunner:
         )
         return out.logits[:, -seq_len:, :]
 
+    def append_step_tokens(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        suffix_ids: torch.LongTensor,
+        pixel_values_videos: Optional[torch.FloatTensor],
+        video_grid_thw: torch.LongTensor,
+        precomputed_video_outputs=None,
+        attention_mask: Optional[torch.Tensor] = None,
+        suffix_attention_mask: Optional[torch.Tensor] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        now = time.monotonic() if now is None else now
+        if now - self.state.last_vision_time < self.vision_interval_s:
+            return False
+        if pixel_values_videos is None and precomputed_video_outputs is None:
+            raise ValueError("append_step_tokens requires pixel_values_videos or precomputed_video_outputs.")
+
+        step_start = 0 if self.token_log is None else int(self.token_log.shape[1])
+        batch_size, seq_len = input_ids.shape
+        local_mask = attention_mask
+        if local_mask is None:
+            local_mask = torch.ones((batch_size, seq_len), device=input_ids.device, dtype=torch.long)
+
+        suffix_batch_size, suffix_seq_len = suffix_ids.shape
+        if suffix_batch_size != batch_size:
+            raise ValueError(
+                f"suffix_ids batch size must match input_ids batch size, got {suffix_batch_size} vs {batch_size}"
+            )
+        suffix_mask = suffix_attention_mask
+        if suffix_mask is None:
+            suffix_mask = torch.ones((batch_size, suffix_seq_len), device=suffix_ids.device, dtype=torch.long)
+
+        full_input_ids = torch.cat([input_ids, suffix_ids], dim=1)
+        full_attention_mask = torch.cat([local_mask, suffix_mask], dim=1)
+        self._forward_append(
+            input_ids=full_input_ids,
+            attention_mask=full_attention_mask,
+            pixel_values_videos=None if precomputed_video_outputs is not None else pixel_values_videos,
+            precomputed_video_outputs=precomputed_video_outputs,
+            video_grid_thw=video_grid_thw,
+        )
+        self.state.last_vision_time = now
+        step_end = int(self.token_log.shape[1])
+        self.step_spans.append((step_start, step_end))
+        self._evict_steps_if_needed(step_end - step_start)
+        return True
+
     def insert_step(
         self,
         *,
@@ -335,21 +411,18 @@ class Qwen3VLStreamRunner:
         seq_len = int(attention_mask[0].sum().item())
         input_ids = input_ids[:, :seq_len]
         attention_mask = attention_mask[:, :seq_len]
-        did_append = self.append_vision_tokens(
+        suffix_ids = _encode(build_step_assistant_prefix())
+        did_append = self.append_step_tokens(
             input_ids=input_ids,
             pixel_values_videos=pixel_values_videos,
-            precomputed_video_outputs=None,
+            suffix_ids=suffix_ids,
             video_grid_thw=video_grid_thw,
+            precomputed_video_outputs=None,
             attention_mask=attention_mask,
             now=now,
         )
         if not did_append:
             return False
-        suffix_ids = _encode(build_step_assistant_prefix())
-        self.append_text_tokens(input_ids=suffix_ids)
-        step_end = self.token_log.shape[1]
-        self.step_spans.append((step_start, step_end))
-        self._evict_steps_if_needed(step_end - step_start)
         return True
     
     def append_vision_tokens(

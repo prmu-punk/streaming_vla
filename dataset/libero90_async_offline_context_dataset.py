@@ -55,6 +55,7 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         step_dt_min_ms: int = 200,
         step_dt_max_ms: int = 300,
         num_frames: int = 6,
+        video_frame_stride_steps: int = 1,
         chunk_horizon: int = 5,
         anchor_stride_steps: int = 1,
         max_context_len: int = 10_000,
@@ -75,6 +76,7 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             step_dt_min_ms: 历史采样最小步距（毫秒）。
             step_dt_max_ms: 历史采样最大步距（毫秒）。
             num_frames: 每个 step 的视频窗口帧数。
+            video_frame_stride_steps: 视频窗口中相邻采样帧在原始时间轴上的步长。
             chunk_horizon: 动作 chunk 长度。
             anchor_stride_steps: anchor 枚举步长。
             max_context_len: 上下文 token 长度上限。
@@ -99,6 +101,10 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             )
         if num_frames <= 0:
             raise ValueError(f"num_frames must be positive, got {num_frames}")
+        if video_frame_stride_steps <= 0:
+            raise ValueError(
+                f"video_frame_stride_steps must be positive, got {video_frame_stride_steps}"
+            )
         if chunk_horizon <= 0:
             raise ValueError(f"chunk_horizon must be positive, got {chunk_horizon}")
         if anchor_stride_steps <= 0:
@@ -110,6 +116,7 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         self.step_dt_min_ms = int(step_dt_min_ms)
         self.step_dt_max_ms = int(step_dt_max_ms)
         self.num_frames = int(num_frames)
+        self.video_frame_stride_steps = int(video_frame_stride_steps)
         self.chunk_horizon = int(chunk_horizon)
         self.anchor_stride_steps = int(anchor_stride_steps)
         self.max_context_len = int(max_context_len)
@@ -219,6 +226,7 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             "step_dt_min_ms": self.step_dt_min_ms,
             "step_dt_max_ms": self.step_dt_max_ms,
             "num_frames": self.num_frames,
+            "video_frame_stride_steps": self.video_frame_stride_steps,
             "chunk_horizon": self.chunk_horizon,
             "anchor_stride_steps": self.anchor_stride_steps,
             "max_context_len": self.max_context_len,
@@ -274,8 +282,12 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
 
     def _video_window_indices(self, t_idx: int) -> List[int]:
         """计算某时刻对应的视频窗口索引，缺失前缀用 0 对齐。"""
-        start = int(t_idx) - self.num_frames + 1
-        return [max(0, start + i) for i in range(self.num_frames)]
+        stride = self.video_frame_stride_steps
+        end = int(t_idx)
+        return [
+            max(0, end - stride * (self.num_frames - 1 - i))
+            for i in range(self.num_frames)
+        ]
 
     def _history_step_times(self, *, anchor_t: int, episode_idx: int) -> List[int]:
         """基于随机步距向后回溯历史时刻序列。"""

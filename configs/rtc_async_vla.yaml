@@ -2,16 +2,12 @@ mode: rtc_async
 
 stream:
   vision_interval_s: 0.0
-  max_context_len: 1560
+  max_context_len: 1024
   selected_layers: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-
-rtc:
-  inference_delay: 2
-  execute_horizon: 4
 
 action_expert:
   action_dim: 7
-  horizon: 5
+  horizon: 24
   hidden_size: 1024
   num_layers: 10
   num_heads: 8

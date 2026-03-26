@@ -6,7 +6,7 @@
 - VLM 流式上下文编码（Qwen3）
 - 从 VLM 导出 KV-Cache 作为条件
 - 扩散/流匹配动作专家生成动作 chunk
-- RTC 调度器按 `delay/horizon` 异步拼接并执行动作
+- RTC 调度器按真实 `step_delay` 异步拼接并执行动作
 
 ---
 
@@ -17,7 +17,7 @@
 1. 视觉帧、状态、任务语言输入到 VLM 编码器；
 2. 从 VLM 的 `past_key_values` 中导出指定层 KV 条件；
 3. `ActionExpertRunner` 在 KV 条件下预测动作 chunk；
-4. `RTCChunkScheduler` 根据 `inference_delay` 与 `execute_horizon` 形成可执行片段；
+4. `RTCChunkScheduler` 根据真实 `step_delay` 形成当前时刻对齐的可执行片段；
 5. 在线循环中执行 `execute_chunk`，再滚动进入下一控制周期。
 
 对应模块分层：
@@ -42,7 +42,7 @@ Streaming_VLA/
 ├── configs/
 │   ├── train_libero90_async.yaml       # 训练总配置（数据/优化器/入口路径）
 │   ├── vla_qwen3_rtc.yaml              # VLM 编码器配置（模型路径、stream gate）
-│   └── rtc_async_vla.yaml              # RTC 与动作专家配置（delay/horizon 等）
+│   └── rtc_async_vla.yaml              # RTC 与动作专家配置（context/action expert）
 ├── dataset/
 │   ├── __init__.py
 │   ├── libero90_async_dataset.py       # 基础 episode 数据读取
@@ -94,9 +94,9 @@ Streaming_VLA/
 - `Qwen3RTCVLAOnlinePipeline.push_observation(frames, state, ts_ms, num_frames)`
   - 写入当前观测到流式上下文
 - `Qwen3RTCVLAOnlinePipeline.sample_and_schedule(...)`
-  - 采样动作 chunk 并输出 `execute_chunk`
-- `Qwen3RTCVLAOnlinePipeline.set_runtime_schedule_params(...)`
-  - 运行时覆盖 `inference_delay / execute_horizon`
+  - 采样动作 chunk，并按真实 `step_delay` 输出 `stitched_chunk/execute_chunk`
+- `Qwen3RTCVLAOnlinePipeline.set_runtime_timebase(...)`
+  - 设置在线 `source_dt_ms`，用于把 `ts_ms` 换算为 `step_delay_steps`
 
 ---
 
@@ -115,9 +115,7 @@ VLM 配置：`configs/vla_qwen3_rtc.yaml`
 
 RTC 配置：`configs/rtc_async_vla.yaml`
 
-- `rtc.inference_delay`：推理延迟 `d`
-- `rtc.execute_horizon`：执行窗口 `h`
-- `rtc.simulated_delay`：训练期随机延迟上限
+- `stream.*`：流式上下文长度与选层配置
 - `action_expert.*`：动作专家网络结构与采样步数
 
 ---

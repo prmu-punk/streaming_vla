@@ -20,10 +20,22 @@ class StreamConfig:
 
 
 @dataclass
+class LoRAConfig:
+    enabled: bool = False
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
+    layers_end: int | None = None
+    target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens", "lm_head"])
+
+
+@dataclass
 class RTCVLAConfig:
     model_name_or_path: str
     state_dim: int
     device: Optional[str] = None
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
 
 
@@ -70,11 +82,22 @@ def _load_rtc_vla_config(config_path: str) -> RTCVLAConfig:
         vision_interval_s=float(stream_raw.get("vision_interval_s", 0.0)),
         max_context_len=max_context_len,
     )
+    lora_raw = raw.get("lora", {}) or {}
+    lora_cfg = LoRAConfig(
+        enabled=bool(lora_raw.get("enabled", False)),
+        r=int(lora_raw.get("r", 16)),
+        alpha=int(lora_raw.get("alpha", 32)),
+        dropout=float(lora_raw.get("dropout", 0.05)),
+        layers_end=(None if lora_raw.get("layers_end", None) is None else int(lora_raw["layers_end"])),
+        target_modules=[str(x) for x in lora_raw.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])],
+        modules_to_save=[str(x) for x in lora_raw.get("modules_to_save", ["embed_tokens", "lm_head"])],
+    )
 
     return RTCVLAConfig(
         model_name_or_path=str(raw["model_name_or_path"]),
         state_dim=int(raw["state_dim"]),
         device=raw.get("device", None),
+        lora=lora_cfg,
         stream=stream_cfg,
     )
 
@@ -105,6 +128,25 @@ class Qwen3RTCVLAEncoder(nn.Module):
 
         self.processor = Qwen3VLProcessor.from_pretrained(cfg.model_name_or_path, trust_remote_code=False)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(cfg.model_name_or_path, trust_remote_code=False)
+        if cfg.lora.enabled:
+            try:
+                from peft import LoraConfig as PeftLoraConfig, TaskType, get_peft_model
+            except ImportError as exc:
+                raise ImportError("LoRA is enabled but `peft` is not installed. Install project dependencies again.") from exc
+            text_layers = int(self.model.config.text_config.num_hidden_layers)
+            layer_end = text_layers - 1 if cfg.lora.layers_end is None else min(int(cfg.lora.layers_end), text_layers - 1)
+            lora_cfg = PeftLoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                r=int(cfg.lora.r),
+                lora_alpha=int(cfg.lora.alpha),
+                lora_dropout=float(cfg.lora.dropout),
+                bias="none",
+                target_modules=list(cfg.lora.target_modules),
+                modules_to_save=list(cfg.lora.modules_to_save),
+                layers_to_transform=list(range(layer_end + 1)),
+                layers_pattern=["layers"],
+            )
+            self.model = get_peft_model(self.model, lora_cfg)
         self.model.to(self.device)
         self.state_dim = cfg.state_dim
         text_cfg = self.model.config.text_config

@@ -1,18 +1,44 @@
 from .action_expert import ActionExpertBackbone, ActionExpertConfig, ActionExpertRunner, ActionExpertRunnerConfig
-from .pipeline import RTCChunkScheduler, roll_chunk_after_execution, stitch_action_for_execution, validate_rtc_params
-from .qwen3_stream import Qwen3VLStreamRunnerSnapshot, StreamState, export_selected_kv_cache
+from .pipeline import (
+    ActionPacket,
+    ContextPacket,
+    ExecutePacket,
+    LatestPacketQueue,
+    RTCDiTStage,
+    RTCExecutionStage,
+    RTCChunkScheduler,
+    RTCPipelineQueues,
+    RTCThreadedPipelineRunner,
+    RTCVLMStage,
+    StepPacket,
+    roll_chunk_after_execution,
+    stitch_action_for_execution,
+    validate_rtc_params,
+)
+from .qwen3_stream import Qwen3VLStreamRunner, StreamState, export_compact_selected_kv_cache, export_selected_kv_cache
 from .training import RTCInpaintingBatch, build_rtc_inpainting_batch, rtc_velocity_loss
 
 __all__ = [
+    "ActionPacket",
     "ActionExpertBackbone",
     "ActionExpertConfig",
     "ActionExpertRunner",
     "ActionExpertRunnerConfig",
+    "ContextPacket",
+    "ExecutePacket",
+    "LatestPacketQueue",
     "RTCChunkScheduler",
+    "RTCDiTStage",
+    "RTCExecutionStage",
     "RTCInpaintingBatch",
-    "Qwen3VLStreamRunnerSnapshot",
+    "RTCPipelineQueues",
+    "RTCThreadedPipelineRunner",
+    "RTCVLMStage",
+    "Qwen3VLStreamRunner",
+    "StepPacket",
     "StreamState",
     "build_rtc_inpainting_batch",
+    "export_compact_selected_kv_cache",
     "export_selected_kv_cache",
     "roll_chunk_after_execution",
     "rtc_velocity_loss",

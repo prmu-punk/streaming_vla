@@ -5,67 +5,50 @@ from dataclasses import dataclass
 import torch
 
 
-def validate_rtc_params(
-    *,
-    horizon: int,
-    inference_delay: int,
-    execute_horizon: int,
-) -> None:
-    """校验 RTC 调度超参数，确保拼接与执行窗口定义一致。"""
+def validate_rtc_params(*, horizon: int, step_delay_steps: int) -> None:
+    """校验基于真实 step delay 的 RTC 调度参数。"""
 
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
-    if inference_delay < 0:
-        raise ValueError(f"inference_delay must be non-negative, got {inference_delay}")
-    if execute_horizon <= 0:
-        raise ValueError(f"execute_horizon must be positive, got {execute_horizon}")
-    if execute_horizon > horizon:
-        raise ValueError(f"execute_horizon must be <= horizon ({horizon}), got {execute_horizon}")
-    if inference_delay > execute_horizon:
-        raise ValueError(
-            f"inference_delay must be <= execute_horizon ({execute_horizon}), got {inference_delay}"
-        )
+    if step_delay_steps < 0:
+        raise ValueError(f"step_delay_steps must be non-negative, got {step_delay_steps}")
 
 
 def stitch_action_for_execution(
     *,
     prev_chunk: torch.Tensor,
     next_chunk: torch.Tensor,
-    inference_delay: int,
-    execute_horizon: int,
-) -> torch.Tensor:
-    """按 delay/horizon 将历史前缀与新预测拼接成可立即执行的动作段。"""
+    step_delay_steps: int,
+) -> tuple[torch.Tensor, int]:
+    """按真实 step delay 将历史重叠前缀与新预测拼接成当前时刻对齐的 chunk。"""
 
     if prev_chunk.shape != next_chunk.shape:
         raise ValueError(
             f"prev_chunk and next_chunk must share shape, got {tuple(prev_chunk.shape)} vs {tuple(next_chunk.shape)}"
         )
     horizon = int(next_chunk.shape[1])
-    validate_rtc_params(
-        horizon=horizon,
-        inference_delay=inference_delay,
-        execute_horizon=execute_horizon,
-    )
-    left = prev_chunk[:, :inference_delay]
-    right = next_chunk[:, inference_delay:execute_horizon]
-    return torch.cat([left, right], dim=1)
+    validate_rtc_params(horizon=horizon, step_delay_steps=step_delay_steps)
+    prefix_len = max(horizon - int(step_delay_steps), 0)
+    left = prev_chunk[:, :prefix_len]
+    right = next_chunk[:, prefix_len:]
+    return torch.cat([left, right], dim=1), int(prefix_len)
 
 
 def roll_chunk_after_execution(
     *,
-    next_chunk: torch.Tensor,
-    execute_horizon: int,
+    stitched_chunk: torch.Tensor,
+    executed_steps: int,
 ) -> torch.Tensor:
     """在执行后滚动缓存 chunk，保留未执行尾部并在末尾补零。"""
 
-    horizon = int(next_chunk.shape[1])
-    if execute_horizon < 0 or execute_horizon > horizon:
-        raise ValueError(f"execute_horizon must be in [0, {horizon}], got {execute_horizon}")
-    tail = next_chunk[:, execute_horizon:]
+    horizon = int(stitched_chunk.shape[1])
+    if executed_steps < 0 or executed_steps > horizon:
+        raise ValueError(f"executed_steps must be in [0, {horizon}], got {executed_steps}")
+    tail = stitched_chunk[:, executed_steps:]
     pad = torch.zeros(
-        (next_chunk.shape[0], execute_horizon, next_chunk.shape[2]),
-        device=next_chunk.device,
-        dtype=next_chunk.dtype,
+        (stitched_chunk.shape[0], executed_steps, stitched_chunk.shape[2]),
+        device=stitched_chunk.device,
+        dtype=stitched_chunk.dtype,
     )
     return torch.cat([tail, pad], dim=1)
 
@@ -93,10 +76,9 @@ class RTCChunkScheduler:
         self,
         *,
         next_chunk: torch.Tensor,
-        inference_delay: int,
-        execute_horizon: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """生成可执行 chunk，并更新下一步所需的 prev_chunk。"""
+        step_delay_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """生成当前时刻对齐的 stitched chunk、可执行片段，并更新下一步缓存。"""
 
         if next_chunk.dim() != 3:
             raise ValueError(f"next_chunk must be [B, H, D], got {tuple(next_chunk.shape)}")
@@ -106,14 +88,15 @@ class RTCChunkScheduler:
             )
         if self.prev_chunk is None or self.prev_chunk.shape[0] != next_chunk.shape[0]:
             self.reset(next_chunk.shape[0])
-        execute_chunk = stitch_action_for_execution(
+        stitched_chunk, prefix_len = stitch_action_for_execution(
             prev_chunk=self.prev_chunk,
             next_chunk=next_chunk,
-            inference_delay=inference_delay,
-            execute_horizon=execute_horizon,
+            step_delay_steps=int(step_delay_steps),
         )
+        execute_steps = min(max(int(step_delay_steps), 0), self.horizon)
+        execute_chunk = stitched_chunk[:, :execute_steps]
         self.prev_chunk = roll_chunk_after_execution(
-            next_chunk=next_chunk,
-            execute_horizon=execute_horizon,
+            stitched_chunk=stitched_chunk,
+            executed_steps=execute_steps,
         )
-        return execute_chunk, self.prev_chunk
+        return stitched_chunk, execute_chunk, self.prev_chunk, int(prefix_len), int(execute_steps)

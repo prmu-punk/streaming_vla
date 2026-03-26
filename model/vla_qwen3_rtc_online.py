@@ -2,19 +2,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import pathlib
+import time
 from typing import Any, Dict, Optional, cast
 
 import numpy as np
 import torch
 import yaml
 
+from model.qwen3_vl.stream_runner import Qwen3VLStreamRunner
 from model.rtc_async.action_expert.runner import ActionExpertRunner, ActionExpertRunnerConfig
+from model.rtc_async.pipeline import (
+    RTCDiTStage,
+    RTCExecutionStage,
+    RTCThreadedPipelineRunner,
+    RTCPipelineQueues,
+    RTCVLMStage,
+    StepPacket,
+)
 from model.rtc_async.pipeline.scheduler import RTCChunkScheduler
-from model.rtc_async.qwen3_stream.kv_export import export_selected_kv_cache
-from model.rtc_async.qwen3_stream.stream_runner_snapshot import Qwen3VLStreamRunnerSnapshot
 from normalization import RTCNormalizer
 
-from .template_qwen3_vla import build_prompt_prefill_text, build_step_assistant_prefix
+from .template_qwen3_vla import build_prompt_prefill_text
 from .vla_qwen3_rtc import Qwen3RTCVLAEncoder
 
 
@@ -23,8 +31,6 @@ class RTCOnlineResolvedConfig:
     vision_interval_s: float
     max_context_len: int | None
     selected_layers: list[int]
-    inference_delay: int
-    execute_horizon: int
     action_expert: Dict[str, Any]
 
 
@@ -41,7 +47,6 @@ def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
         raw = yaml.safe_load(f) or {}
 
     stream = raw.get("stream", {}) or {}
-    rtc = raw.get("rtc", {}) or {}
     action_expert = raw.get("action_expert", {}) or {}
 
     selected_layers = [int(x) for x in stream.get("selected_layers", [])]
@@ -52,8 +57,6 @@ def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
         vision_interval_s=float(stream.get("vision_interval_s", 0.0)),
         max_context_len=(None if stream.get("max_context_len", None) is None else int(float(stream["max_context_len"]))),
         selected_layers=selected_layers,
-        inference_delay=int(rtc.get("inference_delay", 0)),
-        execute_horizon=int(rtc.get("execute_horizon", 1)),
         action_expert=action_expert,
     )
 
@@ -75,6 +78,8 @@ class Qwen3RTCVLAOnlinePipeline:
         vla_config_path: Optional[str] = None,
         rtc_config_path: Optional[str] = None,
         device: Optional[str] = None,
+        vlm_device: Optional[str] = None,
+        dit_device: Optional[str] = None,
     ) -> None:
         """构建在线推理 pipeline，并绑定 VLM 条件与 RTC 调度模块。
 
@@ -93,11 +98,13 @@ class Qwen3RTCVLAOnlinePipeline:
             rtc_config_path = str(pathlib.Path(__file__).resolve().parent.parent / "configs" / "rtc_async_vla.yaml")
 
         self.encoder = Qwen3RTCVLAEncoder(config_path=vla_config_path)
-        if device is not None and device != self.encoder.device:
-            runtime_device = str(device)
+        resolved_vlm_device = vlm_device if vlm_device is not None else device
+        if resolved_vlm_device is not None and resolved_vlm_device != self.encoder.device:
+            runtime_device = str(resolved_vlm_device)
             self.encoder.device = runtime_device
             model_obj = cast(Any, self.encoder.model)
             model_obj.to(runtime_device)
+        self.vlm_device = str(self.encoder.device)
 
         self.rtc_cfg = _load_rtc_async_runtime_config(rtc_config_path)
 
@@ -122,44 +129,73 @@ class Qwen3RTCVLAOnlinePipeline:
             num_inference_steps=int(action_cfg.get("num_inference_steps", 5)),
         )
         self.action_expert = ActionExpertRunner(runner_cfg).to(self.encoder.device)
+        self.dit_device = str(dit_device if dit_device is not None else self.vlm_device)
+        if self.dit_device != self.vlm_device:
+            self.action_expert.to(self.dit_device)
         self.action_expert.eval()
 
         self.scheduler = RTCChunkScheduler(
             horizon=runner_cfg.horizon,
             action_dim=runner_cfg.action_dim,
-            device=torch.device(self.encoder.device),
+            device=torch.device(self.dit_device),
         )
         self._next_step_id = 0
-
-        self.inference_delay = int(self.rtc_cfg.inference_delay)
-        self.execute_horizon = int(self.rtc_cfg.execute_horizon)
+        self.source_dt_ms = 50
+        self._last_step_ts_ms: int | None = None
         self.normalizer: RTCNormalizer | None = None
 
         tokenizer = cast(Any, self.encoder.processor).tokenizer
-        self.runner = Qwen3VLStreamRunnerSnapshot(
+        self.runner = Qwen3VLStreamRunner(
             model=self.encoder.model,
             vision_interval_s=self.rtc_cfg.vision_interval_s,
             max_context_len=self.rtc_cfg.max_context_len,
             use_step_eviction=True,
             tokenizer=tokenizer,
         )
-        self._latest_state: Optional[torch.Tensor] = None
+        self.vlm_stage = RTCVLMStage(
+            encoder=self.encoder,
+            runner=self.runner,
+            processor=self.encoder.processor,
+            selected_layers=self.rtc_cfg.selected_layers,
+        )
+        self.dit_stage = RTCDiTStage(action_expert=self.action_expert)
+        self.execution_stage = RTCExecutionStage(scheduler=self.scheduler)
+        self.queues = RTCPipelineQueues()
+        self.threaded_runner: RTCThreadedPipelineRunner | None = None
 
     @property
     def device(self) -> str:
         """返回 pipeline 当前运行设备，供外部状态构造与 checkpoint 加载使用。"""
-        return self.encoder.device
+        return self.vlm_device
 
-    def set_runtime_schedule_params(self, *, inference_delay: int, execute_horizon: int) -> None:
-        """覆盖运行期 RTC 调度参数。
+    def set_runtime_timebase(self, *, source_dt_ms: int) -> None:
+        """设置在线 step 时间基准，用于把 `ts_ms` 换算为 `step_delay_steps`。"""
+        if int(source_dt_ms) <= 0:
+            raise ValueError(f"source_dt_ms must be positive, got {source_dt_ms}")
+        self.source_dt_ms = int(source_dt_ms)
 
-        参数:
-            inference_delay: 推理延迟步数 `d`。
-            execute_horizon: 每次控制执行长度 `h`。
-        """
+    def start_async_pipeline(self, *, poll_interval_s: float = 0.001) -> None:
+        """启动单卡线程化 stage pipeline。"""
+        if self.threaded_runner is not None and self.threaded_runner.running():
+            raise RuntimeError("async pipeline is already running")
+        self.threaded_runner = RTCThreadedPipelineRunner(
+            queues=self.queues,
+            step_to_context=self._drain_step_to_context,
+            context_to_action=self._drain_context_to_action,
+            action_to_execute=self._drain_action_to_execute,
+            poll_interval_s=float(poll_interval_s),
+        )
+        self.threaded_runner.start()
 
-        self.inference_delay = int(inference_delay)
-        self.execute_horizon = int(execute_horizon)
+    def stop_async_pipeline(self) -> None:
+        """停止单卡线程化 stage pipeline。"""
+        if self.threaded_runner is None:
+            return
+        self.threaded_runner.stop()
+        self.threaded_runner = None
+
+    def async_pipeline_running(self) -> bool:
+        return self.threaded_runner is not None and self.threaded_runner.running()
 
     def load_action_expert_checkpoint(self, checkpoint_path: str, strict: bool = True) -> None:
         """加载动作专家权重到在线 pipeline。
@@ -168,7 +204,10 @@ class Qwen3RTCVLAOnlinePipeline:
             checkpoint_path: checkpoint 文件路径。
             strict: 是否严格匹配参数名。
         """
-        payload = torch.load(checkpoint_path, map_location=self.device)
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        vla_state_dict = payload.get("vla", None)
+        if vla_state_dict is not None:
+            self.encoder.load_state_dict(vla_state_dict, strict=False)
         state_dict = payload.get("action_expert", payload)
         self.action_expert.load_state_dict(state_dict, strict=strict)
         normalization_payload = payload.get("normalization", None)
@@ -182,10 +221,13 @@ class Qwen3RTCVLAOnlinePipeline:
         参数:
             prompt: 可选任务文本；为空时以 tokenizer EOS 做最小预填充。
         """
+        if self.async_pipeline_running():
+            raise RuntimeError("reset is not allowed while async pipeline is running; stop it first.")
         self.runner.reset()
         self.scheduler.reset(batch_size=1)
         self._next_step_id = 0
-        self._latest_state = None
+        self._last_step_ts_ms = None
+        self.queues.clear()
 
         input_ids: torch.LongTensor
         if prompt is None:
@@ -221,102 +263,118 @@ class Qwen3RTCVLAOnlinePipeline:
         返回:
             是否成功插入（受时间门控与上下文策略影响）。
         """
-        video = self.encoder._make_video_tensor(frames, num_frames)
-        aux_video = self.encoder._make_video_tensor(aux_frames, 1) if aux_frames is not None else None
+        now = time.monotonic()
+        if now - self.runner.state.last_vision_time < self.rtc_cfg.vision_interval_s:
+            return False
         latest_state = state.to(self.device)
         if latest_state.dim() == 1:
             latest_state = latest_state.unsqueeze(0)
-        self._latest_state = latest_state
-        return self.runner.insert_step(
-            processor=self.encoder.processor,
-            video=video,
-            aux_video=aux_video,
-            ts=str(ts_ms) if ts_ms is not None else None,
+        self.queues.step_queue.put_latest(
+            StepPacket(
+            step_id=self._next_step_id,
+            frames=frames,
+            aux_frames=aux_frames,
+            state=latest_state,
+            ts_ms=ts_ms,
+            num_frames=num_frames,
+            close_previous_assistant=bool(self.runner.step_spans),
+            )
         )
+        self._next_step_id += 1
+        return True
+
+    def _drain_step_to_context(self) -> Any:
+        step_packet = self.queues.step_queue.pop()
+        if step_packet is None:
+            return None
+        packet = self.vlm_stage(step_packet)
+        self.queues.context_queue.put_latest(packet)
+        return packet
+
+    def _drain_context_to_action(
+        self,
+        *,
+        kv_cache_key: Optional[tuple[Any, ...]] = None,
+        generator: torch.Generator | None = None,
+    ) -> Any:
+        context_packet = self.queues.context_queue.pop()
+        if context_packet is None:
+            return None
+        packet = self.dit_stage(
+            context_packet,
+            normalizer=self.normalizer,
+            kv_cache_key=kv_cache_key,
+            generator=generator,
+        )
+        self.queues.action_queue.put_latest(packet)
+        return packet
+
+    def _resolve_step_delay_steps(self, ts_ms: int | None) -> int:
+        if ts_ms is None:
+            return int(self.scheduler.horizon)
+        if self._last_step_ts_ms is None:
+            self._last_step_ts_ms = int(ts_ms)
+            return int(self.scheduler.horizon)
+        delta_ms = max(int(ts_ms) - int(self._last_step_ts_ms), 0)
+        self._last_step_ts_ms = int(ts_ms)
+        delay_steps = max(1, int(round(float(delta_ms) / float(self.source_dt_ms))))
+        return int(delay_steps)
+
+    def _drain_action_to_execute(self) -> Any:
+        action_packet = self.queues.action_queue.pop()
+        if action_packet is None:
+            return None
+        step_delay_steps = self._resolve_step_delay_steps(action_packet.ts_ms)
+        packet = self.execution_stage(
+            action_packet,
+            step_delay_steps=step_delay_steps,
+        )
+        self.queues.execute_queue.put_latest(packet)
+        return packet
+
+    def poll_execute_packet(self) -> Optional[Dict[str, torch.Tensor | int]]:
+        execute_packet = self.queues.execute_queue.pop()
+        if execute_packet is None:
+            return None
+        return {
+            "step_id": execute_packet.step_id,
+            "step_delay_steps": execute_packet.step_delay_steps,
+            "prefix_len": execute_packet.prefix_len,
+            "action_chunk": execute_packet.action_chunk,
+            "stitched_chunk": execute_packet.stitched_chunk,
+            "execute_chunk": execute_packet.execute_chunk,
+        }
 
     @torch.inference_mode()
     def sample_and_schedule(
         self,
         *,
-        inference_delay: Optional[int] = None,
-        execute_horizon: Optional[int] = None,
         kv_cache_key: Optional[tuple[Any, ...]] = None,
         generator: torch.Generator | None = None,
     ) -> Dict[str, torch.Tensor | int]:
-        """在当前上下文下采样动作 chunk 并执行 RTC 异步调度。
 
-        参数:
-            inference_delay: 可选覆盖默认推理延迟。
-            execute_horizon: 可选覆盖默认执行视野。
-            kv_cache_key: 可选 KV 缓存键，用于采样缓存复用。
-            generator: 随机数生成器。
+        if self.queues.step_queue.empty():
+            raise RuntimeError("No pending observation available. Call push_observation first.")
+        if self.async_pipeline_running():
+            raise RuntimeError(
+                "sample_and_schedule is not supported while async pipeline is running; use poll_execute_packet."
+            )
 
-        返回:
-            包含 `action_chunk/execute_chunk/step_id` 等字段的调度结果字典，
-            供控制环直接执行 `execute_chunk`。
-        """
-        if self._latest_state is None:
-            raise RuntimeError("No state available. Call push_observation first.")
-
-        delay = int(self.inference_delay if inference_delay is None else inference_delay)
-        horizon = int(self.execute_horizon if execute_horizon is None else execute_horizon)
-
-        kv_cache = export_selected_kv_cache(
-            past_key_values=self.runner.state.past_key_values,
-            selected_layers=self.rtc_cfg.selected_layers,
-            clone=False,
-        )
-        attention_mask = self.runner.state.attention_mask
-        prompt_mask = None
-        step_mask = None
-        if attention_mask is not None:
-            prompt_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
-            step_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
-            prompt_mask[:, : self.runner.prefill_len] = True
-            if self.runner.step_spans:
-                step_start, step_end = self.runner.step_spans[-1]
-                tokenizer = cast(Any, self.encoder.processor).tokenizer
-                assistant_len = int(
-                    len(
-                        tokenizer(
-                            build_step_assistant_prefix(),
-                            add_special_tokens=False,
-                            return_attention_mask=False,
-                            return_token_type_ids=False,
-                        )["input_ids"]
-                    )
-                )
-                step_end = max(step_start, step_end - assistant_len)
-                step_mask[:, step_start:step_end] = True
-
-        sample_state = self._latest_state
-        if self.normalizer is not None:
-            sample_state = self.normalizer.normalize_state(sample_state)
-
-        sampled_chunk = self.action_expert.sample(
-            state=sample_state,
-            kv_cache=kv_cache,
-            attention_mask=attention_mask,
-            prompt_mask=prompt_mask,
-            step_mask=step_mask,
+        self._drain_step_to_context()
+        self._drain_context_to_action(
             kv_cache_key=kv_cache_key,
             generator=generator,
         )
-        if self.normalizer is not None:
-            sampled_chunk = self.normalizer.unnormalize_action(sampled_chunk)
-
-        step_id = self._next_step_id
-        self._next_step_id += 1
-        execute_chunk, _ = self.scheduler.schedule(
-            next_chunk=sampled_chunk,
-            inference_delay=delay,
-            execute_horizon=horizon,
-        )
+        self._drain_action_to_execute()
+        execute_packet = self.queues.execute_queue.pop()
+        if execute_packet is None:
+            raise RuntimeError("RTC pipeline produced no execute packet.")
 
         return {
-            "step_id": step_id,
-            "inference_delay": delay,
-            "execute_horizon": horizon,
-            "action_chunk": sampled_chunk,
-            "execute_chunk": execute_chunk,
+            "step_id": execute_packet.step_id,
+            "step_delay_steps": execute_packet.step_delay_steps,
+            "prefix_len": execute_packet.prefix_len,
+            "action_chunk": execute_packet.action_chunk,
+            "stitched_chunk": execute_packet.stitched_chunk,
+            "execute_chunk": execute_packet.execute_chunk,
         }

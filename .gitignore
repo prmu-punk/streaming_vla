@@ -1,7 +1,8 @@
 outputs/
-checkpoints/
+checkpoints*/
 wandb/
 .cache/
+videos/
 train_log.jsonl
 .venv
 data/

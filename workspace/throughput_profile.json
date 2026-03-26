@@ -1,0 +1,107 @@
+{
+  "task_name": "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet",
+  "task_prompt": "open the top drawer of the cabinet",
+  "init_state_idx": 0,
+  "duration_s": 22.000967505853623,
+  "source_dt_ms": 10,
+  "step_dt_min_ms": 80,
+  "step_dt_max_ms": 90,
+  "num_frames": 5,
+  "video_frame_stride_steps": 2,
+  "horizon": 16,
+  "theoretical_max_action_hz": 100.0,
+  "pushed_steps": 236,
+  "produced_chunks": 82,
+  "chunk_rate_hz": 3.727108818200059,
+  "nominal_action_hz": 59.633741091200946,
+  "effective_action_hz": 58.54287997367898,
+  "step_drop_ratio": 0.652542372881356,
+  "first_ready_latency_ms": 799.4727189652622,
+  "step_delay_steps_summary": {
+    "mean": 24.48780487804878,
+    "std": 6.319238728539134,
+    "min": 8.0,
+    "max": 59.0
+  },
+  "prefix_len_summary": {
+    "mean": 0.0975609756097561,
+    "std": 0.8780487804878049,
+    "min": 0.0,
+    "max": 8.0
+  },
+  "ready_latency_ms_summary": {
+    "mean": 508.9051183937799,
+    "std": 67.46255834356259,
+    "min": 407.0602380670607,
+    "max": 874.7693100012839
+  },
+  "queue_stats": {
+    "step_queue": {
+      "put_count": 236,
+      "pop_count": 231,
+      "replace_count": 5
+    },
+    "vision_queue": {
+      "put_count": 231,
+      "pop_count": 82,
+      "replace_count": 149
+    },
+    "context_queue": {
+      "put_count": 82,
+      "pop_count": 82,
+      "replace_count": 0
+    },
+    "action_queue": {
+      "put_count": 82,
+      "pop_count": 82,
+      "replace_count": 0
+    },
+    "execute_queue": {
+      "put_count": 82,
+      "pop_count": 82,
+      "replace_count": 0
+    }
+  },
+  "worker_stats": {
+    "_drain_step_to_vision": {
+      "call_count": 231,
+      "emit_count": 231,
+      "duration_ms_summary": {
+        "mean": 54.85701955879083,
+        "std": 28.853815443619972,
+        "min": 32.10732713341713,
+        "max": 357.343309558928
+      }
+    },
+    "_drain_vision_to_context": {
+      "call_count": 82,
+      "emit_count": 82,
+      "duration_ms_summary": {
+        "mean": 244.2746242372001,
+        "std": 37.51188919670184,
+        "min": 200.46374667435884,
+        "max": 551.0792001150548
+      }
+    },
+    "_drain_context_to_action": {
+      "call_count": 82,
+      "emit_count": 82,
+      "duration_ms_summary": {
+        "mean": 180.81275486705326,
+        "std": 35.730991201770124,
+        "min": 68.25748924165964,
+        "max": 459.2189178802073
+      }
+    },
+    "_drain_action_to_execute": {
+      "call_count": 82,
+      "emit_count": 82,
+      "duration_ms_summary": {
+        "mean": 0.2179746629624832,
+        "std": 0.07596072378171612,
+        "min": 0.10624295100569725,
+        "max": 0.5479450337588787
+      }
+    }
+  }
+}

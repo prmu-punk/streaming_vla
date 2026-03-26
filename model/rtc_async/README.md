@@ -2,7 +2,7 @@
 
 `model/rtc_async` 是一套与原有 `model/vla_qwen3.py` 并行的重写路径，目标是支持三件事：
 - 训练时 RTC（action inpainting / delay masking）
-- 推理时异步调度（`inference_delay` + `execute_horizon`）
+- 推理时基于真实 `step_delay` 的 RTC 调度
 - VLM KV-cache 与连续动作扩散头的直接互联（绕过 OAT detokenizer）
 
 ## 文件树
@@ -24,7 +24,6 @@ model/rtc_async/
   qwen3_stream/
     __init__.py
     kv_export.py
-    stream_runner_snapshot.py
   training/
     __init__.py
     loss_rtc.py
@@ -39,12 +38,12 @@ configs/
   - 动作专家：`ActionExpertRunner`、`ActionExpertBackbone`
   - 调度：`RTCChunkScheduler`
   - 训练 RTC：`build_rtc_inpainting_batch`、`rtc_velocity_loss`
-  - Qwen3 流式适配：`Qwen3VLStreamRunnerSnapshot`、`export_selected_kv_cache`
+  - Qwen3 流式适配：`Qwen3VLStreamRunner`、`export_selected_kv_cache`
 
 ## 子模块职责与接口契约
 
 - `qwen3_stream/`
-  - `Qwen3VLStreamRunnerSnapshot`：冻结原 stream runner 行为，防止上游接口漂移。
+  - `Qwen3VLStreamRunner`：维护流式上下文、KV cache 与 step eviction。
   - `export_selected_kv_cache`：从 `past_key_values` 提取指定层 KV，供动作专家注入。
 
 - `action_expert/`
@@ -77,7 +76,7 @@ configs/
 
 ## 快速接入路径
 
-1. 用 `Qwen3VLStreamRunnerSnapshot` 维护流式上下文。
+1. 用 `Qwen3VLStreamRunner` 维护流式上下文。
 2. 用 `export_selected_kv_cache()` 导出选层 KV。
 3. 调用 `ActionExpertRunner.sample(state, kv_cache=...)` 生成动作 chunk。
 4. 调用 `RTCChunkScheduler.schedule()` 产出可执行片段并滚动缓存。

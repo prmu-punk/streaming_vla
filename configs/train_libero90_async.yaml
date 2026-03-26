@@ -1,6 +1,7 @@
 model:
   vla_config_path: configs/vla_qwen3_rtc.yaml
-  num_frames: 4
+  num_frames: 5
+  video_frame_stride_steps: 4
 
 rtc_async:
   config_path: configs/rtc_async_vla.yaml
@@ -27,19 +28,24 @@ training:
   seed: 42
   num_epochs: 30
   max_grad_norm: 1.0
-  source_dt_ms: 50
-  step_dt_min_ms: 150
-  step_dt_max_ms: 250
+  source_dt_ms: 10
+  step_dt_min_ms: 160
+  step_dt_max_ms: 180
   max_train_batches: null
 
 optimizer:
-  lr: 5.0e-5
+  action_expert_lr: 5.0e-5
+  vla_lr: 5.0e-6
   beta1: 0.9
   beta2: 0.95
   weight_decay: 0.0
 
+scheduler:
+  name: cosine
+  warmup_steps: 500
+
 dataloader:
-  batch_size: 8
+  batch_size: 13
   shuffle: true
   num_workers: 5
   pin_memory: true
@@ -47,8 +53,8 @@ dataloader:
   drop_last: false
 
 val_dataloader:
-  batch_size: 8
-  shuffle: false
+  batch_size: 13
+  shuffle: true
   num_workers: 5
   pin_memory: true
   persistent_workers: true
@@ -61,4 +67,4 @@ checkpoint:
   save_every: 2
   best_monitor: val/rtc_loss
   best_mode: min
-  resume_from: null
+  resume_from: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/Streaming_VLA/checkpoints/epoch_0008.pt

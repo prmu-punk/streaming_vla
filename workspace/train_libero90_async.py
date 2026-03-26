@@ -16,6 +16,7 @@ from multiprocessing.reduction import ForkingPickler
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, dataloader
 from tqdm.auto import tqdm
+from transformers import get_scheduler
 import wandb
 default_collate_func = dataloader.default_collate
 def default_collate_override(batch) -> Any:
@@ -127,6 +128,7 @@ def run_epoch(
     cfg: DictConfig,
     train: bool,
     optimizer: torch.optim.Optimizer | None,
+    scheduler: Any | None,
     epoch: int,
     accelerator: Accelerator,
 ) -> Dict[str, float]:
@@ -214,6 +216,8 @@ def run_epoch(
                 accelerator.clip_grad_norm_(params, float(cfg.training.max_grad_norm))
             assert optimizer is not None
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             n_updates += 1
 
         bs = int(target_chunk.shape[0])
@@ -254,6 +258,7 @@ def save_checkpoint(
     action_expert: ActionExpertRunner,
     vla: Qwen3RTCVLAEncoder,
     optimizer: torch.optim.Optimizer,
+    scheduler: Any,
     normalizer: RTCNormalizer,
     epoch: int,
     global_step: int,
@@ -265,6 +270,7 @@ def save_checkpoint(
         "global_step": int(global_step),
         "action_expert": accelerator.get_state_dict(action_expert),
         "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
         "normalization": normalizer.to_payload(),
         "cfg": OmegaConf.to_container(cfg, resolve=True),
     }
@@ -279,6 +285,7 @@ def load_checkpoint(
     action_expert: ActionExpertRunner,
     vla: Qwen3RTCVLAEncoder,
     optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any | None = None,
     train_vla: bool,
 ) -> tuple[int, int]:
     """加载检查点并恢复训练状态。
@@ -292,6 +299,8 @@ def load_checkpoint(
         vla.load_state_dict(payload["vla"], strict=True)
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
+    if scheduler is not None and "scheduler" in payload:
+        scheduler.load_state_dict(payload["scheduler"])
     epoch = int(payload.get("epoch", -1))
     global_step = int(payload.get("global_step", 0))
     return epoch, global_step
@@ -354,6 +363,7 @@ def main(cfg: DictConfig) -> None:
         step_dt_min_ms=int(cfg.training.step_dt_min_ms),
         step_dt_max_ms=int(cfg.training.step_dt_max_ms),
         num_frames=int(cfg.model.num_frames),
+        video_frame_stride_steps=int(cfg.model.get("video_frame_stride_steps", 1)),
         chunk_horizon=int(chunk_horizon),
         anchor_stride_steps=anchor_stride,
         max_context_len=int(rtc_cfg.max_context_len),
@@ -443,15 +453,34 @@ def main(cfg: DictConfig) -> None:
         persistent_workers=bool(cfg.val_dataloader.get("persistent_workers", int(cfg.val_dataloader.num_workers) > 0)),
     )
 
-    params = list(action_expert.parameters())
+    param_groups = [
+        {
+            "params": [p for p in action_expert.parameters() if p.requires_grad],
+            "lr": float(cfg.optimizer.action_expert_lr),
+        }
+    ]
     if bool(cfg.rtc_async.train_vla):
-        params += list(vla.parameters())
+        vla_params = [p for p in vla.parameters() if p.requires_grad]
+        if vla_params:
+            param_groups.append(
+                {
+                    "params": vla_params,
+                    "lr": float(cfg.optimizer.vla_lr),
+                }
+            )
 
     optimizer = torch.optim.AdamW(
-        params,
-        lr=float(cfg.optimizer.lr),
+        param_groups,
         betas=(float(cfg.optimizer.beta1), float(cfg.optimizer.beta2)),
         weight_decay=float(cfg.optimizer.weight_decay),
+    )
+    num_update_steps_per_epoch = len(train_loader)
+    max_train_steps = int(cfg.training.num_epochs) * int(num_update_steps_per_epoch)
+    scheduler = get_scheduler(
+        str(cfg.scheduler.name),
+        optimizer=optimizer,
+        num_warmup_steps=int(cfg.scheduler.warmup_steps),
+        num_training_steps=max(max_train_steps, 1),
     )
 
     log_path = os.path.join(out_dir, "train_log.jsonl")
@@ -467,6 +496,7 @@ def main(cfg: DictConfig) -> None:
             action_expert=action_expert,
             vla=vla,
             optimizer=optimizer,
+            scheduler=scheduler,
             train_vla=bool(cfg.rtc_async.train_vla),
         )
         start_epoch = resumed_epoch + 1
@@ -483,19 +513,21 @@ def main(cfg: DictConfig) -> None:
         )
 
     if bool(cfg.rtc_async.train_vla):
-        vla, action_expert, optimizer, train_loader, val_loader = accelerator.prepare(
+        vla, action_expert, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
             vla,
             action_expert,
             optimizer,
             train_loader,
             val_loader,
+            scheduler,
         )
     else:
-        action_expert, optimizer, train_loader, val_loader = accelerator.prepare(
+        action_expert, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
             action_expert,
             optimizer,
             train_loader,
             val_loader,
+            scheduler,
         )
 
     for epoch in range(start_epoch, int(cfg.training.num_epochs)):
@@ -508,6 +540,7 @@ def main(cfg: DictConfig) -> None:
             cfg=cfg,
             train=True,
             optimizer=optimizer,
+            scheduler=scheduler,
             epoch=epoch,
             accelerator=accelerator,
         )
@@ -519,6 +552,7 @@ def main(cfg: DictConfig) -> None:
             cfg=cfg,
             train=False,
             optimizer=None,
+            scheduler=None,
             epoch=epoch,
             accelerator=accelerator,
         )
@@ -540,6 +574,7 @@ def main(cfg: DictConfig) -> None:
                 action_expert=action_expert,
                 vla=vla,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 normalizer=normalizer,
                 epoch=epoch,
                 global_step=global_step,
@@ -551,6 +586,7 @@ def main(cfg: DictConfig) -> None:
                 action_expert=action_expert,
                 vla=vla,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 normalizer=normalizer,
                 epoch=epoch,
                 global_step=global_step,
@@ -568,6 +604,7 @@ def main(cfg: DictConfig) -> None:
                     action_expert=action_expert,
                     vla=vla,
                     optimizer=optimizer,
+                    scheduler=scheduler,
                     normalizer=normalizer,
                     epoch=epoch,
                     global_step=global_step,
