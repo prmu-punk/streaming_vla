@@ -19,7 +19,6 @@ class StepPacket:
     state: torch.Tensor
     ts_ms: Optional[int]
     num_frames: int
-    close_previous_assistant: bool
 
 
 @dataclass

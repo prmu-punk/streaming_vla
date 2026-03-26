@@ -9,7 +9,7 @@ from typing import Any, Optional
 import torch
 
 from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-from ..template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix, build_video_text
+from ..template_qwen3_vla import build_step_user_prefix, build_video_text
 
 
 @dataclass
@@ -318,12 +318,10 @@ class Qwen3VLStreamRunner:
         self,
         *,
         input_ids: torch.LongTensor,
-        suffix_ids: torch.LongTensor,
         pixel_values_videos: Optional[torch.FloatTensor],
         video_grid_thw: torch.LongTensor,
         precomputed_video_outputs=None,
         attention_mask: Optional[torch.Tensor] = None,
-        suffix_attention_mask: Optional[torch.Tensor] = None,
         now: Optional[float] = None,
     ) -> bool:
         now = time.monotonic() if now is None else now
@@ -337,21 +335,9 @@ class Qwen3VLStreamRunner:
         local_mask = attention_mask
         if local_mask is None:
             local_mask = torch.ones((batch_size, seq_len), device=input_ids.device, dtype=torch.long)
-
-        suffix_batch_size, suffix_seq_len = suffix_ids.shape
-        if suffix_batch_size != batch_size:
-            raise ValueError(
-                f"suffix_ids batch size must match input_ids batch size, got {suffix_batch_size} vs {batch_size}"
-            )
-        suffix_mask = suffix_attention_mask
-        if suffix_mask is None:
-            suffix_mask = torch.ones((batch_size, suffix_seq_len), device=suffix_ids.device, dtype=torch.long)
-
-        full_input_ids = torch.cat([input_ids, suffix_ids], dim=1)
-        full_attention_mask = torch.cat([local_mask, suffix_mask], dim=1)
         self._forward_append(
-            input_ids=full_input_ids,
-            attention_mask=full_attention_mask,
+            input_ids=input_ids,
+            attention_mask=local_mask,
             pixel_values_videos=None if precomputed_video_outputs is not None else pixel_values_videos,
             precomputed_video_outputs=precomputed_video_outputs,
             video_grid_thw=video_grid_thw,
@@ -370,7 +356,6 @@ class Qwen3VLStreamRunner:
         aux_video: Optional[object] = None,
         video_path: Optional[str] = None,
         ts: Optional[str] = None,
-        act_bos: str = "<act_bos>",
         now: Optional[float] = None,
     ) -> bool:
         if (video is None) == (video_path is None):
@@ -382,16 +367,11 @@ class Qwen3VLStreamRunner:
         if tokenizer is None:
             raise ValueError("processor.tokenizer is required for insert_step.")
 
-        def _encode(text: str) -> torch.LongTensor:
-            encoded = tokenizer(text, add_special_tokens=False, return_tensors="pt")
-            return encoded["input_ids"].to(self.model.device)
-
         video_token = getattr(processor, "video_token", "<|video_pad|>")
         has_aux = aux_video is not None
         prefix_text = build_step_user_prefix(
             ts_ms=int(ts) if ts is not None else None,
             video_token=build_video_text(video_token=video_token, has_aux=has_aux),
-            close_previous_assistant=(len(self.step_spans) > 0),
         )
         video_payload = video if video is not None else video_path
         videos = [video_payload]
@@ -411,11 +391,9 @@ class Qwen3VLStreamRunner:
         seq_len = int(attention_mask[0].sum().item())
         input_ids = input_ids[:, :seq_len]
         attention_mask = attention_mask[:, :seq_len]
-        suffix_ids = _encode(build_step_assistant_prefix())
         did_append = self.append_step_tokens(
             input_ids=input_ids,
             pixel_values_videos=pixel_values_videos,
-            suffix_ids=suffix_ids,
             video_grid_thw=video_grid_thw,
             precomputed_video_outputs=None,
             attention_mask=attention_mask,

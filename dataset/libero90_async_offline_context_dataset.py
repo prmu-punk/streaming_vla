@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .libero90_async_dataset import LiberoEpisodeDataset
-from model.template_qwen3_vla import IM_END, build_prompt_prefill_text, build_step_user_prefix, build_video_text
+from model.template_qwen3_vla import build_prompt_prefill_text, build_step_user_prefix, build_video_text
 
 
 @dataclass(frozen=True)
@@ -304,14 +304,9 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         return list(reversed(times_rev))
 
     def _build_step_text(self, *, ts_ms: int | None, video_token: str, has_aux: bool) -> str:
-        return (
-            build_step_user_prefix(
-                ts_ms=ts_ms,
-                video_token=build_video_text(video_token=video_token, has_aux=has_aux),
-                close_previous_assistant=False,
-            )
-            + IM_END
-            + "\n"
+        return build_step_user_prefix(
+            ts_ms=ts_ms,
+            video_token=build_video_text(video_token=video_token, has_aux=has_aux),
         )
 
     def _make_video_tensor(self, frames: np.ndarray | torch.Tensor, num_frames: int | None = None) -> torch.Tensor:

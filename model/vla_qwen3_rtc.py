@@ -10,7 +10,7 @@ import torch.nn as nn
 import yaml
 
 from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-from .template_qwen3_vla import IM_END, build_prompt_prefill_text, build_step_user_prefix, build_video_text
+from .template_qwen3_vla import build_prompt_prefill_text, build_step_user_prefix, build_video_text
 
 
 @dataclass
@@ -170,14 +170,9 @@ class Qwen3RTCVLAEncoder(nn.Module):
         return frames_t
 
     def _build_step_text(self, *, ts_ms: int | None, video_token: str, has_aux: bool) -> str:
-        return (
-            build_step_user_prefix(
-                ts_ms=ts_ms,
-                video_token=build_video_text(video_token=video_token, has_aux=has_aux),
-                close_previous_assistant=False,
-            )
-            + IM_END
-            + "\n"
+        return build_step_user_prefix(
+            ts_ms=ts_ms,
+            video_token=build_video_text(video_token=video_token, has_aux=has_aux),
         )
 
     def forward(

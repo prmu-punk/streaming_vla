@@ -277,7 +277,6 @@ class Qwen3RTCVLAOnlinePipeline:
             state=latest_state,
             ts_ms=ts_ms,
             num_frames=num_frames,
-            close_previous_assistant=bool(self.runner.step_spans),
             )
         )
         self._next_step_id += 1

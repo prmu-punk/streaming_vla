@@ -22,7 +22,7 @@ if str(ROOT_DIR) not in sys.path:
 from dataset.libero90_async_dataset import LiberoEpisodeDataset
 from model.rtc_async.action_expert.runner import ActionExpertRunner, ActionExpertRunnerConfig
 from model.rtc_async.qwen3_stream.kv_export import export_selected_kv_cache
-from model.template_qwen3_vla import IM_END, build_prompt_prefill_text, build_step_user_prefix, build_video_text
+from model.template_qwen3_vla import build_prompt_prefill_text, build_step_user_prefix, build_video_text
 from model.vla_qwen3_rtc import Qwen3RTCVLAEncoder
 from normalization import RTCNormalizer
 from workspace.rollout_libero_rtc_async_video import (
@@ -147,14 +147,9 @@ def _make_video_tensor(frames: np.ndarray | torch.Tensor, num_frames: int) -> to
 
 
 def _build_step_text(*, ts_ms: int | None, video_token: str, has_aux: bool) -> str:
-    return (
-        build_step_user_prefix(
-            ts_ms=ts_ms,
-            video_token=build_video_text(video_token=video_token, has_aux=has_aux),
-            close_previous_assistant=False,
-        )
-        + IM_END
-        + "\n"
+    return build_step_user_prefix(
+        ts_ms=ts_ms,
+        video_token=build_video_text(video_token=video_token, has_aux=has_aux),
     )
 
 

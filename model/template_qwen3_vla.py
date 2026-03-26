@@ -15,18 +15,10 @@ def build_video_text(*, video_token: str, has_aux: bool) -> str:
     return video_token
 
 
-def build_step_user_prefix(*, ts_ms: int | None, video_token: str, close_previous_assistant: bool) -> str:
-    parts: list[str] = []
-    if close_previous_assistant:
-        parts.append(f"{IM_END}\n")
-    parts.append(f"{IM_START}user\n")
-    parts.append("<step>")
+def build_step_user_prefix(*, ts_ms: int | None, video_token: str) -> str:
+    parts: list[str] = [f"{IM_START}user\n"]
     if ts_ms is not None:
-        parts.append(f"<ts>{int(ts_ms)}</ts>")
-    parts.append(video_token)
-    parts.append("<state>")
+        parts.append(f"time: {float(ts_ms) / 1000.0:.2f}s\n")
+    parts.append(f"obs: {video_token}")
+    parts.append(f"{IM_END}\n")
     return "".join(parts)
-
-
-def build_step_assistant_prefix() -> str:
-    return f"</state>{IM_END}\n{IM_START}assistant\n<act_bos>"

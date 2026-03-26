@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 from model.qwen3_vl.stream_runner import Qwen3VLStreamRunner
-from model.template_qwen3_vla import build_step_assistant_prefix, build_step_user_prefix, build_video_text
+from model.template_qwen3_vla import build_step_user_prefix, build_video_text
 from normalization import RTCNormalizer
 
 from ..action_expert.runner import ActionExpertRunner
@@ -38,14 +38,6 @@ class RTCVLMStage(nn.Module):
         self.runner = runner
         self.processor = processor
         self.selected_layers = list(selected_layers)
-        self._assistant_prefix_ids = cast(
-            torch.LongTensor,
-            processor.tokenizer(
-                build_step_assistant_prefix(),
-                add_special_tokens=False,
-                return_tensors="pt",
-            )["input_ids"],
-        )
 
     def forward(self, step_packet: StepPacket) -> ContextPacket:
         processor = self.encoder.processor
@@ -59,7 +51,6 @@ class RTCVLMStage(nn.Module):
         prefix_text = build_step_user_prefix(
             ts_ms=step_packet.ts_ms,
             video_token=build_video_text(video_token=processor.video_token, has_aux=has_aux),
-            close_previous_assistant=bool(step_packet.close_previous_assistant),
         )
         videos = [video]
         if aux_video is not None:
@@ -87,7 +78,6 @@ class RTCVLMStage(nn.Module):
 
         inserted = self.runner.append_step_tokens(
             input_ids=input_ids,
-            suffix_ids=self._assistant_prefix_ids.to(self.runner.model.device),
             pixel_values_videos=None,
             precomputed_video_outputs=video_features,
             video_grid_thw=video_grid_thw,
@@ -103,8 +93,6 @@ class RTCVLMStage(nn.Module):
         step_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
         prompt_mask[:, : self.runner.prefill_len] = True
         latest_step_start, latest_step_end = self.runner.step_spans[-1]
-        assistant_len = int(self._assistant_prefix_ids.shape[1])
-        latest_step_end = max(latest_step_start, latest_step_end - assistant_len)
         step_mask[:, latest_step_start:latest_step_end] = True
 
         kv_cache, compact_attention_mask, compact_prompt_mask, compact_step_mask = export_compact_selected_kv_cache(
