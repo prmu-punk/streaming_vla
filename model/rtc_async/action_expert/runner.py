@@ -89,6 +89,8 @@ class ActionExpertRunner(nn.Module):
         attention_mask: torch.Tensor | None = None,
         prompt_mask: torch.Tensor | None = None,
         step_mask: torch.Tensor | None = None,
+        known_action: torch.Tensor | None = None,
+        known_mask: torch.Tensor | None = None,
         kv_cache_key: Hashable | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
@@ -104,6 +106,8 @@ class ActionExpertRunner(nn.Module):
             attention_mask=attention_mask,
             prompt_mask=prompt_mask,
             step_mask=step_mask,
+            known_action=known_action,
+            known_mask=known_mask,
             kv_cache_store=self.kv_cache_store,
             kv_cache_key=kv_cache_key,
             generator=generator,

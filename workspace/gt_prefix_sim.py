@@ -28,11 +28,9 @@ from normalization import RTCNormalizer
 from workspace.rollout_libero_rtc_async_video import (
     LiberoEnv,
     _build_state_tensor,
-    _initial_frame_window,
     _load_task_init_states,
     _save_video,
     _set_init_state,
-    _window_array,
     benchmark,
     task_name_to_suite_and_ids,
 )
@@ -175,19 +173,17 @@ def _step_length(
 ) -> int:
     has_aux = aux_stack is not None
     t_idx = max(0, int(images.shape[0] // 2))
-    ts_ms = int(t_idx) * int(source_dt_ms)
     step_text = _build_step_text(
-        ts_ms=ts_ms,
-        video_token=encoder.processor.video_token,
+        ts_ms=int(t_idx * int(source_dt_ms)),
+        video_token=encoder.processor.image_token,
         has_aux=has_aux,
     )
-    frame_ids = _video_window_indices(int(t_idx), int(num_frames), int(frame_stride_steps))
-    videos = [[_make_video_tensor(images[torch.as_tensor(frame_ids, dtype=torch.long)], int(num_frames))]]
+    images_for_step = [[images[int(t_idx)]]]
     if has_aux:
-        videos[0].append(_make_video_tensor(aux_stack[int(t_idx)].unsqueeze(0), 1))
+        images_for_step[0].append(aux_stack[int(t_idx)])
     proc = encoder.processor(
         text=[step_text],
-        videos=videos,
+        images=images_for_step,
         padding=False,
         return_tensors="pt",
         add_special_tokens=False,
@@ -215,7 +211,6 @@ def run_gt_prefix_rollout(
 
     source_dt_ms = int(cfg.training.source_dt_ms)
     num_frames = int(cfg.model.num_frames)
-    frame_stride_steps = int(cfg.model.get("video_frame_stride_steps", 1))
     anchor_stride_steps = int(cfg.dataset.anchor_stride_steps or 1)
     step_dt_min_ms = int(cfg.training.step_dt_min_ms)
     step_dt_max_ms = int(cfg.training.step_dt_max_ms)
@@ -289,7 +284,7 @@ def run_gt_prefix_rollout(
         aux_stack=aux_stack,
         source_dt_ms=source_dt_ms,
         num_frames=num_frames,
-        frame_stride_steps=frame_stride_steps,
+        frame_stride_steps=1,
     )
     base_len = prompt_len + step_len
     available_len = max(max_context_len - base_len, 0)
@@ -303,7 +298,7 @@ def run_gt_prefix_rollout(
     state_keys = [str(k) for k in cfg.dataset.state_keys]
     env = LiberoEnv(
         task_name=task_name,
-        image_size=128,
+        image_size=256,
         seed=int(cfg.training.seed),
         camera_names=[
             image_key.replace("_rgb", ""),
@@ -322,11 +317,6 @@ def run_gt_prefix_rollout(
             obs = _set_init_state(env, init_states[init_idx])
 
             prompt = str(obs["prompt"])
-            frame_window: deque[np.ndarray] = _initial_frame_window(
-                obs[image_key],
-                num_frames=num_frames,
-                frame_stride_steps=frame_stride_steps,
-            )
             if save_video_path is not None:
                 frames_to_save.append(env.render())
 
@@ -340,18 +330,13 @@ def run_gt_prefix_rollout(
                     if save_video_path is not None:
                         frames_to_save.append(env.render())
                     current_t += 1
-                    frame_window.append(np.asarray(obs[image_key], dtype=np.uint8))
                     if done:
                         raise RuntimeError("Environment ended while advancing to the next GT history step.")
                 if current_t != hist_t:
                     raise RuntimeError(f"Environment time drifted: current_t={current_t}, expected hist_t={hist_t}")
 
                 context_videos.append(
-                    _window_array(
-                        frame_window,
-                        num_frames=num_frames,
-                        frame_stride_steps=frame_stride_steps,
-                    )
+                    np.asarray(obs[image_key], dtype=np.uint8)[None, ...]
                 )
                 if aux_image_key is not None and aux_image_key in obs:
                     context_aux_videos.append(np.asarray(obs[aux_image_key], dtype=np.uint8)[None, ...])
@@ -362,18 +347,13 @@ def run_gt_prefix_rollout(
                 if save_video_path is not None:
                     frames_to_save.append(env.render())
                 current_t += 1
-                frame_window.append(np.asarray(obs[image_key], dtype=np.uint8))
                 if done:
                     raise RuntimeError("Environment ended while advancing to anchor.")
             if current_t != anchor_t:
                 raise RuntimeError(f"Anchor mismatch: current_t={current_t}, anchor_t={anchor_t}")
 
             state = _build_state_tensor(obs, state_keys, device=encoder.device)
-            anchor_video_np = _window_array(
-                frame_window,
-                num_frames=num_frames,
-                frame_stride_steps=frame_stride_steps,
-            )
+            anchor_video_np = np.asarray(obs[image_key], dtype=np.uint8)[None, ...]
             aux_frames = None
             if aux_image_key is not None and aux_image_key in obs:
                 aux_frames = np.asarray(obs[aux_image_key], dtype=np.uint8)[None, ...]
@@ -435,7 +415,6 @@ def run_gt_prefix_rollout(
                 if save_video_path is not None:
                     frames_to_save.append(env.render())
                 current_t += 1
-                frame_window.append(np.asarray(obs[image_key], dtype=np.uint8))
                 if reward >= 1.0:
                     success = True
                 if done:
@@ -453,8 +432,9 @@ def run_gt_prefix_rollout(
                 "step_dt_min_ms": int(step_dt_min_ms),
                 "step_dt_max_ms": int(step_dt_max_ms),
                 "anchor_stride_steps": int(anchor_stride_steps),
-                "frame_stride_steps": int(frame_stride_steps),
-                "num_frames": int(num_frames),
+                "frame_stride_steps": 1,
+                "num_frames": 1,
+                "observation_mode": "image",
                 "anchor_pos": int(anchor_pos),
                 "anchor_t": int(anchor_t),
                 "history_times": history_times,
@@ -476,7 +456,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/train_libero90_async.yaml")
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--match-rank", type=int, default=0)
-    parser.add_argument("--anchor-pos", type=int, default=8)
+    parser.add_argument("--anchor-pos", type=int, default=0)
     parser.add_argument("--save-video", action="store_true")
     args = parser.parse_args()
 

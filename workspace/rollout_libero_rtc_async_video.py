@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import json
 import os
 import pathlib
 import random
 import sys
 import time
-from collections import deque
 from typing import Any, Dict, List, Optional
 
 import imageio
@@ -56,7 +57,6 @@ def _ensure_libero_config() -> None:
 _ensure_libero_config()
 
 
-from dataset.libero90_async_dataset import LiberoEpisodeDataset
 from libero.libero import benchmark, get_libero_path
 from model import Qwen3RTCVLAOnlinePipeline
 from oat.oat.env.libero.env import LiberoEnv, task_name_to_suite_and_ids
@@ -71,27 +71,6 @@ def _build_state_tensor(obs: Dict[str, Any], state_keys: List[str], device: str)
     return torch.from_numpy(state).to(device=device).unsqueeze(0)
 
 
-def _raw_window_size(num_frames: int, frame_stride_steps: int) -> int:
-    return 1 + max(0, int(num_frames) - 1) * int(frame_stride_steps)
-
-
-def _initial_frame_window(frame: np.ndarray, num_frames: int, frame_stride_steps: int) -> deque[np.ndarray]:
-    q: deque[np.ndarray] = deque(maxlen=_raw_window_size(num_frames, frame_stride_steps))
-    for _ in range(q.maxlen):
-        q.append(np.asarray(frame, dtype=np.uint8))
-    return q
-
-
-def _window_array(frame_window: deque[np.ndarray], *, num_frames: int, frame_stride_steps: int) -> np.ndarray:
-    arr = list(frame_window)
-    end = len(arr) - 1
-    indices = [
-        max(0, end - int(frame_stride_steps) * (int(num_frames) - 1 - i))
-        for i in range(int(num_frames))
-    ]
-    return np.stack([np.asarray(arr[idx], dtype=np.uint8) for idx in indices], axis=0)
-
-
 def _set_init_state(env: LiberoEnv, init_state: np.ndarray) -> Dict[str, Any]:
     raw_obs = env.env.set_init_state(init_state)
     env.done = False
@@ -102,14 +81,6 @@ def _set_init_state(env: LiberoEnv, init_state: np.ndarray) -> Dict[str, Any]:
 def _load_task_init_states(task) -> torch.Tensor:
     init_states_path = pathlib.Path(get_libero_path("init_states")) / task.problem_folder / task.init_states_file
     return torch.load(init_states_path, weights_only=False)
-
-
-def _find_matching_episode_indices(dataset: LiberoEpisodeDataset, prompt: str) -> List[int]:
-    out: List[int] = []
-    for ep_idx in range(len(dataset)):
-        if str(dataset.get_prompt(ep_idx)) == prompt:
-            out.append(int(ep_idx))
-    return out
 
 
 def _save_video(path: str, frames: List[np.ndarray], fps: int) -> None:
@@ -128,6 +99,124 @@ def _summary(values: List[float]) -> Dict[str, float]:
         "min": float(arr.min()),
         "max": float(arr.max()),
     }
+
+
+@dataclass
+class ScheduledExecuteChunk:
+    step_id: int
+    start_step: int
+    end_step: int
+    step_delay_steps: int
+    prefix_len: int
+    actions: np.ndarray
+
+
+def _ingest_execute_packet(
+    *,
+    scheduled_chunks: deque[ScheduledExecuteChunk],
+    packet_history: List[Dict[str, int]],
+    latest_out: Dict[str, torch.Tensor | int],
+    source_dt_ms: int,
+) -> None:
+    stitched_chunk = latest_out["stitched_chunk"]
+    if not isinstance(stitched_chunk, torch.Tensor):
+        raise RuntimeError(f"stitched_chunk must be torch.Tensor, got {type(stitched_chunk)}")
+    ts_ms = latest_out.get("ts_ms", None)
+    if not isinstance(ts_ms, int):
+        raise RuntimeError(f"execute packet must include integer ts_ms, got {type(ts_ms)}")
+    start_step = max(int(round(float(ts_ms) / float(source_dt_ms))), 0)
+    if scheduled_chunks and start_step <= int(scheduled_chunks[-1].start_step):
+        raise RuntimeError(
+            f"Execute chunk start_step must be strictly increasing, got {start_step} "
+            f"after {scheduled_chunks[-1].start_step}"
+        )
+    horizon_steps = int(stitched_chunk.shape[1])
+    execute_chunk = latest_out["execute_chunk"]
+    if not isinstance(execute_chunk, torch.Tensor):
+        raise RuntimeError(f"execute_chunk must be torch.Tensor, got {type(execute_chunk)}")
+    scheduled_chunks.append(
+        ScheduledExecuteChunk(
+            step_id=int(latest_out["step_id"]),
+            start_step=start_step,
+            end_step=start_step + horizon_steps,
+            step_delay_steps=int(latest_out["step_delay_steps"]),
+            prefix_len=int(latest_out["prefix_len"]),
+            actions=stitched_chunk[0].detach().to("cpu").numpy().astype(np.float32),
+        )
+    )
+    packet_history.append(
+        {
+            "step_id": int(latest_out["step_id"]),
+            "ts_ms": int(ts_ms),
+            "start_step": int(start_step),
+            "end_step": int(start_step + horizon_steps),
+            "step_delay_steps": int(latest_out["step_delay_steps"]),
+            "prefix_len": int(latest_out["prefix_len"]),
+            "horizon_steps": int(horizon_steps),
+            "execute_steps": int(execute_chunk.shape[1]),
+        }
+    )
+
+
+def _advance_chunk_queue(
+    scheduled_chunks: deque[ScheduledExecuteChunk],
+    *,
+    current_step: int,
+) -> None:
+    while len(scheduled_chunks) >= 2 and int(scheduled_chunks[1].start_step) <= int(current_step):
+        scheduled_chunks.popleft()
+    while scheduled_chunks and int(scheduled_chunks[0].end_step) <= int(current_step):
+        scheduled_chunks.popleft()
+
+
+def _active_chunk_action(
+    scheduled_chunks: deque[ScheduledExecuteChunk],
+    *,
+    current_step: int,
+) -> np.ndarray:
+    _advance_chunk_queue(scheduled_chunks, current_step=current_step)
+    if not scheduled_chunks:
+        raise RuntimeError(f"No execute chunk covers current_step={current_step}")
+    active = scheduled_chunks[0]
+    if not (int(active.start_step) <= int(current_step) < int(active.end_step)):
+        raise RuntimeError(f"No execute chunk covers current_step={current_step}")
+    offset = int(current_step) - int(active.start_step)
+    if offset < 0 or offset >= int(active.actions.shape[0]):
+        raise RuntimeError(
+            f"Active chunk offset out of range: current_step={current_step}, "
+            f"start_step={active.start_step}, action_len={active.actions.shape[0]}"
+        )
+    return active.actions[offset]
+
+
+def _drain_execute_packets(
+    *,
+    pipeline: Qwen3RTCVLAOnlinePipeline,
+    scheduled_chunks: deque[ScheduledExecuteChunk],
+    packet_history: List[Dict[str, int]],
+    source_dt_ms: int,
+) -> None:
+    latest_out = pipeline.poll_execute_packet()
+    while latest_out is not None:
+        _ingest_execute_packet(
+            scheduled_chunks=scheduled_chunks,
+            packet_history=packet_history,
+            latest_out=latest_out,
+            source_dt_ms=source_dt_ms,
+        )
+        latest_out = pipeline.poll_execute_packet()
+
+
+def _has_active_chunk(
+    scheduled_chunks: deque[ScheduledExecuteChunk],
+    *,
+    current_step: int,
+) -> bool:
+    _advance_chunk_queue(scheduled_chunks, current_step=current_step)
+    if not scheduled_chunks:
+        return False
+    head = scheduled_chunks[0]
+    return int(head.start_step) <= int(current_step) < int(head.end_step)
 
 
 def run_async_rollout(
@@ -152,31 +241,19 @@ def run_async_rollout(
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
     task = task_suite.get_task(task_id)
     init_states = _load_task_init_states(task)
+    num_init_states = int(init_states.shape[0])
+    if num_init_states <= 0:
+        raise ValueError(f"Task has no init states: {task.name}")
+    if match_rank < 0 or match_rank >= num_init_states:
+        raise ValueError(f"match_rank out of range for init states: {match_rank}, total_init_states={num_init_states}")
 
-    dataset = LiberoEpisodeDataset(
-        zarr_path=str(cfg.dataset.zarr_path),
-        image_key=str(cfg.dataset.image_key),
-        extra_image_keys=([str(cfg.dataset.aux_image_key)] if cfg.dataset.get("aux_image_key", None) else []),
-        action_key=str(cfg.dataset.action_key),
-        state_keys=[str(k) for k in cfg.dataset.state_keys],
-        prompt_key=str(cfg.dataset.prompt_key),
-        max_episodes=cfg.dataset.max_episodes,
-    )
-    matched = _find_matching_episode_indices(dataset, str(task.language))
-    if not matched:
-        raise ValueError(f"No dataset episodes matched task prompt: {task.language}")
-    if match_rank < 0 or match_rank >= len(matched):
-        raise ValueError(f"match_rank out of range: {match_rank}, total_matches={len(matched)}")
-
-    init_idx = min(match_rank, int(init_states.shape[0]) - 1)
+    init_idx = int(match_rank)
     image_key = str(cfg.dataset.image_key)
     aux_image_key = str(cfg.dataset.aux_image_key) if cfg.dataset.get("aux_image_key", None) else None
     state_keys = [str(k) for k in cfg.dataset.state_keys]
-    frame_stride_steps = int(cfg.model.get("video_frame_stride_steps", 1))
-
     env = LiberoEnv(
         task_name=task_name,
-        image_size=128,
+        image_size=256,
         seed=int(cfg.training.seed),
         camera_names=[
             image_key.replace("_rgb", ""),
@@ -187,7 +264,7 @@ def run_async_rollout(
     )
 
     video_frames: List[np.ndarray] = []
-    pending_actions: deque[np.ndarray] = deque()
+    scheduled_chunks: deque[ScheduledExecuteChunk] = deque()
     packet_history: List[Dict[str, int]] = []
     sampled_gap_steps: List[int] = []
     try:
@@ -200,12 +277,6 @@ def run_async_rollout(
             pipeline.reset(prompt=prompt)
             pipeline.set_runtime_timebase(source_dt_ms=int(source_dt_ms))
             pipeline.start_async_pipeline()
-
-            frame_window = _initial_frame_window(
-                obs[image_key],
-                num_frames=num_frames,
-                frame_stride_steps=frame_stride_steps,
-            )
             video_frames.append(env.render())
 
             total_env_steps = 0
@@ -221,17 +292,13 @@ def run_async_rollout(
                     state = _build_state_tensor(obs, state_keys, device=pipeline.device)
                     aux_frames = None
                     if aux_image_key is not None and aux_image_key in obs:
-                        aux_frames = np.asarray(obs[aux_image_key], dtype=np.uint8)[None, ...]
+                        aux_frames = np.asarray(obs[aux_image_key], dtype=np.uint8)
                     pipeline.push_observation(
-                        frames=_window_array(
-                            frame_window,
-                            num_frames=num_frames,
-                            frame_stride_steps=frame_stride_steps,
-                        ),
+                        frames=np.asarray(obs[image_key], dtype=np.uint8),
                         aux_frames=aux_frames,
                         state=state,
                         ts_ms=total_env_steps * source_dt_ms,
-                        num_frames=num_frames,
+                        num_frames=1,
                     )
                     if observation_gap_steps is None:
                         gap_ms = rng.randint(int(step_dt_min_ms), int(step_dt_max_ms))
@@ -241,79 +308,55 @@ def run_async_rollout(
                     sampled_gap_steps.append(int(gap_steps))
                     next_obs_step += int(gap_steps)
 
-                latest_out = pipeline.poll_execute_packet()
-                while True:
-                    newer_out = pipeline.poll_execute_packet()
-                    if newer_out is None:
-                        break
-                    latest_out = newer_out
-                if latest_out is not None:
-                    execute_chunk = latest_out["execute_chunk"]
-                    if not isinstance(execute_chunk, torch.Tensor):
-                        raise RuntimeError(f"execute_chunk must be torch.Tensor, got {type(execute_chunk)}")
-                    pending_actions = deque(
-                        execute_chunk[0].detach().to("cpu").numpy().astype(np.float32)
-                    )
-                    packet_history.append(
-                        {
-                            "step_id": int(latest_out["step_id"]),
-                            "step_delay_steps": int(latest_out["step_delay_steps"]),
-                            "prefix_len": int(latest_out["prefix_len"]),
-                            "execute_steps": int(execute_chunk.shape[1]),
-                        }
-                    )
+                _drain_execute_packets(
+                    pipeline=pipeline,
+                    scheduled_chunks=scheduled_chunks,
+                    packet_history=packet_history,
+                    source_dt_ms=source_dt_ms,
+                )
 
-                if not pending_actions:
+                if not _has_active_chunk(scheduled_chunks, current_step=total_env_steps):
                     wait_deadline = time.perf_counter() + float(max_wait_s)
-                    while time.perf_counter() < wait_deadline and not pending_actions:
-                        latest_out = pipeline.poll_execute_packet()
-                        if latest_out is not None:
-                            execute_chunk = latest_out["execute_chunk"]
-                            if not isinstance(execute_chunk, torch.Tensor):
-                                raise RuntimeError(f"execute_chunk must be torch.Tensor, got {type(execute_chunk)}")
-                            pending_actions = deque(
-                                execute_chunk[0].detach().to("cpu").numpy().astype(np.float32)
-                            )
-                            packet_history.append(
-                                {
-                                    "step_id": int(latest_out["step_id"]),
-                                    "step_delay_steps": int(latest_out["step_delay_steps"]),
-                                    "prefix_len": int(latest_out["prefix_len"]),
-                                    "execute_steps": int(execute_chunk.shape[1]),
-                                }
-                            )
+                    while time.perf_counter() < wait_deadline:
+                        _drain_execute_packets(
+                            pipeline=pipeline,
+                            scheduled_chunks=scheduled_chunks,
+                            packet_history=packet_history,
+                            source_dt_ms=source_dt_ms,
+                        )
+                        if _has_active_chunk(scheduled_chunks, current_step=total_env_steps):
                             break
                         time.sleep(0.001)
-                    if not pending_actions:
-                        break
+                    if not _has_active_chunk(scheduled_chunks, current_step=total_env_steps):
+                        raise RuntimeError(
+                            f"No execute chunk became available for current_step={total_env_steps} "
+                            f"within max_wait_s={max_wait_s}"
+                        )
 
                 target_time = rollout_start + (total_env_steps + 1) * control_dt_s
-                while True:
-                    latest_out = pipeline.poll_execute_packet()
-                    if latest_out is None:
-                        break
-                    execute_chunk = latest_out["execute_chunk"]
-                    if not isinstance(execute_chunk, torch.Tensor):
-                        raise RuntimeError(f"execute_chunk must be torch.Tensor, got {type(execute_chunk)}")
-                    pending_actions = deque(
-                        execute_chunk[0].detach().to("cpu").numpy().astype(np.float32)
-                    )
-                    packet_history.append(
-                        {
-                            "step_id": int(latest_out["step_id"]),
-                            "step_delay_steps": int(latest_out["step_delay_steps"]),
-                            "prefix_len": int(latest_out["prefix_len"]),
-                            "execute_steps": int(execute_chunk.shape[1]),
-                        }
-                    )
+                _drain_execute_packets(
+                    pipeline=pipeline,
+                    scheduled_chunks=scheduled_chunks,
+                    packet_history=packet_history,
+                    source_dt_ms=source_dt_ms,
+                )
                 sleep_s = target_time - time.perf_counter()
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-                action = pending_actions.popleft()
+                _drain_execute_packets(
+                    pipeline=pipeline,
+                    scheduled_chunks=scheduled_chunks,
+                    packet_history=packet_history,
+                    source_dt_ms=source_dt_ms,
+                )
+
+                action = _active_chunk_action(
+                    scheduled_chunks,
+                    current_step=total_env_steps,
+                )
                 obs, reward, done, _, _ = env.step(action)
                 total_env_steps += 1
-                frame_window.append(np.asarray(obs[image_key], dtype=np.uint8))
                 video_frames.append(env.render())
                 if reward >= 1.0:
                     success = True
@@ -328,8 +371,8 @@ def run_async_rollout(
                 "observation_gap_steps": (None if observation_gap_steps is None else int(observation_gap_steps)),
                 "observation_gap_mode": ("random" if observation_gap_steps is None else "fixed"),
                 "sampled_gap_steps_summary": _summary([float(x) for x in sampled_gap_steps]),
-                "num_frames": int(num_frames),
-                "video_frame_stride_steps": int(frame_stride_steps),
+                "num_frames": 1,
+                "observation_mode": "image",
                 "success": bool(success),
                 "done": bool(done),
                 "total_env_steps": int(total_env_steps),
@@ -351,7 +394,7 @@ def main() -> None:
     parser.add_argument("--dit-device", type=str, default=None)
     parser.add_argument("--match-rank", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=None)
-    parser.add_argument("--max-env-steps", type=int, default=300)
+    parser.add_argument("--max-env-steps", type=int, default=900)
     parser.add_argument("--observation-gap-steps", type=int, default=None)
     parser.add_argument("--step-dt-min-ms", type=int, default=None)
     parser.add_argument("--step-dt-max-ms", type=int, default=None)

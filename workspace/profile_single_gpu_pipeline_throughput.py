@@ -128,17 +128,17 @@ def _install_queue_stats(pipeline: Qwen3RTCVLAOnlinePipeline) -> Dict[str, Dict[
     queue_stats: Dict[str, Dict[str, int]] = {}
     for name in ("step_queue", "context_queue", "action_queue", "execute_queue"):
         queue = getattr(pipeline.queues, name)
-        stats = {"put_count": 0, "pop_count": 0, "replace_count": 0}
+        stats = {"put_count": 0, "pop_count": 0, "full_count": 0}
         queue_stats[name] = stats
 
         orig_put_latest = queue.put_latest
         orig_pop = queue.pop
-        orig_empty = queue.empty
+        orig_full = queue.full
 
         @wraps(orig_put_latest)
-        def put_latest(item, *, _orig=orig_put_latest, _empty=orig_empty, _stats=stats):
-            if not _empty():
-                _stats["replace_count"] += 1
+        def put_latest(item, *, _orig=orig_put_latest, _full=orig_full, _stats=stats):
+            if _full():
+                _stats["full_count"] += 1
             _stats["put_count"] += 1
             return _orig(item)
 
@@ -225,7 +225,7 @@ def run_single_gpu_throughput_profile(
 
     env = LiberoEnv(
         task_name=task_name,
-        image_size=128,
+        image_size=256,
         seed=int(cfg.training.seed),
         camera_names=[
             image_key.replace("_rgb", ""),

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -16,20 +15,17 @@ from ..template_qwen3_vla import build_step_user_prefix, build_video_text
 class StreamState:
     past_key_values: Optional[object] = None
     attention_mask: Optional[torch.Tensor] = None
-    last_vision_time: float = 0.0
 
 
 class Qwen3VLStreamRunner:
     def __init__(
         self,
         model: Qwen3VLForConditionalGeneration,
-        vision_interval_s: float,
         max_context_len: Optional[int] = None,
         use_step_eviction: bool = True,
         tokenizer=None,
     ) -> None:
         self.model = model
-        self.vision_interval_s = float(vision_interval_s)
         self.state = StreamState()
         self.token_log: Optional[torch.LongTensor] = None
         self.image_grid_log: Optional[torch.LongTensor] = None
@@ -38,6 +34,7 @@ class Qwen3VLStreamRunner:
         self.max_context_len = int(max_context_len) if max_context_len is not None else None
         self.use_step_eviction = bool(use_step_eviction)
         self.step_spans: list[tuple[int, int]] = []
+        self.step_mm_counts: list[tuple[int, int]] = []
         self.last_logits: Optional[torch.Tensor] = None
 
     def _get_rope_model(self) -> Any:
@@ -54,6 +51,7 @@ class Qwen3VLStreamRunner:
         self.video_grid_log = None
         self.prefill_len = 0
         self.step_spans = []
+        self.step_mm_counts = []
         self._get_rope_model().rope_deltas = None
         self.last_logits = None
 
@@ -107,13 +105,17 @@ class Qwen3VLStreamRunner:
             if self.state.past_key_values is not None:
                 self._select_cache_mask(keep_mask)
 
-            if self.video_grid_log is not None and self.video_grid_log.shape[0] > 0:
-                self.video_grid_log = self.video_grid_log[1:]
+            image_count, video_count = self.step_mm_counts[0]
+            if self.image_grid_log is not None and image_count > 0:
+                self.image_grid_log = self.image_grid_log[image_count:]
+            if self.video_grid_log is not None and video_count > 0:
+                self.video_grid_log = self.video_grid_log[video_count:]
 
             removed_len = end - start
             self.step_spans = [
                 (s - removed_len, e - removed_len) for (s, e) in self.step_spans[1:]
             ]
+            self.step_mm_counts = self.step_mm_counts[1:]
 
         if self.token_log.shape[1] > self.max_context_len:
             available_len = self.max_context_len - self.prefill_len
@@ -318,17 +320,15 @@ class Qwen3VLStreamRunner:
         self,
         *,
         input_ids: torch.LongTensor,
-        pixel_values_videos: Optional[torch.FloatTensor],
-        video_grid_thw: torch.LongTensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
         precomputed_video_outputs=None,
         attention_mask: Optional[torch.Tensor] = None,
-        now: Optional[float] = None,
     ) -> bool:
-        now = time.monotonic() if now is None else now
-        if now - self.state.last_vision_time < self.vision_interval_s:
-            return False
-        if pixel_values_videos is None and precomputed_video_outputs is None:
-            raise ValueError("append_step_tokens requires pixel_values_videos or precomputed_video_outputs.")
+        if pixel_values is None and pixel_values_videos is None and precomputed_video_outputs is None:
+            raise ValueError("append_step_tokens requires image or video inputs.")
 
         step_start = 0 if self.token_log is None else int(self.token_log.shape[1])
         batch_size, seq_len = input_ids.shape
@@ -338,13 +338,20 @@ class Qwen3VLStreamRunner:
         self._forward_append(
             input_ids=input_ids,
             attention_mask=local_mask,
+            pixel_values=pixel_values,
             pixel_values_videos=None if precomputed_video_outputs is not None else pixel_values_videos,
             precomputed_video_outputs=precomputed_video_outputs,
+            image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
         )
-        self.state.last_vision_time = now
         step_end = int(self.token_log.shape[1])
         self.step_spans.append((step_start, step_end))
+        self.step_mm_counts.append(
+            (
+                0 if image_grid_thw is None else int(image_grid_thw.shape[0]),
+                0 if video_grid_thw is None else int(video_grid_thw.shape[0]),
+            )
+        )
         self._evict_steps_if_needed(step_end - step_start)
         return True
 
@@ -356,7 +363,6 @@ class Qwen3VLStreamRunner:
         aux_video: Optional[object] = None,
         video_path: Optional[str] = None,
         ts: Optional[str] = None,
-        now: Optional[float] = None,
     ) -> bool:
         if (video is None) == (video_path is None):
             raise ValueError("Provide exactly one of video or video_path.")
@@ -367,37 +373,32 @@ class Qwen3VLStreamRunner:
         if tokenizer is None:
             raise ValueError("processor.tokenizer is required for insert_step.")
 
-        video_token = getattr(processor, "video_token", "<|video_pad|>")
+        video_token = getattr(processor, "image_token", "<|image_pad|>")
         has_aux = aux_video is not None
         prefix_text = build_step_user_prefix(
-            ts_ms=int(ts) if ts is not None else None,
+            ts_ms=0,
             video_token=build_video_text(video_token=video_token, has_aux=has_aux),
         )
         video_payload = video if video is not None else video_path
-        videos = [video_payload]
-        if aux_video is not None:
-            videos.append(aux_video)
         proc = processor(
             text=[prefix_text],
-            videos=[videos],
+            images=[[video_payload] + ([aux_video] if aux_video is not None else [])],
             padding=True,
             return_tensors="pt",
             add_special_tokens=False,
         )
         input_ids = proc["input_ids"].to(self.model.device)
         attention_mask = proc["attention_mask"].to(self.model.device)
-        pixel_values_videos = proc["pixel_values_videos"].to(self.model.device)
-        video_grid_thw = proc["video_grid_thw"].to(self.model.device)
+        pixel_values = proc["pixel_values"].to(self.model.device)
+        image_grid_thw = proc["image_grid_thw"].to(self.model.device)
         seq_len = int(attention_mask[0].sum().item())
         input_ids = input_ids[:, :seq_len]
         attention_mask = attention_mask[:, :seq_len]
         did_append = self.append_step_tokens(
             input_ids=input_ids,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            precomputed_video_outputs=None,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
-            now=now,
         )
         if not did_append:
             return False
@@ -411,11 +412,7 @@ class Qwen3VLStreamRunner:
         video_grid_thw: torch.LongTensor,
         precomputed_video_outputs=None,
         attention_mask: Optional[torch.Tensor] = None,
-        now: Optional[float] = None,
     ) -> bool:
-        now = time.monotonic() if now is None else now
-        if now - self.state.last_vision_time < self.vision_interval_s:
-            return False
         if pixel_values_videos is None and precomputed_video_outputs is None:
             raise ValueError("append_vision_tokens requires pixel_values_videos or precomputed_video_outputs.")
         batch_size, seq_len = input_ids.shape
@@ -436,7 +433,6 @@ class Qwen3VLStreamRunner:
             precomputed_video_outputs=precomputed_video_outputs,
             video_grid_thw=video_grid_thw,
         )
-        self.state.last_vision_time = now
         return True
 
     

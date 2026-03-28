@@ -36,12 +36,14 @@ class ContextPacket:
 class ActionPacket:
     step_id: int
     ts_ms: Optional[int]
+    step_delay_steps: int
     action_chunk: torch.Tensor
 
 
 @dataclass
 class ExecutePacket:
     step_id: int
+    ts_ms: Optional[int]
     step_delay_steps: int
     prefix_len: int
     action_chunk: torch.Tensor

@@ -9,7 +9,7 @@ rtc_async:
   use_attention_mask: true
 
 dataset:
-  zarr_path: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero/libero90_N4500.zarr
+  zarr_path: /inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero_256/libero90_N4500.zarr
   image_key: agentview_rgb
   aux_image_key: robot0_eye_in_hand_rgb
   action_key: action
@@ -19,7 +19,7 @@ dataset:
     - robot0_eef_pos
     - robot0_eef_quat
     - robot0_gripper_qpos
-  anchor_stride_steps: 8
+  anchor_stride_steps: 4
   episode_cache_size: 8
   max_episodes: null
   val_ratio: 0.1
@@ -45,7 +45,7 @@ scheduler:
   warmup_steps: 500
 
 dataloader:
-  batch_size: 13
+  batch_size: 12
   shuffle: true
   num_workers: 5
   pin_memory: true
@@ -53,7 +53,7 @@ dataloader:
   drop_last: false
 
 val_dataloader:
-  batch_size: 13
+  batch_size: 12
   shuffle: true
   num_workers: 5
   pin_memory: true
@@ -62,9 +62,10 @@ val_dataloader:
 
 eval:
   max_val_batches: null
+  denoise_mse_num_samples: 64
 
 checkpoint:
   save_every: 2
   best_monitor: val/rtc_loss
   best_mode: min
-  resume_from: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/Streaming_VLA/checkpoints/epoch_0008.pt
+  resume_from: null

@@ -1,8 +1,7 @@
 mode: rtc_async
 
 stream:
-  vision_interval_s: 0.0
-  max_context_len: 1024
+  max_context_len: 2048
   selected_layers: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 
 action_expert:

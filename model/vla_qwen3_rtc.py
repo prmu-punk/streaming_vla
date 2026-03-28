@@ -15,7 +15,6 @@ from .template_qwen3_vla import build_prompt_prefill_text, build_step_user_prefi
 
 @dataclass
 class StreamConfig:
-    vision_interval_s: float = 0.0
     max_context_len: Optional[int] = None
 
 
@@ -27,7 +26,7 @@ class LoRAConfig:
     dropout: float = 0.05
     layers_end: int | None = None
     target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
-    modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens", "lm_head"])
+    modules_to_save: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,7 +78,6 @@ def _load_rtc_vla_config(config_path: str) -> RTCVLAConfig:
     if max_context_len is not None:
         max_context_len = int(float(max_context_len))
     stream_cfg = StreamConfig(
-        vision_interval_s=float(stream_raw.get("vision_interval_s", 0.0)),
         max_context_len=max_context_len,
     )
     lora_raw = raw.get("lora", {}) or {}
@@ -90,7 +88,7 @@ def _load_rtc_vla_config(config_path: str) -> RTCVLAConfig:
         dropout=float(lora_raw.get("dropout", 0.05)),
         layers_end=(None if lora_raw.get("layers_end", None) is None else int(lora_raw["layers_end"])),
         target_modules=[str(x) for x in lora_raw.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])],
-        modules_to_save=[str(x) for x in lora_raw.get("modules_to_save", ["embed_tokens", "lm_head"])],
+        modules_to_save=[str(x) for x in lora_raw.get("modules_to_save", [])],
     )
 
     return RTCVLAConfig(
@@ -153,20 +151,15 @@ class Qwen3RTCVLAEncoder(nn.Module):
         head_dim = getattr(text_cfg, "head_dim", None) or (text_cfg.hidden_size // text_cfg.num_attention_heads)
         self.kv_cache_dim = int(text_cfg.num_key_value_heads * head_dim)
 
-    def _make_video_tensor(self, frames: np.ndarray | torch.Tensor, num_frames: int) -> torch.Tensor:
+    def _make_image_tensor(self, frames: np.ndarray | torch.Tensor) -> torch.Tensor:
         if isinstance(frames, np.ndarray):
             frames_t = torch.from_numpy(frames)
         else:
             frames_t = frames
-        if frames_t.dim() == 3:
-            frames_t = frames_t.unsqueeze(0)
+        if frames_t.dim() == 4:
+            frames_t = frames_t[-1]
         if frames_t.shape[-1] == 3:
-            frames_t = frames_t.permute(0, 3, 1, 2)
-        if frames_t.shape[0] < num_frames:
-            repeat = num_frames - frames_t.shape[0]
-            frames_t = torch.cat([frames_t, frames_t[-1:].repeat(repeat, 1, 1, 1)], dim=0)
-        elif frames_t.shape[0] > num_frames:
-            frames_t = frames_t[:num_frames]
+            frames_t = frames_t.permute(2, 0, 1)
         return frames_t
 
     def _build_step_text(self, *, ts_ms: int | None, video_token: str, has_aux: bool) -> str:
@@ -218,12 +211,12 @@ class Qwen3RTCVLAEncoder(nn.Module):
             `OfflineContextBatchOutput`，键集合由 `return_condition_cache` 控制。
         """
         batch_texts: List[str] = []
-        batch_videos: List[List[torch.Tensor]] = []
+        batch_images: List[List[torch.Tensor]] = []
         batch_target_chunks: List[torch.Tensor] = []
         prompt_lengths: List[int] = []
         step_lengths: List[int] = []
 
-        video_token = self.processor.video_token
+        image_token = self.processor.image_token
 
         for sample in samples:
             prompt = sample.get("prompt", None)
@@ -246,44 +239,49 @@ class Qwen3RTCVLAEncoder(nn.Module):
             else:
                 prompt_lengths.append(0)
 
-            videos: List[torch.Tensor] = []
+            images: List[torch.Tensor] = []
 
             context_videos = sample["context_videos"]
             context_aux_videos = sample.get("context_aux_videos", None)
             context_time_indices = sample["context_time_indices"]
+            anchor_t_idx = int(sample["anchor_time_idx"].item())
             n_context = int(context_videos.shape[0])
 
             for i in range(n_context):
-                ts_ms = int(context_time_indices[i].item()) * int(source_dt_ms)
+                context_t_idx = int(context_time_indices[i].item())
+                ts_ms = int(context_t_idx * int(source_dt_ms))
                 has_aux = (
                     context_aux_videos is not None
                     and int(context_aux_videos.shape[0]) > i
                     and int(context_aux_videos[i].shape[0]) > 0
                 )
-                parts.append(self._build_step_text(ts_ms=ts_ms, video_token=video_token, has_aux=has_aux))
-                videos.append(self._make_video_tensor(context_videos[i], num_frames))
+                parts.append(self._build_step_text(ts_ms=ts_ms, video_token=image_token, has_aux=has_aux))
+                images.append(self._make_image_tensor(context_videos[i]))
                 if has_aux:
-                    videos.append(self._make_video_tensor(context_aux_videos[i], 1))
+                    images.append(self._make_image_tensor(context_aux_videos[i]))
 
-            anchor_ts_ms = int(sample["anchor_time_idx"].item()) * int(source_dt_ms)
             anchor_aux_video = sample.get("anchor_aux_video", None)
             has_anchor_aux = anchor_aux_video is not None and int(anchor_aux_video.shape[0]) > 0
-            anchor_text = self._build_step_text(ts_ms=anchor_ts_ms, video_token=video_token, has_aux=has_anchor_aux)
+            anchor_text = self._build_step_text(
+                ts_ms=int(anchor_t_idx * int(source_dt_ms)),
+                video_token=image_token,
+                has_aux=has_anchor_aux,
+            )
             parts.append(anchor_text)
-            anchor_video = self._make_video_tensor(sample["anchor_video"], num_frames)
-            videos.append(anchor_video)
-            step_videos = [anchor_video]
+            anchor_image = self._make_image_tensor(sample["anchor_video"])
+            images.append(anchor_image)
+            step_images = [anchor_image]
             if has_anchor_aux:
-                anchor_aux = self._make_video_tensor(anchor_aux_video, 1)
-                videos.append(anchor_aux)
-                step_videos.append(anchor_aux)
+                anchor_aux = self._make_image_tensor(anchor_aux_video)
+                images.append(anchor_aux)
+                step_images.append(anchor_aux)
 
             batch_texts.append("".join(parts))
-            batch_videos.append(videos)
+            batch_images.append(images)
             batch_target_chunks.append(sample["target_chunk"].to(self.device))
             step_proc = self.processor(
                 text=[anchor_text],
-                videos=[step_videos],
+                images=[step_images],
                 padding=False,
                 return_tensors="pt",
                 add_special_tokens=False,
@@ -292,21 +290,21 @@ class Qwen3RTCVLAEncoder(nn.Module):
 
         proc = self.processor(
             text=batch_texts,
-            videos=batch_videos,
+            images=batch_images,
             padding=True,
             return_tensors="pt",
             add_special_tokens=False,
         )
         input_ids = proc["input_ids"].to(self.device)
         attention_mask = proc["attention_mask"].to(self.device)
-        pixel_values_videos = proc["pixel_values_videos"].to(self.device)
-        video_grid_thw = proc["video_grid_thw"].to(self.device)
+        pixel_values = proc["pixel_values"].to(self.device)
+        image_grid_thw = proc["image_grid_thw"].to(self.device)
 
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             use_cache=return_condition_cache,
             return_dict=True,
         )

@@ -85,6 +85,8 @@ def euler_sample_actions(
     attention_mask: torch.Tensor | None = None,
     prompt_mask: torch.Tensor | None = None,
     step_mask: torch.Tensor | None = None,
+    known_action: torch.Tensor | None = None,
+    known_mask: torch.Tensor | None = None,
     kv_cache_store: DiffusionKVCache | None = None,
     kv_cache_key: Hashable | None = None,
     generator: torch.Generator | None = None,
@@ -117,19 +119,42 @@ def euler_sample_actions(
             prompt_mask=prompt_mask,
             step_mask=step_mask,
         )
+    if known_action is not None:
+        known_action = known_action.to(device=device, dtype=dtype)
+        if known_action.shape != (batch_size, horizon, action_dim):
+            raise ValueError(
+                f"known_action must be [B, H, D], got {tuple(known_action.shape)}, "
+                f"expected {(batch_size, horizon, action_dim)}"
+            )
+    if known_mask is not None:
+        known_mask = known_mask.to(device=device, dtype=torch.bool)
+        if known_mask.shape != (batch_size, horizon):
+            raise ValueError(f"known_mask must be [B, H], got {tuple(known_mask.shape)}")
+    if (known_action is None) != (known_mask is None):
+        raise ValueError("known_action and known_mask must be provided together")
     x_t = torch.randn((batch_size, horizon, action_dim), device=device, dtype=dtype, generator=generator)
+    if known_action is not None and known_mask is not None:
+        x_t = torch.where(known_mask.unsqueeze(-1), known_action, x_t)
     t = torch.zeros((batch_size,), device=device, dtype=dtype)
     dt = 1.0 / float(num_steps)
     for _ in range(num_steps):
+        time_input: torch.Tensor
+        if known_mask is not None:
+            time_input = t[:, None].expand(batch_size, horizon)
+            time_input = torch.where(known_mask, torch.ones_like(time_input), time_input)
+        else:
+            time_input = t
         v_t = model(
             noisy_action=x_t,
             state=state,
-            time=t,
+            time=time_input,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
             prompt_mask=prompt_mask,
             step_mask=step_mask,
         )
         x_t = x_t + dt * v_t
+        if known_action is not None and known_mask is not None:
+            x_t = torch.where(known_mask.unsqueeze(-1), known_action, x_t)
         t = t + dt
     return x_t

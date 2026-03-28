@@ -353,19 +353,17 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         has_aux = aux_stack is not None
         images = ep["images"]
         t_idx = max(0, int(images.shape[0] // 2))
-        ts_ms = int(t_idx) * int(self.source_dt_ms)
         step_text = self._build_step_text(
-            ts_ms=ts_ms,
-            video_token=self._planning_processor.video_token,
+            ts_ms=int(t_idx * self.source_dt_ms),
+            video_token=self._planning_processor.image_token,
             has_aux=has_aux,
         )
-        frame_ids = self._video_window_indices(int(t_idx))
-        videos = [[self._make_video_tensor(images[torch.as_tensor(frame_ids, dtype=torch.long)])]]
+        images_for_step = [[images[int(t_idx)]]]
         if has_aux:
-            videos[0].append(self._make_video_tensor(aux_stack[int(t_idx)].unsqueeze(0), 1))
+            images_for_step[0].append(aux_stack[int(t_idx)])
         proc = self._planning_processor(
             text=[step_text],
-            videos=videos,
+            images=images_for_step,
             padding=False,
             return_tensors="pt",
             add_special_tokens=False,
@@ -417,28 +415,26 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         context_videos = []
         context_aux_videos = []
         for t_idx in history_t:
-            frame_ids = self._video_window_indices(int(t_idx))
-            context_videos.append(images[torch.as_tensor(frame_ids, dtype=torch.long)])
+            context_videos.append(images[int(t_idx)])
             if aux_stack is not None:
-                context_aux_videos.append(aux_stack[int(t_idx)].unsqueeze(0))
+                context_aux_videos.append(aux_stack[int(t_idx)])
         if context_videos:
             context_videos_t = torch.stack(context_videos, dim=0)
         else:
             context_videos_t = torch.empty(
-                (0, self.num_frames, *images.shape[1:]),
+                (0, *images.shape[1:]),
                 dtype=images.dtype,
             )
         if context_aux_videos:
             context_aux_videos_t = torch.stack(context_aux_videos, dim=0)
         else:
             context_aux_videos_t = torch.empty(
-                (0, 1, *images.shape[1:]),
+                (0, *images.shape[1:]),
                 dtype=images.dtype,
             )
 
-        anchor_frame_ids = self._video_window_indices(anchor_t)
-        anchor_video = images[torch.as_tensor(anchor_frame_ids, dtype=torch.long)]
-        anchor_aux_video = aux_stack[anchor_t].unsqueeze(0) if aux_stack is not None else torch.empty(
+        anchor_video = images[anchor_t]
+        anchor_aux_video = aux_stack[anchor_t] if aux_stack is not None else torch.empty(
             (0, *images.shape[1:]),
             dtype=images.dtype,
         )

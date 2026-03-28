@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import pathlib
-import time
 from typing import Any, Dict, Optional, cast
 
 import numpy as np
@@ -28,7 +27,6 @@ from .vla_qwen3_rtc import Qwen3RTCVLAEncoder
 
 @dataclass
 class RTCOnlineResolvedConfig:
-    vision_interval_s: float
     max_context_len: int | None
     selected_layers: list[int]
     action_expert: Dict[str, Any]
@@ -54,7 +52,6 @@ def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
         raise ValueError("rtc_async.stream.selected_layers must be non-empty for online pipeline.")
 
     return RTCOnlineResolvedConfig(
-        vision_interval_s=float(stream.get("vision_interval_s", 0.0)),
         max_context_len=(None if stream.get("max_context_len", None) is None else int(float(stream["max_context_len"]))),
         selected_layers=selected_layers,
         action_expert=action_expert,
@@ -147,7 +144,6 @@ class Qwen3RTCVLAOnlinePipeline:
         tokenizer = cast(Any, self.encoder.processor).tokenizer
         self.runner = Qwen3VLStreamRunner(
             model=self.encoder.model,
-            vision_interval_s=self.rtc_cfg.vision_interval_s,
             max_context_len=self.rtc_cfg.max_context_len,
             use_step_eviction=True,
             tokenizer=tokenizer,
@@ -196,6 +192,10 @@ class Qwen3RTCVLAOnlinePipeline:
 
     def async_pipeline_running(self) -> bool:
         return self.threaded_runner is not None and self.threaded_runner.running()
+
+    def _check_async_pipeline_error(self) -> None:
+        if self.threaded_runner is not None:
+            self.threaded_runner.check_error()
 
     def load_action_expert_checkpoint(self, checkpoint_path: str, strict: bool = True) -> None:
         """加载动作专家权重到在线 pipeline。
@@ -250,7 +250,7 @@ class Qwen3RTCVLAOnlinePipeline:
         aux_frames: Optional[np.ndarray | torch.Tensor] = None,
         state: torch.Tensor,
         ts_ms: Optional[int] = None,
-        num_frames: int = 4,
+        num_frames: int = 1,
     ) -> bool:
         """插入一条观测 step 到流式上下文。
 
@@ -261,11 +261,9 @@ class Qwen3RTCVLAOnlinePipeline:
             num_frames: 输入窗口帧数。
 
         返回:
-            是否成功插入（受时间门控与上下文策略影响）。
+            是否成功插入。
         """
-        now = time.monotonic()
-        if now - self.runner.state.last_vision_time < self.rtc_cfg.vision_interval_s:
-            return False
+        self._check_async_pipeline_error()
         latest_state = state.to(self.device)
         if latest_state.dim() == 1:
             latest_state = latest_state.unsqueeze(0)
@@ -299,8 +297,32 @@ class Qwen3RTCVLAOnlinePipeline:
         context_packet = self.queues.context_queue.pop()
         if context_packet is None:
             return None
+        step_delay_steps = self._resolve_step_delay_steps(context_packet.ts_ms)
+        prefix_len = max(self.scheduler.horizon - int(step_delay_steps), 0)
+        known_action = None
+        known_mask = None
+        if prefix_len > 0:
+            prev_chunk = self.scheduler.prev_chunk
+            if prev_chunk is None:
+                raise RuntimeError("scheduler prev_chunk is unavailable for RTC prefix conditioning.")
+            if prev_chunk.shape[0] != context_packet.state.shape[0]:
+                raise RuntimeError(
+                    f"scheduler prev_chunk batch mismatch: {prev_chunk.shape[0]} vs {context_packet.state.shape[0]}"
+                )
+            known_action = prev_chunk.to(device=self.dit_device, non_blocking=True)
+            if self.normalizer is not None:
+                known_action = self.normalizer.normalize_action(known_action)
+            known_mask = torch.zeros(
+                (known_action.shape[0], known_action.shape[1]),
+                dtype=torch.bool,
+                device=known_action.device,
+            )
+            known_mask[:, :prefix_len] = True
         packet = self.dit_stage(
             context_packet,
+            step_delay_steps=step_delay_steps,
+            known_action=known_action,
+            known_mask=known_mask,
             normalizer=self.normalizer,
             kv_cache_key=kv_cache_key,
             generator=generator,
@@ -323,20 +345,21 @@ class Qwen3RTCVLAOnlinePipeline:
         action_packet = self.queues.action_queue.pop()
         if action_packet is None:
             return None
-        step_delay_steps = self._resolve_step_delay_steps(action_packet.ts_ms)
         packet = self.execution_stage(
             action_packet,
-            step_delay_steps=step_delay_steps,
+            step_delay_steps=action_packet.step_delay_steps,
         )
         self.queues.execute_queue.put_latest(packet)
         return packet
 
     def poll_execute_packet(self) -> Optional[Dict[str, torch.Tensor | int]]:
+        self._check_async_pipeline_error()
         execute_packet = self.queues.execute_queue.pop()
         if execute_packet is None:
             return None
         return {
             "step_id": execute_packet.step_id,
+            "ts_ms": execute_packet.ts_ms,
             "step_delay_steps": execute_packet.step_delay_steps,
             "prefix_len": execute_packet.prefix_len,
             "action_chunk": execute_packet.action_chunk,
@@ -351,6 +374,7 @@ class Qwen3RTCVLAOnlinePipeline:
         kv_cache_key: Optional[tuple[Any, ...]] = None,
         generator: torch.Generator | None = None,
     ) -> Dict[str, torch.Tensor | int]:
+        self._check_async_pipeline_error()
 
         if self.queues.step_queue.empty():
             raise RuntimeError("No pending observation available. Call push_observation first.")
@@ -371,6 +395,7 @@ class Qwen3RTCVLAOnlinePipeline:
 
         return {
             "step_id": execute_packet.step_id,
+            "ts_ms": execute_packet.ts_ms,
             "step_delay_steps": execute_packet.step_delay_steps,
             "prefix_len": execute_packet.prefix_len,
             "action_chunk": execute_packet.action_chunk,

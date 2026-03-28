@@ -9,7 +9,4 @@ lora:
   dropout: 0.05
   layers_end: 20
   target_modules: [q_proj, k_proj, v_proj, o_proj]
-  modules_to_save: [embed_tokens, lm_head]
-
-stream:
-  vision_interval_s: 0.0
+  modules_to_save: []

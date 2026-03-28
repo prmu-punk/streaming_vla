@@ -119,6 +119,29 @@ def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device:
     return torch.tensor(delays, device=device, dtype=torch.long)
 
 
+def _slice_kv_cache(kv_cache, batch_size: int):
+    if kv_cache is None:
+        return None
+    return [(k[:batch_size], v[:batch_size]) for k, v in kv_cache]
+
+
+def _slice_mask(mask: torch.Tensor | None, batch_size: int) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    return mask[:batch_size]
+
+
+def _masked_action_mse_stats(
+    *,
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    per_pos_mse = (pred_action - target_action).pow(2).mean(dim=-1)
+    mask = loss_mask.to(dtype=per_pos_mse.dtype)
+    return (per_pos_mse * mask).sum(), mask.sum()
+
+
 def run_epoch(
     *,
     vla: Qwen3RTCVLAEncoder,
@@ -142,8 +165,11 @@ def run_epoch(
 
     total_loss = 0.0
     total_delay = 0.0
+    total_denoise_mse_num = 0.0
+    total_denoise_mse_den = 0.0
     n_samples = 0
     n_updates = 0
+    denoise_mse_num_samples = int(cfg.eval.get("denoise_mse_num_samples", 0) or 0) if not train else 0
     max_batches_key = "max_train_batches" if train else "max_val_batches"
     max_batches = cfg.training.get(max_batches_key, None) if train else cfg.eval.get(max_batches_key, None)
 
@@ -225,6 +251,25 @@ def run_epoch(
         total_delay += float(rtc_batch.delay.float().mean().item()) * bs
         n_samples += bs
 
+        if not train and denoise_mse_num_samples > 0:
+            metric_bs = min(bs, denoise_mse_num_samples)
+            sample_model = accelerator.unwrap_model(action_expert)
+            pred_action = sample_model.sample(
+                state=state[:metric_bs],
+                kv_cache=_slice_kv_cache(kv_cache, metric_bs),
+                attention_mask=_slice_mask(attention_mask, metric_bs),
+                prompt_mask=_slice_mask(prompt_mask, metric_bs),
+                step_mask=_slice_mask(step_mask, metric_bs),
+            )
+            mse_num, mse_den = _masked_action_mse_stats(
+                pred_action=pred_action,
+                target_action=target_chunk[:metric_bs],
+                loss_mask=rtc_batch.loss_mask[:metric_bs],
+            )
+            total_denoise_mse_num += float(mse_num.item())
+            total_denoise_mse_den += float(mse_den.item())
+            denoise_mse_num_samples -= metric_bs
+
         if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
             progress.set_postfix(
                 rtc_loss=f"{(total_loss / max(n_samples, 1)):.4f}",
@@ -235,21 +280,27 @@ def run_epoch(
             break
 
     local_stats = torch.tensor(
-        [[total_loss, total_delay, float(n_samples), float(n_updates)]],
+        [[total_loss, total_delay, float(n_samples), float(n_updates), total_denoise_mse_num, total_denoise_mse_den]],
         device=accelerator.device,
         dtype=torch.float64,
     )
     gathered_stats = accelerator.gather(local_stats)
-    summed_stats = gathered_stats[:, :3].sum(dim=0)
+    summed_loss_delay_samples = gathered_stats[:, :3].sum(dim=0)
     max_updates = gathered_stats[:, 3].max()
+    summed_denoise_stats = gathered_stats[:, 4:].sum(dim=0)
 
     prefix = "train" if train else "val"
-    return {
-        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/avg_delay": float(summed_stats[1].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/samples": float(summed_stats[2].item()),
+    result = {
+        f"{prefix}/rtc_loss": float(summed_loss_delay_samples[0].item() / max(summed_loss_delay_samples[2].item(), 1.0)),
+        f"{prefix}/avg_delay": float(summed_loss_delay_samples[1].item() / max(summed_loss_delay_samples[2].item(), 1.0)),
+        f"{prefix}/samples": float(summed_loss_delay_samples[2].item()),
         f"{prefix}/updates": float(max_updates.item()),
     }
+    if not train and float(summed_denoise_stats[1].item()) > 0.0:
+        result[f"{prefix}/denoise_mse"] = float(
+            summed_denoise_stats[0].item() / max(summed_denoise_stats[1].item(), 1.0)
+        )
+    return result
 
 
 def save_checkpoint(

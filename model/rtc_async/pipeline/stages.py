@@ -41,23 +41,23 @@ class RTCVLMStage(nn.Module):
 
     def forward(self, step_packet: StepPacket) -> ContextPacket:
         processor = self.encoder.processor
-        video = self.encoder._make_video_tensor(step_packet.frames, step_packet.num_frames)
-        aux_video = (
-            self.encoder._make_video_tensor(step_packet.aux_frames, 1)
+        image = self.encoder._make_image_tensor(step_packet.frames)
+        aux_image = (
+            self.encoder._make_image_tensor(step_packet.aux_frames)
             if step_packet.aux_frames is not None
             else None
         )
-        has_aux = aux_video is not None
+        has_aux = aux_image is not None
         prefix_text = build_step_user_prefix(
-            ts_ms=step_packet.ts_ms,
-            video_token=build_video_text(video_token=processor.video_token, has_aux=has_aux),
+            ts_ms=(None if step_packet.ts_ms is None else int(step_packet.ts_ms)),
+            video_token=build_video_text(video_token=processor.image_token, has_aux=has_aux),
         )
-        videos = [video]
-        if aux_video is not None:
-            videos.append(aux_video)
+        images = [image]
+        if aux_image is not None:
+            images.append(aux_image)
         proc = processor(
             text=[prefix_text],
-            videos=[videos],
+            images=[images],
             padding=True,
             return_tensors="pt",
             add_special_tokens=False,
@@ -65,22 +65,16 @@ class RTCVLMStage(nn.Module):
         device = self.encoder.device
         input_ids = proc["input_ids"].to(device)
         attention_mask = proc["attention_mask"].to(device)
-        video_grid_thw = proc["video_grid_thw"].to(device)
-        pixel_values_videos = proc["pixel_values_videos"].to(device)
+        image_grid_thw = proc["image_grid_thw"].to(device)
+        pixel_values = proc["pixel_values"].to(device)
         seq_len = int(attention_mask[0].sum().item())
         input_ids = input_ids[:, :seq_len]
         attention_mask = attention_mask[:, :seq_len]
-        video_features = self.encoder.model.get_video_features(
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            return_dict=True,
-        )
 
         inserted = self.runner.append_step_tokens(
             input_ids=input_ids,
-            pixel_values_videos=None,
-            precomputed_video_outputs=video_features,
-            video_grid_thw=video_grid_thw,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
         )
         if not inserted:
@@ -122,6 +116,9 @@ class RTCDiTStage(nn.Module):
         self,
         context_packet: ContextPacket,
         *,
+        step_delay_steps: int,
+        known_action: torch.Tensor | None = None,
+        known_mask: torch.Tensor | None = None,
         normalizer: Optional[RTCNormalizer] = None,
         kv_cache_key: object | None = None,
         generator: torch.Generator | None = None,
@@ -140,6 +137,8 @@ class RTCDiTStage(nn.Module):
             attention_mask=attention_mask,
             prompt_mask=prompt_mask,
             step_mask=step_mask,
+            known_action=known_action,
+            known_mask=known_mask,
             kv_cache_key=kv_cache_key,
             generator=generator,
         )
@@ -148,6 +147,7 @@ class RTCDiTStage(nn.Module):
         return ActionPacket(
             step_id=context_packet.step_id,
             ts_ms=context_packet.ts_ms,
+            step_delay_steps=int(step_delay_steps),
             action_chunk=action_chunk,
         )
 
@@ -169,6 +169,7 @@ class RTCExecutionStage(nn.Module):
         )
         return ExecutePacket(
             step_id=action_packet.step_id,
+            ts_ms=action_packet.ts_ms,
             step_delay_steps=int(step_delay_steps),
             prefix_len=int(prefix_len),
             action_chunk=action_packet.action_chunk,

@@ -22,11 +22,15 @@ class RTCThreadedPipelineRunner:
     def __post_init__(self) -> None:
         self._stop_event = Event()
         self._threads: list[Thread] = []
+        self._exception: Exception | None = None
+        self._exception_worker: str | None = None
 
     def start(self) -> None:
         if self._threads:
             raise RuntimeError("RTCThreadedPipelineRunner is already running.")
         self._stop_event.clear()
+        self._exception = None
+        self._exception_worker = None
         self._threads = [
             Thread(target=self._worker_step_to_context, name="rtc-step-to-context", daemon=True),
             Thread(target=self._worker_context_to_action, name="rtc-context-to-action", daemon=True),
@@ -47,32 +51,52 @@ class RTCThreadedPipelineRunner:
     def running(self) -> bool:
         return bool(self._threads) and not self._stop_event.is_set()
 
+    def check_error(self) -> None:
+        if self._exception is not None:
+            worker = "unknown" if self._exception_worker is None else self._exception_worker
+            raise RuntimeError(f"RTC async worker failed in {worker}") from self._exception
+
     def _idle(self) -> None:
         time.sleep(self.poll_interval_s)
 
+    def _record_exception(self, worker_name: str, exc: Exception) -> None:
+        if self._exception is None:
+            self._exception = exc
+            self._exception_worker = worker_name
+        self._stop_event.set()
+
     def _worker_step_to_context(self) -> None:
-        while not self._stop_event.is_set():
-            if self.queues.step_queue.empty():
-                self._idle()
-                continue
-            packet = self.step_to_context()
-            if packet is None:
-                self._idle()
+        try:
+            while not self._stop_event.is_set():
+                if self.queues.step_queue.empty():
+                    self._idle()
+                    continue
+                packet = self.step_to_context()
+                if packet is None:
+                    self._idle()
+        except Exception as exc:
+            self._record_exception("step_to_context", exc)
 
     def _worker_context_to_action(self) -> None:
-        while not self._stop_event.is_set():
-            if self.queues.context_queue.empty():
-                self._idle()
-                continue
-            packet = self.context_to_action()
-            if packet is None:
-                self._idle()
+        try:
+            while not self._stop_event.is_set():
+                if self.queues.context_queue.empty():
+                    self._idle()
+                    continue
+                packet = self.context_to_action()
+                if packet is None:
+                    self._idle()
+        except Exception as exc:
+            self._record_exception("context_to_action", exc)
 
     def _worker_action_to_execute(self) -> None:
-        while not self._stop_event.is_set():
-            if self.queues.action_queue.empty():
-                self._idle()
-                continue
-            packet = self.action_to_execute()
-            if packet is None:
-                self._idle()
+        try:
+            while not self._stop_event.is_set():
+                if self.queues.action_queue.empty():
+                    self._idle()
+                    continue
+                packet = self.action_to_execute()
+                if packet is None:
+                    self._idle()
+        except Exception as exc:
+            self._record_exception("action_to_execute", exc)
