@@ -172,13 +172,11 @@ class Qwen3RTCVLAEncoder(nn.Module):
         self,
         *,
         samples: List[OfflineContextSample],
-        num_frames: int,
         source_dt_ms: int = 50,
         return_condition_cache: bool = True,
     ) -> OfflineContextBatchOutput:
         return self.forward_offline_context_batch(
             samples=samples,
-            num_frames=num_frames,
             source_dt_ms=source_dt_ms,
             return_condition_cache=return_condition_cache,
         )
@@ -187,7 +185,6 @@ class Qwen3RTCVLAEncoder(nn.Module):
         self,
         *,
         samples: List[OfflineContextSample],
-        num_frames: int,
         source_dt_ms: int = 50,
         return_condition_cache: bool = True,
     ) -> OfflineContextBatchOutput:
@@ -203,7 +200,6 @@ class Qwen3RTCVLAEncoder(nn.Module):
 
         参数:
             samples: 离线 context 样本列表，每个元素遵循 `OfflineContextSample`。
-            num_frames: 每个 step 使用的视频帧数。
             source_dt_ms: 索引时间步到毫秒时间戳的换算尺度。
             return_condition_cache: 是否返回 `past_key_values` 与 `attention_mask`。
 

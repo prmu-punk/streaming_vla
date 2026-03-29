@@ -1,7 +1,7 @@
 mode: rtc_async
 
 stream:
-  max_context_len: 2048
+  max_context_len: 1024
   selected_layers: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 
 action_expert:
@@ -11,7 +11,6 @@ action_expert:
   num_layers: 10
   num_heads: 8
   mlp_ratio: 4.0
-  time_embed_dim: 256
   norm_eps: 1.0e-6
   ffn_multiple_of: 256
   ffn_dim_multiplier: null

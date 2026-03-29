@@ -119,7 +119,6 @@ class Qwen3RTCVLAOnlinePipeline:
             num_layers=int(action_cfg.get("num_layers", 8)),
             num_heads=int(action_cfg.get("num_heads", 8)),
             mlp_ratio=float(action_cfg.get("mlp_ratio", 4.0)),
-            time_embed_dim=int(action_cfg.get("time_embed_dim", 256)),
             norm_eps=float(action_cfg.get("norm_eps", 1e-6)),
             ffn_multiple_of=int(action_cfg.get("ffn_multiple_of", 256)),
             ffn_dim_multiplier=action_cfg.get("ffn_dim_multiplier", None),
@@ -302,14 +301,15 @@ class Qwen3RTCVLAOnlinePipeline:
         known_action = None
         known_mask = None
         if prefix_len > 0:
-            prev_chunk = self.scheduler.prev_chunk
-            if prev_chunk is None:
-                raise RuntimeError("scheduler prev_chunk is unavailable for RTC prefix conditioning.")
-            if prev_chunk.shape[0] != context_packet.state.shape[0]:
+            prefix_chunk = self.scheduler.get_prefix_chunk(
+                batch_size=context_packet.state.shape[0],
+                step_delay_steps=int(step_delay_steps),
+            )
+            if prefix_chunk.shape[0] != context_packet.state.shape[0]:
                 raise RuntimeError(
-                    f"scheduler prev_chunk batch mismatch: {prev_chunk.shape[0]} vs {context_packet.state.shape[0]}"
+                    f"scheduler prefix_chunk batch mismatch: {prefix_chunk.shape[0]} vs {context_packet.state.shape[0]}"
                 )
-            known_action = prev_chunk.to(device=self.dit_device, non_blocking=True)
+            known_action = prefix_chunk.to(device=self.dit_device, non_blocking=True)
             if self.normalizer is not None:
                 known_action = self.normalizer.normalize_action(known_action)
             known_mask = torch.zeros(

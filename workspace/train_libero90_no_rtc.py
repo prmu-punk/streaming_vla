@@ -18,10 +18,15 @@ from torch.utils.data import DataLoader, dataloader
 from tqdm.auto import tqdm
 from transformers import get_scheduler
 import wandb
+
 default_collate_func = dataloader.default_collate
+
+
 def default_collate_override(batch) -> Any:
     dataloader._use_shared_memory = False
     return default_collate_func(batch)
+
+
 setattr(dataloader, "default_collate", default_collate_override)
 for t in torch._storage_classes:
     if sys.version_info[0] == 2:
@@ -49,11 +54,15 @@ class RTCAsyncResolvedConfig:
     max_context_len: int | None
     selected_layers: list[int]
     action_expert: Dict[str, Any]
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
 def ensure_dir(path: str) -> None:
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -63,6 +72,8 @@ def resolve_workspace_path(path_str: str) -> str:
     if p.is_absolute():
         return str(p)
     return str(pathlib.Path(ROOT_DIR) / p)
+
+
 def load_rtc_async_config(config_path: str) -> RTCAsyncResolvedConfig:
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -105,20 +116,6 @@ def _stack_anchor_state(sample_list: List[Dict[str, Any]], device: str) -> torch
     return state.to(device)
 
 
-def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device: torch.device) -> torch.Tensor:
-    delays = []
-    for sample in sample_list:
-        history = sample["context_time_indices"]
-        if int(history.numel()) == 0:
-            delays.append(0)
-            continue
-        anchor_t = int(sample["anchor_time_idx"].item())
-        prev_t = int(history[-1].item())
-        step_gap = max(anchor_t - prev_t, 0)
-        delays.append(max(horizon - step_gap, 0))
-    return torch.tensor(delays, device=device, dtype=torch.long)
-
-
 def run_epoch(
     *,
     vla: Qwen3RTCVLAEncoder,
@@ -141,7 +138,6 @@ def run_epoch(
         vla.eval()
 
     total_loss = 0.0
-    total_delay = 0.0
     n_samples = 0
     n_updates = 0
     max_batches_key = "max_train_batches" if train else "max_val_batches"
@@ -183,30 +179,29 @@ def run_epoch(
         )
 
         state = _stack_anchor_state(sample_list, accelerator.device)
-        delay = _stack_rtc_delay(
-            sample_list,
-            horizon=int(target_chunk.shape[1]),
+        zero_delay = torch.zeros(
+            (int(target_chunk.shape[0]),),
             device=accelerator.device,
+            dtype=torch.long,
         )
-
-        rtc_batch = build_rtc_inpainting_batch(
+        full_chunk_batch = build_rtc_inpainting_batch(
             action=target_chunk,
-            delay=delay,
+            delay=zero_delay,
         )
 
         if not bool(cfg.rtc_async.use_attention_mask):
             attention_mask = None
 
         pred_u_t = action_expert(
-            noisy_action=rtc_batch.x_t,
+            noisy_action=full_chunk_batch.x_t,
             state=state,
-            time=rtc_batch.time,
+            time=full_chunk_batch.time,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
             prompt_mask=prompt_mask,
             step_mask=step_mask,
         )
-        loss = rtc_velocity_loss(pred_u_t=pred_u_t, batch=rtc_batch)
+        loss = rtc_velocity_loss(pred_u_t=pred_u_t, batch=full_chunk_batch)
 
         if train:
             accelerator.backward(loss)
@@ -223,12 +218,11 @@ def run_epoch(
 
         bs = int(target_chunk.shape[0])
         total_loss += float(loss.detach().item()) * bs
-        total_delay += float(rtc_batch.delay.float().mean().item()) * bs
         n_samples += bs
 
         if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
             progress.set_postfix(
-                rtc_loss=f"{(total_loss / max(n_samples, 1)):.4f}",
+                full_loss=f"{(total_loss / max(n_samples, 1)):.4f}",
                 samples=n_samples,
             )
 
@@ -236,19 +230,18 @@ def run_epoch(
             break
 
     local_stats = torch.tensor(
-        [[total_loss, total_delay, float(n_samples), float(n_updates)]],
+        [[total_loss, float(n_samples), float(n_updates)]],
         device=accelerator.device,
         dtype=torch.float64,
     )
     gathered_stats = accelerator.gather(local_stats)
-    summed_stats = gathered_stats[:, :3].sum(dim=0)
-    max_updates = gathered_stats[:, 3].max()
+    summed_stats = gathered_stats[:, :2].sum(dim=0)
+    max_updates = gathered_stats[:, 2].max()
 
     prefix = "train" if train else "val"
     return {
-        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/avg_delay": float(summed_stats[1].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/samples": float(summed_stats[2].item()),
+        f"{prefix}/full_chunk_loss": float(summed_stats[0].item() / max(summed_stats[1].item(), 1.0)),
+        f"{prefix}/samples": float(summed_stats[1].item()),
         f"{prefix}/updates": float(max_updates.item()),
     }
 
@@ -289,11 +282,6 @@ def load_checkpoint(
     scheduler: Any | None = None,
     train_vla: bool,
 ) -> tuple[int, int]:
-    """加载检查点并恢复训练状态。
-
-    返回:
-        `(epoch, global_step)`，用于恢复训练游标。
-    """
     payload = torch.load(path, map_location=vla.device)
     action_expert.load_state_dict(payload["action_expert"], strict=True)
     if train_vla and "vla" in payload:
@@ -313,11 +301,6 @@ def load_checkpoint(
     config_name="train_libero90_async",
 )
 def main(cfg: DictConfig) -> None:
-    """离线训练入口：构建数据、模型、优化器并驱动 epoch 循环。
-
-    参数:
-        cfg: Hydra 注入的训练配置。
-    """
     OmegaConf.resolve(cfg)
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=False,
@@ -483,8 +466,8 @@ def main(cfg: DictConfig) -> None:
     )
 
     log_path = os.path.join(out_dir, "train_log.jsonl")
-    best_key = str(cfg.checkpoint.best_monitor)
-    best_val = math.inf if str(cfg.checkpoint.best_mode) == "min" else -math.inf
+    best_key = "val/full_chunk_loss"
+    best_val = math.inf
 
     global_step = 0
     start_epoch = 0
@@ -595,8 +578,7 @@ def main(cfg: DictConfig) -> None:
 
         if accelerator.is_main_process and best_key in metrics:
             cur = float(metrics[best_key])
-            better = cur < best_val if str(cfg.checkpoint.best_mode) == "min" else cur > best_val
-            if better:
+            if cur < best_val:
                 best_val = cur
                 save_checkpoint(
                     os.path.join(out_dir, "checkpoints", "best.pt"),
@@ -615,6 +597,8 @@ def main(cfg: DictConfig) -> None:
         accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         wandb.finish()
+
+
 if __name__ == "__main__":
     os.chdir(ROOT_DIR)
     main()

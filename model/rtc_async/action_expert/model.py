@@ -23,7 +23,6 @@ class ActionExpertConfig:
     num_layers: int = 8
     num_heads: int = 8
     mlp_ratio: float = 4.0
-    time_embed_dim: int = 256
     norm_eps: float = 1e-6
     ffn_multiple_of: int = 256
     ffn_dim_multiplier: float | None = None
@@ -79,23 +78,24 @@ class TimestepEmbedder(nn.Module):
         )
 
     def _sinusoidal_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        """将标量时间 `t` 编码为正余弦特征。"""
+        """将标量或逐位置时间 `t` 编码为正余弦特征。"""
         half = self.freq_size // 2
         device = t.device
         dtype = t.dtype
         freq = torch.exp(
             -math.log(10000.0) * torch.arange(half, device=device, dtype=dtype) / max(half - 1, 1)
         )
-        args = t[:, None] * freq[None, :]
+        flat_t = t.reshape(-1)
+        args = flat_t[:, None] * freq[None, :]
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         if self.freq_size % 2 == 1:
             emb = F.pad(emb, (0, 1))
-        return emb
+        return emb.reshape(*t.shape, self.freq_size)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """将一维时间输入映射到网络隐藏空间。"""
-        if t.dim() != 1:
-            raise ValueError(f"time must be [B], got {tuple(t.shape)}")
+        """将样本级或逐位置时间输入映射到网络隐藏空间。"""
+        if t.dim() not in (1, 2):
+            raise ValueError(f"time must be [B] or [B,H], got {tuple(t.shape)}")
         return self.mlp(self._sinusoidal_embedding(t))
 
 
@@ -194,7 +194,7 @@ class DiTBlock(nn.Module):
 
         参数:
             x: 动作 token 隐状态 `[B,H,C]`。
-            ada_cond: AdaLN 条件向量 `[B,2C]`。
+            ada_cond: AdaLN 条件向量 `[B,2C]` 或 `[B,H,2C]`。
             ck: 可选 cross-attention key 条件。
             cv: 可选 cross-attention value 条件。
             attn_mask: 可选 key padding mask（True 表示忽略）。
@@ -216,17 +216,25 @@ class DiTBlock(nn.Module):
 
         attn_in = _modulate(self.attn_norm(x), shift_attn, scale_attn)
         attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-        h = x + gate_attn.unsqueeze(1) * attn_out
+        h = x + self._expand_gate(gate_attn) * attn_out
 
         if ck is not None and cv is not None:
             q = _modulate(self.cross_norm(h), shift_cross, scale_cross)
             k = self.cond_norm(ck)
             v = self.cond_norm(cv)
             cross_out, _ = self.cross_attn(q, k, v, key_padding_mask=attn_mask, need_weights=False)
-            h = h + gate_cross.unsqueeze(1) * cross_out
+            h = h + self._expand_gate(gate_cross) * cross_out
 
         mlp_out = self.ffn(_modulate(self.ffn_norm(h), shift_mlp, scale_mlp))
-        return h + gate_mlp.unsqueeze(1) * mlp_out
+        return h + self._expand_gate(gate_mlp) * mlp_out
+
+    @staticmethod
+    def _expand_gate(gate: torch.Tensor) -> torch.Tensor:
+        if gate.dim() == 2:
+            return gate.unsqueeze(1)
+        if gate.dim() == 3:
+            return gate
+        raise ValueError(f"gate must be [B,C] or [B,H,C], got {tuple(gate.shape)}")
 
 
 class ActionExpertBackbone(nn.Module):
@@ -239,7 +247,7 @@ class ActionExpertBackbone(nn.Module):
         self.config = config
         self.action_in = nn.Linear(config.action_dim, config.hidden_size)
         self.state_global_in = nn.Linear(config.state_dim, config.hidden_size)
-        self.time_embed = TimestepEmbedder(config.hidden_size, freq_size=config.time_embed_dim)
+        self.time_embed = TimestepEmbedder(config.hidden_size)
         self.prompt_k_proj = nn.Linear(config.cond_dim, config.hidden_size)
         self.prompt_v_proj = nn.Linear(config.cond_dim, config.hidden_size)
         self.step_k_proj = nn.Linear(config.cond_dim, config.hidden_size)
@@ -379,17 +387,19 @@ class ActionExpertBackbone(nn.Module):
         预测扩散速度场 u_t。
 
         这里的 kv_cache 与 qwen3_stream.kv_export.export_selected_kv_cache 输出协议一致，
-        用于在动作头中注入视觉语言上下文偏置。
+        用于在动作头中注入视觉语言上下文偏置。RTC 模式下 `time` 允许为 `[B,H]`，
+        使已承诺前缀与待预测后缀拥有不同扩散时间条件。
         """
 
         batch_size, horizon, _ = noisy_action.shape
         state = self._to_horizon_state(state, batch_size, horizon)
         if time.dim() == 1:
-            time = time[:, None]
-        if time.shape[1] != 1 and time.shape[1] != horizon:
-            raise ValueError(f"time must be [B], [B,1], or [B,H], got {tuple(time.shape)}")
-        if time.shape[1] == 1:
-            time = time.expand(batch_size, horizon)
+            time = time[:, None].expand(batch_size, horizon)
+        elif time.dim() == 2:
+            if time.shape[0] != batch_size or time.shape[1] != horizon:
+                raise ValueError(f"time must be [B] or [B,H], got {tuple(time.shape)} expected {(batch_size, horizon)}")
+        else:
+            raise ValueError(f"time must be [B] or [B,H], got {tuple(time.shape)}")
         if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(f"attention_mask must be [B, S], got {tuple(attention_mask.shape)}")
         if attention_mask is not None and attention_mask.shape[0] != batch_size:
@@ -398,8 +408,8 @@ class ActionExpertBackbone(nn.Module):
             )
 
         x = self.action_in(noisy_action)
-        time_cond = self.time_embed(time[:, 0])
-        state_cond = self.state_global_in(state.mean(dim=1))
+        time_cond = self.time_embed(time)
+        state_cond = self.state_global_in(state.mean(dim=1))[:, None, :].expand(batch_size, horizon, -1)
         ada_cond = torch.cat([time_cond, state_cond], dim=-1)
 
         kv_layer_conds = self._encode_layerwise_kv(

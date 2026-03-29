@@ -24,7 +24,6 @@ class ActionExpertRunnerConfig:
     num_layers: int = 8
     num_heads: int = 8
     mlp_ratio: float = 4.0
-    time_embed_dim: int = 256
     norm_eps: float = 1e-6
     ffn_multiple_of: int = 256
     ffn_dim_multiplier: float | None = None
@@ -50,7 +49,6 @@ class ActionExpertRunner(nn.Module):
                 num_layers=config.num_layers,
                 num_heads=config.num_heads,
                 mlp_ratio=config.mlp_ratio,
-                time_embed_dim=config.time_embed_dim,
                 norm_eps=config.norm_eps,
                 ffn_multiple_of=config.ffn_multiple_of,
                 ffn_dim_multiplier=config.ffn_dim_multiplier,

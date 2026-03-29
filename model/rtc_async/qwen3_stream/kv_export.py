@@ -28,7 +28,9 @@ def export_selected_kv_cache(
     past_key_values: object,
     selected_layers: Iterable[int],
     clone: bool = True,
-) -> KVCache:
+    prompt_mask: torch.Tensor | None = None,
+    step_mask: torch.Tensor | None = None,
+) -> KVCache | tuple[KVCache, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     导出指定层 KV cache。
 
@@ -37,7 +39,13 @@ def export_selected_kv_cache(
 
     layers = _cache_to_layer_list(past_key_values)
     if not layers:
-        return []
+        if prompt_mask is None and step_mask is None:
+            return []
+        if prompt_mask is None or step_mask is None:
+            raise ValueError("prompt_mask and step_mask must be both set when compacting selected KV cache.")
+        empty_mask = torch.zeros((prompt_mask.shape[0], 0), dtype=torch.bool, device=prompt_mask.device)
+        empty_attn = torch.zeros((prompt_mask.shape[0], 0), dtype=torch.long, device=prompt_mask.device)
+        return [], empty_attn, empty_mask, empty_mask.clone()
     selected = []
     total = len(layers)
     for idx in selected_layers:
@@ -48,7 +56,33 @@ def export_selected_kv_cache(
             k = k.clone()
             v = v.clone()
         selected.append((k, v))
-    return selected
+    if prompt_mask is None and step_mask is None:
+        return selected
+    if prompt_mask is None or step_mask is None:
+        raise ValueError("prompt_mask and step_mask must be both set when compacting selected KV cache.")
+
+    kv_len = int(selected[0][0].shape[_kv_seq_dim(selected[0][0])])
+    device = selected[0][0].device
+    aligned_prompt_mask = _align_bool_mask(prompt_mask, kv_len=kv_len, device=device)
+    aligned_step_mask = _align_bool_mask(step_mask, kv_len=kv_len, device=device)
+    keep_mask = aligned_prompt_mask | aligned_step_mask
+    positions = torch.nonzero(keep_mask.any(dim=0), as_tuple=False).flatten()
+    compact_attention_mask = keep_mask.index_select(1, positions).to(dtype=torch.long)
+    compact_prompt_mask = aligned_prompt_mask.index_select(1, positions)
+    compact_step_mask = aligned_step_mask.index_select(1, positions)
+
+    compact_kv: KVCache = []
+    for k, v in selected:
+        layer_kv_len = int(k.shape[_kv_seq_dim(k)])
+        if layer_kv_len != kv_len:
+            raise ValueError(f"Inconsistent KV lengths across layers: expected {kv_len}, got {layer_kv_len}")
+        compact_k = _index_select_seq(k, positions)
+        compact_v = _index_select_seq(v, positions)
+        if clone:
+            compact_k = compact_k.clone()
+            compact_v = compact_v.clone()
+        compact_kv.append((compact_k, compact_v))
+    return compact_kv, compact_attention_mask, compact_prompt_mask, compact_step_mask
 
 
 def _kv_seq_dim(x: torch.Tensor) -> int:
@@ -68,8 +102,6 @@ def _index_select_seq(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 def _align_bool_mask(mask: torch.Tensor, *, kv_len: int, device: torch.device) -> torch.Tensor:
     if mask.dim() != 2:
         raise ValueError(f"mask must be [B, S], got {tuple(mask.shape)}")
-    if mask.shape[0] != 1:
-        raise ValueError(f"Only batch size 1 is supported for compact KV export, got {mask.shape[0]}")
     out = mask.to(device=device)
     if out.dtype != torch.bool:
         out = out > 0
@@ -80,45 +112,3 @@ def _align_bool_mask(mask: torch.Tensor, *, kv_len: int, device: torch.device) -
         pad = torch.zeros((out.shape[0], kv_len - seq_len), device=device, dtype=torch.bool)
         out = torch.cat([pad, out], dim=1)
     return out
-
-
-def export_compact_selected_kv_cache(
-    *,
-    past_key_values: object,
-    selected_layers: Iterable[int],
-    prompt_mask: torch.Tensor,
-    step_mask: torch.Tensor,
-    clone: bool = True,
-) -> tuple[KVCache, torch.Tensor, torch.Tensor, torch.Tensor]:
-    selected = export_selected_kv_cache(
-        past_key_values=past_key_values,
-        selected_layers=selected_layers,
-        clone=False,
-    )
-    if not selected:
-        empty_mask = torch.zeros((1, 0), dtype=torch.bool, device=prompt_mask.device)
-        empty_attn = torch.zeros((1, 0), dtype=torch.long, device=prompt_mask.device)
-        return [], empty_attn, empty_mask, empty_mask.clone()
-
-    kv_len = int(selected[0][0].shape[_kv_seq_dim(selected[0][0])])
-    device = selected[0][0].device
-    aligned_prompt_mask = _align_bool_mask(prompt_mask, kv_len=kv_len, device=device)
-    aligned_step_mask = _align_bool_mask(step_mask, kv_len=kv_len, device=device)
-    keep_mask = aligned_prompt_mask | aligned_step_mask
-    positions = torch.nonzero(keep_mask[0], as_tuple=False).flatten()
-    compact_attention_mask = torch.ones((1, int(positions.numel())), device=device, dtype=torch.long)
-    compact_prompt_mask = aligned_prompt_mask.index_select(1, positions)
-    compact_step_mask = aligned_step_mask.index_select(1, positions)
-
-    compact_kv: KVCache = []
-    for k, v in selected:
-        layer_kv_len = int(k.shape[_kv_seq_dim(k)])
-        if layer_kv_len != kv_len:
-            raise ValueError(f"Inconsistent KV lengths across layers: expected {kv_len}, got {layer_kv_len}")
-        compact_k = _index_select_seq(k, positions)
-        compact_v = _index_select_seq(v, positions)
-        if clone:
-            compact_k = compact_k.clone()
-            compact_v = compact_v.clone()
-        compact_kv.append((compact_k, compact_v))
-    return compact_kv, compact_attention_mask, compact_prompt_mask, compact_step_mask

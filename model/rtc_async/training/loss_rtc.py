@@ -23,8 +23,7 @@ def _sample_time(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    z = torch.randn((batch_size,), device=device, dtype=dtype, generator=generator)
-    return torch.sigmoid(z)
+    return torch.rand((batch_size,), device=device, dtype=dtype, generator=generator)
 
 
 def build_rtc_inpainting_batch(
@@ -60,9 +59,9 @@ def build_rtc_inpainting_batch(
 
     pos = torch.arange(horizon, device=device)[None, :]
     prefix_mask = pos < delay[:, None]
-    time = base_time[:, None].expand(batch_size, horizon)
-    time = torch.where(prefix_mask, torch.ones_like(time), time)
-    x_t = (1 - time[:, :, None]) * noise + time[:, :, None] * action
+    time_per_pos = base_time[:, None].expand(batch_size, horizon)
+    time_per_pos = torch.where(prefix_mask, torch.ones_like(time_per_pos), time_per_pos)
+    x_t = (1 - time_per_pos[:, :, None]) * noise + time_per_pos[:, :, None] * action
     loss_mask = ~prefix_mask
 
     return RTCInpaintingBatch(
@@ -70,7 +69,7 @@ def build_rtc_inpainting_batch(
         u_t=u_t,
         loss_mask=loss_mask,
         delay=delay,
-        time=time,
+        time=time_per_pos,
     )
 
 

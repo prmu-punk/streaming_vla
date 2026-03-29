@@ -10,7 +10,7 @@ from model.template_qwen3_vla import build_step_user_prefix, build_video_text
 from normalization import RTCNormalizer
 
 from ..action_expert.runner import ActionExpertRunner
-from ..qwen3_stream.kv_export import export_compact_selected_kv_cache
+from ..qwen3_stream.kv_export import export_selected_kv_cache
 from .pipeline_types import ActionPacket, ContextPacket, ExecutePacket, StepPacket
 from .scheduler import RTCChunkScheduler
 
@@ -89,7 +89,7 @@ class RTCVLMStage(nn.Module):
         latest_step_start, latest_step_end = self.runner.step_spans[-1]
         step_mask[:, latest_step_start:latest_step_end] = True
 
-        kv_cache, compact_attention_mask, compact_prompt_mask, compact_step_mask = export_compact_selected_kv_cache(
+        kv_cache, compact_attention_mask, compact_prompt_mask, compact_step_mask = export_selected_kv_cache(
             past_key_values=self.runner.state.past_key_values,
             selected_layers=self.selected_layers,
             prompt_mask=prompt_mask,

@@ -417,7 +417,7 @@ def main() -> None:
         cfg=cfg,
         task_name=str(args.task),
         match_rank=int(args.match_rank),
-        num_frames=int(cfg.model.num_frames if args.num_frames is None else args.num_frames),
+        num_frames=int(cfg.model.get("num_frames", 1) if args.num_frames is None else args.num_frames),
         duration_s=float(args.duration_s),
         warmup_s=float(args.warmup_s),
         source_dt_ms=int(cfg.training.source_dt_ms),

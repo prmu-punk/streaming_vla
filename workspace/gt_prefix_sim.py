@@ -83,7 +83,6 @@ def _build_action_expert(*, encoder: Qwen3RTCVLAEncoder, action_cfg: Dict[str, A
             num_layers=int(action_cfg.get("num_layers", 8)),
             num_heads=int(action_cfg.get("num_heads", 8)),
             mlp_ratio=float(action_cfg.get("mlp_ratio", 4.0)),
-            time_embed_dim=int(action_cfg.get("time_embed_dim", 256)),
             norm_eps=float(action_cfg.get("norm_eps", 1e-6)),
             ffn_multiple_of=int(action_cfg.get("ffn_multiple_of", 256)),
             ffn_dim_multiplier=action_cfg.get("ffn_dim_multiplier", None),
@@ -210,7 +209,7 @@ def run_gt_prefix_rollout(
     max_context_len = runtime.max_context_len
 
     source_dt_ms = int(cfg.training.source_dt_ms)
-    num_frames = int(cfg.model.num_frames)
+    num_frames = int(cfg.model.get("num_frames", 1))
     anchor_stride_steps = int(cfg.dataset.anchor_stride_steps or 1)
     step_dt_min_ms = int(cfg.training.step_dt_min_ms)
     step_dt_max_ms = int(cfg.training.step_dt_max_ms)
@@ -385,7 +384,6 @@ def run_gt_prefix_rollout(
             }
             encoded = encoder.forward_offline_context_batch(
                 samples=[sample],
-                num_frames=num_frames,
                 source_dt_ms=source_dt_ms,
                 return_condition_cache=True,
             )

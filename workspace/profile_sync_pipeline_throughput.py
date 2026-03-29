@@ -316,7 +316,7 @@ def main() -> None:
         cfg=cfg,
         task_name=str(args.task),
         match_rank=int(args.match_rank),
-        num_frames=int(cfg.model.num_frames if args.num_frames is None else args.num_frames),
+        num_frames=int(cfg.model.get("num_frames", 1) if args.num_frames is None else args.num_frames),
         duration_s=float(args.duration_s),
         source_dt_ms=int(cfg.training.source_dt_ms),
         step_dt_min_ms=int(cfg.training.step_dt_min_ms if args.step_dt_min_ms is None else args.step_dt_min_ms),

@@ -138,16 +138,13 @@ def euler_sample_actions(
     t = torch.zeros((batch_size,), device=device, dtype=dtype)
     dt = 1.0 / float(num_steps)
     for _ in range(num_steps):
-        time_input: torch.Tensor
-        if known_mask is not None:
-            time_input = t[:, None].expand(batch_size, horizon)
-            time_input = torch.where(known_mask, torch.ones_like(time_input), time_input)
-        else:
-            time_input = t
+        time_chunk = t[:, None].expand(batch_size, horizon)
+        if known_action is not None and known_mask is not None:
+            time_chunk = torch.where(known_mask, torch.ones_like(time_chunk), time_chunk)
         v_t = model(
             noisy_action=x_t,
             state=state,
-            time=time_input,
+            time=time_chunk,
             kv_cache=kv_cache,
             attention_mask=attention_mask,
             prompt_mask=prompt_mask,

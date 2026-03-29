@@ -413,7 +413,7 @@ def main() -> None:
     )
     pipeline.load_action_expert_checkpoint(str(args.checkpoint), strict=False)
 
-    num_frames = int(cfg.model.num_frames if args.num_frames is None else args.num_frames)
+    num_frames = int(cfg.model.get("num_frames", 1) if args.num_frames is None else args.num_frames)
     video_path = args.video_path
     if video_path is None:
         video_path = str(

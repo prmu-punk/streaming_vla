@@ -54,8 +54,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         source_dt_ms: int = 50,
         step_dt_min_ms: int = 200,
         step_dt_max_ms: int = 300,
-        num_frames: int = 6,
-        video_frame_stride_steps: int = 1,
         chunk_horizon: int = 5,
         anchor_stride_steps: int = 1,
         max_context_len: int = 10_000,
@@ -75,8 +73,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             source_dt_ms: 原始数据时间步（毫秒）。
             step_dt_min_ms: 历史采样最小步距（毫秒）。
             step_dt_max_ms: 历史采样最大步距（毫秒）。
-            num_frames: 每个 step 的视频窗口帧数。
-            video_frame_stride_steps: 视频窗口中相邻采样帧在原始时间轴上的步长。
             chunk_horizon: 动作 chunk 长度。
             anchor_stride_steps: anchor 枚举步长。
             max_context_len: 上下文 token 长度上限。
@@ -99,12 +95,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             raise ValueError(
                 f"step_dt_min_ms must be <= step_dt_max_ms, got {step_dt_min_ms}>{step_dt_max_ms}"
             )
-        if num_frames <= 0:
-            raise ValueError(f"num_frames must be positive, got {num_frames}")
-        if video_frame_stride_steps <= 0:
-            raise ValueError(
-                f"video_frame_stride_steps must be positive, got {video_frame_stride_steps}"
-            )
         if chunk_horizon <= 0:
             raise ValueError(f"chunk_horizon must be positive, got {chunk_horizon}")
         if anchor_stride_steps <= 0:
@@ -115,8 +105,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
         self.source_dt_ms = int(source_dt_ms)
         self.step_dt_min_ms = int(step_dt_min_ms)
         self.step_dt_max_ms = int(step_dt_max_ms)
-        self.num_frames = int(num_frames)
-        self.video_frame_stride_steps = int(video_frame_stride_steps)
         self.chunk_horizon = int(chunk_horizon)
         self.anchor_stride_steps = int(anchor_stride_steps)
         self.max_context_len = int(max_context_len)
@@ -225,8 +213,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             "source_dt_ms": self.source_dt_ms,
             "step_dt_min_ms": self.step_dt_min_ms,
             "step_dt_max_ms": self.step_dt_max_ms,
-            "num_frames": self.num_frames,
-            "video_frame_stride_steps": self.video_frame_stride_steps,
             "chunk_horizon": self.chunk_horizon,
             "anchor_stride_steps": self.anchor_stride_steps,
             "max_context_len": self.max_context_len,
@@ -280,15 +266,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
                 self._episode_cache.popitem(last=False)
         return ep
 
-    def _video_window_indices(self, t_idx: int) -> List[int]:
-        """计算某时刻对应的视频窗口索引，缺失前缀用 0 对齐。"""
-        stride = self.video_frame_stride_steps
-        end = int(t_idx)
-        return [
-            max(0, end - stride * (self.num_frames - 1 - i))
-            for i in range(self.num_frames)
-        ]
-
     def _history_step_times(self, *, anchor_t: int, episode_idx: int) -> List[int]:
         """基于随机步距向后回溯历史时刻序列。"""
         rng = self._make_rng(episode_idx=episode_idx, anchor_t=anchor_t)
@@ -308,23 +285,6 @@ class LiberoOfflineContextDataset(Dataset[Dict[str, Any]]):
             ts_ms=ts_ms,
             video_token=build_video_text(video_token=video_token, has_aux=has_aux),
         )
-
-    def _make_video_tensor(self, frames: np.ndarray | torch.Tensor, num_frames: int | None = None) -> torch.Tensor:
-        if isinstance(frames, np.ndarray):
-            frames_t = torch.from_numpy(frames)
-        else:
-            frames_t = frames
-        target_frames = self.num_frames if num_frames is None else int(num_frames)
-        if frames_t.dim() == 3:
-            frames_t = frames_t.unsqueeze(0)
-        if frames_t.shape[-1] == 3:
-            frames_t = frames_t.permute(0, 3, 1, 2)
-        if frames_t.shape[0] < target_frames:
-            repeat = target_frames - frames_t.shape[0]
-            frames_t = torch.cat([frames_t, frames_t[-1:].repeat(repeat, 1, 1, 1)], dim=0)
-        elif frames_t.shape[0] > target_frames:
-            frames_t = frames_t[:target_frames]
-        return frames_t
 
     def _prompt_length(self, episode_idx: int) -> int:
         cached = self._prompt_length_cache.get(int(episode_idx), None)
