@@ -7,9 +7,7 @@ import torch
 
 KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
-
 class VelocityModel(Protocol):
-
     def __call__(
         self,
         *,
@@ -23,11 +21,8 @@ class VelocityModel(Protocol):
     ) -> torch.Tensor:
         ...
 
-
 @dataclass
 class DiffusionKVCache:
-    """为扩散采样缓存跨步复用的 VLM KV 条件。"""
-
     store: dict[Hashable, KVCache] = field(default_factory=dict)
     attention_mask_store: dict[Hashable, torch.Tensor] = field(default_factory=dict)
     prompt_mask_store: dict[Hashable, torch.Tensor] = field(default_factory=dict)
@@ -41,7 +36,6 @@ class DiffusionKVCache:
         prompt_mask: torch.Tensor | None = None,
         step_mask: torch.Tensor | None = None,
     ) -> None:
-        """写入指定键对应的 KV 快照。"""
 
         if kv_cache is None:
             return
@@ -56,7 +50,6 @@ class DiffusionKVCache:
     def get(
         self, key: Hashable
     ) -> tuple[KVCache | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """读取指定键对应的 KV 快照。"""
 
         return (
             self.store.get(key),
@@ -66,13 +59,10 @@ class DiffusionKVCache:
         )
 
     def clear(self) -> None:
-        """清空缓存。"""
-
         self.store.clear()
         self.attention_mask_store.clear()
         self.prompt_mask_store.clear()
         self.step_mask_store.clear()
-
 
 def euler_sample_actions(
     *,
@@ -91,12 +81,6 @@ def euler_sample_actions(
     kv_cache_key: Hashable | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """
-    使用欧拉积分生成连续动作 chunk。
-
-    kv_cache 参数与 qwen3_stream.export_selected_kv_cache 的返回值直接对接；
-    若提供 kv_cache_store + kv_cache_key，则在多次采样间自动读写缓存。
-    """
 
     if num_steps <= 0:
         raise ValueError(f"num_steps must be positive, got {num_steps}")

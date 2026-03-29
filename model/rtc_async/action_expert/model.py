@@ -10,11 +10,8 @@ import torch.nn.functional as F
 
 KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
-
 @dataclass
 class ActionExpertConfig:
-    """动作专家主干网络结构配置。"""
-
     state_dim: int
     action_dim: int
     horizon: int
@@ -27,48 +24,27 @@ class ActionExpertConfig:
     ffn_multiple_of: int = 256
     ffn_dim_multiplier: float | None = None
 
-
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """执行 AdaLN 调制：`x * (1 + scale) + shift`，支持 `[B,D]` 自动扩展到 `[B,1,D]`。"""
     if shift.dim() == 2:
         shift = shift.unsqueeze(1)
     if scale.dim() == 2:
         scale = scale.unsqueeze(1)
     return x * (1 + scale) + shift
 
-
 class RMSNorm(nn.Module):
-    """RDT 对齐版 RMSNorm。"""
-
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        """初始化 RMSNorm。
-
-        参数:
-            dim: 通道维度。
-            eps: 数值稳定项。
-        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """对输入执行 RMS 归一化并应用可学习缩放。"""
         x_float = x.float()
         rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         y = x_float * rms
         return (y.to(dtype=x.dtype)) * self.weight
 
-
 class TimestepEmbedder(nn.Module):
-    """将标量扩散时间映射到隐藏向量。"""
-
     def __init__(self, hidden_size: int, freq_size: int = 256) -> None:
-        """初始化扩散时间嵌入器。
-
-        参数:
-            hidden_size: 输出隐藏维度。
-            freq_size: 正弦位置编码频率维度。
-        """
         super().__init__()
         self.freq_size = freq_size
         self.mlp = nn.Sequential(
@@ -78,7 +54,6 @@ class TimestepEmbedder(nn.Module):
         )
 
     def _sinusoidal_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        """将标量或逐位置时间 `t` 编码为正余弦特征。"""
         half = self.freq_size // 2
         device = t.device
         dtype = t.dtype
@@ -93,15 +68,11 @@ class TimestepEmbedder(nn.Module):
         return emb.reshape(*t.shape, self.freq_size)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """将样本级或逐位置时间输入映射到网络隐藏空间。"""
         if t.dim() not in (1, 2):
             raise ValueError(f"time must be [B] or [B,H], got {tuple(t.shape)}")
         return self.mlp(self._sinusoidal_embedding(t))
 
-
 class FeedForward(nn.Module):
-    """RDT 对齐版 SiLU-gated FFN。"""
-
     def __init__(
         self,
         *,
@@ -110,14 +81,6 @@ class FeedForward(nn.Module):
         multiple_of: int,
         ffn_dim_multiplier: float | None,
     ) -> None:
-        """初始化 SiLU-gated 前馈层。
-
-        参数:
-            dim: 输入/输出维度。
-            hidden_dim: 中间维度基值。
-            multiple_of: 中间维度对齐倍数。
-            ffn_dim_multiplier: 可选维度缩放系数。
-        """
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         if ffn_dim_multiplier is not None:
@@ -129,13 +92,9 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """执行 gated FFN 前向计算。"""
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-
 class DiTBlock(nn.Module):
-    """RDT 对齐版 DiT block：MSA + Cross-Attention + SiLU-gated FFN。"""
-
     def __init__(
         self,
         *,
@@ -146,16 +105,6 @@ class DiTBlock(nn.Module):
         ffn_multiple_of: int,
         ffn_dim_multiplier: float | None,
     ) -> None:
-        """初始化单层 DiT block（自注意力 + 交叉注意力 + FFN）。
-
-        参数:
-            hidden_size: 隐藏维度。
-            num_heads: 注意力头数。
-            mlp_ratio: FFN 扩展比例。
-            norm_eps: 归一化稳定项。
-            ffn_multiple_of: FFN 维度对齐倍数。
-            ffn_dim_multiplier: 可选 FFN 缩放系数。
-        """
         super().__init__()
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
         self.cross_norm = RMSNorm(hidden_size, eps=norm_eps)
@@ -190,18 +139,6 @@ class DiTBlock(nn.Module):
         cv: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """执行单层 DiT 前向。
-
-        参数:
-            x: 动作 token 隐状态 `[B,H,C]`。
-            ada_cond: AdaLN 条件向量 `[B,2C]` 或 `[B,H,2C]`。
-            ck: 可选 cross-attention key 条件。
-            cv: 可选 cross-attention value 条件。
-            attn_mask: 可选 key padding mask（True 表示忽略）。
-
-        返回:
-            更新后的动作隐状态。
-        """
         (
             shift_attn,
             scale_attn,
@@ -236,13 +173,8 @@ class DiTBlock(nn.Module):
             return gate
         raise ValueError(f"gate must be [B,C] or [B,H,C], got {tuple(gate.shape)}")
 
-
 class ActionExpertBackbone(nn.Module):
-    """动作扩散速度场主干网络。"""
-
     def __init__(self, config: ActionExpertConfig) -> None:
-        """构建连续动作速度场网络。"""
-
         super().__init__()
         self.config = config
         self.action_in = nn.Linear(config.action_dim, config.hidden_size)
@@ -279,7 +211,6 @@ class ActionExpertBackbone(nn.Module):
 
     @staticmethod
     def _to_horizon_state(state: torch.Tensor, batch_size: int, horizon: int) -> torch.Tensor:
-        """将状态张量规范到 `[B,H,Ds]` 形状，便于与动作序列对齐。"""
         if state.dim() == 2:
             state = state.unsqueeze(1)
         if state.shape[1] == 1:
@@ -290,12 +221,11 @@ class ActionExpertBackbone(nn.Module):
 
     @staticmethod
     def _kv_to_tokens(x: torch.Tensor) -> torch.Tensor:
-        """将不同 rank 的 KV 张量统一展开为 token 序列格式 `[B,S,C]`。"""
         if x.dim() == 4:
-            # 典型 KV 形状: [B, heads, seq, head_dim]
+
             if x.shape[1] < x.shape[2]:
                 x = x.permute(0, 2, 1, 3)
-            # 若已是 [B, seq, heads, head_dim]，按原状处理
+
             x = x.reshape(x.shape[0], x.shape[1], -1)
             return x
         if x.dim() == 3:
@@ -315,17 +245,6 @@ class ActionExpertBackbone(nn.Module):
         prompt_mask: Optional[torch.Tensor] = None,
         step_mask: Optional[torch.Tensor] = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """将层级 KV 条件投影到动作主干 hidden 空间。
-
-        参数:
-            kv_cache: 来自 VLM 的层级 KV 列表。
-            batch_size: 当前批大小。
-            device: 目标设备。
-            dtype: 目标数据类型。
-
-        返回:
-            与输入层数对齐的 `(k_proj, v_proj)` 列表。
-        """
         if not kv_cache:
             return []
         layer_conds: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
@@ -383,13 +302,6 @@ class ActionExpertBackbone(nn.Module):
         prompt_mask: Optional[torch.Tensor] = None,
         step_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        预测扩散速度场 u_t。
-
-        这里的 kv_cache 与 qwen3_stream.kv_export.export_selected_kv_cache 输出协议一致，
-        用于在动作头中注入视觉语言上下文偏置。RTC 模式下 `time` 允许为 `[B,H]`，
-        使已承诺前缀与待预测后缀拥有不同扩散时间条件。
-        """
 
         batch_size, horizon, _ = noisy_action.shape
         state = self._to_horizon_state(state, batch_size, horizon)

@@ -4,17 +4,13 @@ from dataclasses import dataclass
 
 import torch
 
-
 @dataclass
 class RTCInpaintingBatch:
-    """训练期 RTC 样本包，包含去噪输入、监督目标与有效损失掩码。"""
-
     x_t: torch.Tensor
     u_t: torch.Tensor
     loss_mask: torch.Tensor
     delay: torch.Tensor
     time: torch.Tensor
-
 
 def _sample_time(
     *,
@@ -25,14 +21,12 @@ def _sample_time(
 ) -> torch.Tensor:
     return torch.rand((batch_size,), device=device, dtype=dtype, generator=generator)
 
-
 def build_rtc_inpainting_batch(
     *,
     action: torch.Tensor,
     delay: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> RTCInpaintingBatch:
-    """构造训练时 action inpainting 批次，前缀强制已知、后缀参与学习。"""
 
     if action.dim() != 3:
         raise ValueError(f"action must be [B, H, D], got {tuple(action.shape)}")
@@ -72,13 +66,11 @@ def build_rtc_inpainting_batch(
         time=time_per_pos,
     )
 
-
 def rtc_velocity_loss(
     *,
     pred_u_t: torch.Tensor,
     batch: RTCInpaintingBatch,
 ) -> torch.Tensor:
-    """在 RTC 有效位置上聚合速度场 MSE 损失。"""
 
     if pred_u_t.shape != batch.u_t.shape:
         raise ValueError(f"pred_u_t shape mismatch: {tuple(pred_u_t.shape)} vs {tuple(batch.u_t.shape)}")

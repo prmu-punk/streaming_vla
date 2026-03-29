@@ -6,10 +6,7 @@ import torch
 
 KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
-
 def _cache_to_layer_list(past_key_values: object) -> KVCache:
-    """将模型 cache 结构标准化为 layer-wise (K, V) 列表。"""
-
     if past_key_values is None:
         return []
     layers = []
@@ -22,7 +19,6 @@ def _cache_to_layer_list(past_key_values: object) -> KVCache:
         layers.append((k, v))
     return layers
 
-
 def export_selected_kv_cache(
     *,
     past_key_values: object,
@@ -31,11 +27,6 @@ def export_selected_kv_cache(
     prompt_mask: torch.Tensor | None = None,
     step_mask: torch.Tensor | None = None,
 ) -> KVCache | tuple[KVCache, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    导出指定层 KV cache。
-
-    返回值协议与 action_expert 的 kv_cache 入参保持一致，可直接注入。
-    """
 
     layers = _cache_to_layer_list(past_key_values)
     if not layers:
@@ -84,7 +75,6 @@ def export_selected_kv_cache(
         compact_kv.append((compact_k, compact_v))
     return compact_kv, compact_attention_mask, compact_prompt_mask, compact_step_mask
 
-
 def _kv_seq_dim(x: torch.Tensor) -> int:
     if x.dim() == 4:
         return 2 if x.shape[1] < x.shape[2] else 1
@@ -94,10 +84,8 @@ def _kv_seq_dim(x: torch.Tensor) -> int:
         return 1
     raise ValueError(f"Unsupported KV rank: {x.dim()}, shape={tuple(x.shape)}")
 
-
 def _index_select_seq(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     return x.index_select(_kv_seq_dim(x), positions)
-
 
 def _align_bool_mask(mask: torch.Tensor, *, kv_len: int, device: torch.device) -> torch.Tensor:
     if mask.dim() != 2:

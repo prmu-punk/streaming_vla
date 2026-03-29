@@ -12,11 +12,9 @@ import yaml
 from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from .template_qwen3_vla import build_prompt_prefill_text, build_step_user_prefix, build_video_text
 
-
 @dataclass
 class StreamConfig:
     max_context_len: Optional[int] = None
-
 
 @dataclass
 class LoRAConfig:
@@ -28,7 +26,6 @@ class LoRAConfig:
     target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     modules_to_save: list[str] = field(default_factory=list)
 
-
 @dataclass
 class RTCVLAConfig:
     model_name_or_path: str
@@ -36,7 +33,6 @@ class RTCVLAConfig:
     device: Optional[str] = None
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
-
 
 class OfflineContextSample(TypedDict, total=False):
     prompt: str
@@ -48,7 +44,6 @@ class OfflineContextSample(TypedDict, total=False):
     anchor_aux_video: torch.Tensor | np.ndarray
     target_chunk: torch.Tensor
 
-
 class OfflineContextBatchOutput(TypedDict, total=False):
     target_chunk: torch.Tensor
     past_key_values: Any
@@ -56,20 +51,7 @@ class OfflineContextBatchOutput(TypedDict, total=False):
     prompt_mask: torch.Tensor
     step_mask: torch.Tensor
 
-
 def _load_rtc_vla_config(config_path: str) -> RTCVLAConfig:
-    """加载 RTC-VLA 编码配置，并映射到 `RTCVLAConfig` 接口。
-
-    该函数负责把 YAML 文件中的 `model_name_or_path`、`state_dim`、`device`
-    以及 `stream` 子配置解析为强类型配置对象，供 `Qwen3RTCVLAEncoder.__init__`
-    的构造流程直接消费。
-
-    参数:
-        config_path: RTC-VLA YAML 配置文件路径。
-
-    返回:
-        `RTCVLAConfig` 实例，字段与编码器初始化接口一一对应。
-    """
     with open(config_path, "r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
@@ -99,21 +81,8 @@ def _load_rtc_vla_config(config_path: str) -> RTCVLAConfig:
         stream=stream_cfg,
     )
 
-
 class Qwen3RTCVLAEncoder(nn.Module):
-    """RTC 异步训练专用条件编码器：仅输出 KV/attention，不依赖 OAT 和动作 token 监督。"""
-
     def __init__(self, config_path: Optional[str] = None) -> None:
-        """构建 RTC 异步训练用 VLA 条件编码器。
-
-        接口对应关系:
-        - 输入接口: 通过 `forward_offline_context_batch` 接收离线上下文样本。
-        - 输出接口: 产出 `target_chunk` 以及可选的 `past_key_values/attention_mask`
-          供动作专家训练路径使用。
-
-        参数:
-            config_path: 编码器配置路径；为空时使用仓库默认配置。
-        """
         super().__init__()
         if config_path is None:
             config_path = str(pathlib.Path(__file__).resolve().parent.parent / "configs" / "vla_qwen3_rtc.yaml")
@@ -188,24 +157,6 @@ class Qwen3RTCVLAEncoder(nn.Module):
         source_dt_ms: int = 50,
         return_condition_cache: bool = True,
     ) -> OfflineContextBatchOutput:
-        """编码离线 context 批次，并按动作专家接口返回训练条件。
-
-        接口对应关系:
-        - 输入接口 `samples` 需包含:
-          `context_videos/context_time_indices/anchor_* /target_chunk`，
-          可选 `prompt`。
-        - 输出接口包含:
-          - `target_chunk`: 对齐动作监督目标，供 RTC loss 使用。
-          - `past_key_values` 与 `attention_mask`(可选): 供动作专家注入 VLM 条件。
-
-        参数:
-            samples: 离线 context 样本列表，每个元素遵循 `OfflineContextSample`。
-            source_dt_ms: 索引时间步到毫秒时间戳的换算尺度。
-            return_condition_cache: 是否返回 `past_key_values` 与 `attention_mask`。
-
-        返回:
-            `OfflineContextBatchOutput`，键集合由 `return_condition_cache` 控制。
-        """
         batch_texts: List[str] = []
         batch_images: List[List[torch.Tensor]] = []
         batch_target_chunks: List[torch.Tensor] = []

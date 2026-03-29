@@ -11,11 +11,8 @@ from .model import ActionExpertBackbone, ActionExpertConfig
 
 KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
-
 @dataclass
 class ActionExpertRunnerConfig:
-    """动作专家运行配置。"""
-
     state_dim: int
     action_dim: int
     horizon: int
@@ -29,13 +26,8 @@ class ActionExpertRunnerConfig:
     ffn_dim_multiplier: float | None = None
     num_inference_steps: int = 5
 
-
 class ActionExpertRunner(nn.Module):
-    """动作专家统一训练/采样封装。"""
-
     def __init__(self, config: ActionExpertRunnerConfig) -> None:
-        """构建动作专家主干与 KV 缓存容器。"""
-
         super().__init__()
         self.config = config
         self.kv_cache_store = DiffusionKVCache()
@@ -66,7 +58,6 @@ class ActionExpertRunner(nn.Module):
         prompt_mask: torch.Tensor | None = None,
         step_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """训练路径前向，输出速度场预测。"""
 
         return self.backbone(
             noisy_action=noisy_action,
@@ -92,7 +83,6 @@ class ActionExpertRunner(nn.Module):
         kv_cache_key: Hashable | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """推理路径采样动作 chunk，并可复用 KV 条件缓存。"""
 
         return euler_sample_actions(
             model=self,

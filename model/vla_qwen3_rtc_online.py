@@ -24,23 +24,13 @@ from normalization import RTCNormalizer
 from .template_qwen3_vla import build_prompt_prefill_text
 from .vla_qwen3_rtc import Qwen3RTCVLAEncoder
 
-
 @dataclass
 class RTCOnlineResolvedConfig:
     max_context_len: int | None
     selected_layers: list[int]
     action_expert: Dict[str, Any]
 
-
 def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
-    """加载在线推理期 RTC 配置并映射到强类型结构。
-
-    参数:
-        config_path: `rtc_async_vla.yaml` 路径。
-
-    返回:
-        `RTCOnlineResolvedConfig`，用于初始化调度器与动作专家运行参数。
-    """
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
@@ -57,18 +47,7 @@ def _load_rtc_async_runtime_config(config_path: str) -> RTCOnlineResolvedConfig:
         action_expert=action_expert,
     )
 
-
 class Qwen3RTCVLAOnlinePipeline:
-    """
-    统一在线入口：
-    1) 流式写入 VLM 上下文
-    2) 导出 KV/attention 条件
-    3) 扩散头采样动作 chunk
-    4) RTC 异步调度输出 execute_chunk
-
-    该入口不包含任何在线 token 生成/解码逻辑。
-    """
-
     def __init__(
         self,
         *,
@@ -78,17 +57,6 @@ class Qwen3RTCVLAOnlinePipeline:
         vlm_device: Optional[str] = None,
         dit_device: Optional[str] = None,
     ) -> None:
-        """构建在线推理 pipeline，并绑定 VLM 条件与 RTC 调度模块。
-
-        参数:
-            vla_config_path: VLA 编码器配置路径；为空时使用默认配置。
-            rtc_config_path: RTC 运行配置路径；为空时使用默认配置。
-            device: 可选运行设备覆盖值。
-
-        接口对应:
-            初始化后可通过 `reset/push_observation/sample_and_schedule`
-            形成完整在线闭环。
-        """
         if vla_config_path is None:
             vla_config_path = str(pathlib.Path(__file__).resolve().parent.parent / "configs" / "vla_qwen3_rtc.yaml")
         if rtc_config_path is None:
@@ -160,17 +128,14 @@ class Qwen3RTCVLAOnlinePipeline:
 
     @property
     def device(self) -> str:
-        """返回 pipeline 当前运行设备，供外部状态构造与 checkpoint 加载使用。"""
         return self.vlm_device
 
     def set_runtime_timebase(self, *, source_dt_ms: int) -> None:
-        """设置在线 step 时间基准，用于把 `ts_ms` 换算为 `step_delay_steps`。"""
         if int(source_dt_ms) <= 0:
             raise ValueError(f"source_dt_ms must be positive, got {source_dt_ms}")
         self.source_dt_ms = int(source_dt_ms)
 
     def start_async_pipeline(self, *, poll_interval_s: float = 0.001) -> None:
-        """启动单卡线程化 stage pipeline。"""
         if self.threaded_runner is not None and self.threaded_runner.running():
             raise RuntimeError("async pipeline is already running")
         self.threaded_runner = RTCThreadedPipelineRunner(
@@ -183,7 +148,6 @@ class Qwen3RTCVLAOnlinePipeline:
         self.threaded_runner.start()
 
     def stop_async_pipeline(self) -> None:
-        """停止单卡线程化 stage pipeline。"""
         if self.threaded_runner is None:
             return
         self.threaded_runner.stop()
@@ -197,12 +161,6 @@ class Qwen3RTCVLAOnlinePipeline:
             self.threaded_runner.check_error()
 
     def load_action_expert_checkpoint(self, checkpoint_path: str, strict: bool = True) -> None:
-        """加载动作专家权重到在线 pipeline。
-
-        参数:
-            checkpoint_path: checkpoint 文件路径。
-            strict: 是否严格匹配参数名。
-        """
         payload = torch.load(checkpoint_path, map_location="cpu")
         vla_state_dict = payload.get("vla", None)
         if vla_state_dict is not None:
@@ -215,11 +173,6 @@ class Qwen3RTCVLAOnlinePipeline:
         self.action_expert.eval()
 
     def reset(self, prompt: Optional[str] = None) -> None:
-        """重置流式上下文与调度状态，并进行 prompt 预填充。
-
-        参数:
-            prompt: 可选任务文本；为空时以 tokenizer EOS 做最小预填充。
-        """
         if self.async_pipeline_running():
             raise RuntimeError("reset is not allowed while async pipeline is running; stop it first.")
         self.runner.reset()
@@ -251,17 +204,6 @@ class Qwen3RTCVLAOnlinePipeline:
         ts_ms: Optional[int] = None,
         num_frames: int = 1,
     ) -> bool:
-        """插入一条观测 step 到流式上下文。
-
-        参数:
-            frames: 窗口帧序列。
-            state: 当前状态向量，支持 `[Ds]` 或 `[1, Ds]`。
-            ts_ms: 可选毫秒时间戳。
-            num_frames: 输入窗口帧数。
-
-        返回:
-            是否成功插入。
-        """
         self._check_async_pipeline_error()
         latest_state = state.to(self.device)
         if latest_state.dim() == 1:

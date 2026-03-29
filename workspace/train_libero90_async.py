@@ -43,7 +43,6 @@ from model.rtc_async.training.loss_rtc import build_rtc_inpainting_batch, rtc_ve
 from model.vla_qwen3_rtc import Qwen3RTCVLAEncoder
 from normalization import RTCNormalizer
 
-
 @dataclass
 class RTCAsyncResolvedConfig:
     max_context_len: int | None
@@ -56,7 +55,6 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 def ensure_dir(path: str) -> None:
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-
 
 def resolve_workspace_path(path_str: str) -> str:
     p = pathlib.Path(path_str)
@@ -75,7 +73,6 @@ def load_rtc_async_config(config_path: str) -> RTCAsyncResolvedConfig:
         selected_layers=[int(x) for x in stream["selected_layers"]],
         action_expert=action_expert,
     )
-
 
 def build_action_expert_runner(
     *,
@@ -99,11 +96,9 @@ def build_action_expert_runner(
         raise ValueError(f"action_dim mismatch: config={runner_cfg.action_dim}, dataset={action_dim}")
     return ActionExpertRunner(runner_cfg)
 
-
 def _stack_anchor_state(sample_list: List[Dict[str, Any]], device: str) -> torch.Tensor:
     state = torch.stack([sample["anchor_state"] for sample in sample_list], dim=0)
     return state.to(device)
-
 
 def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device: torch.device) -> torch.Tensor:
     delays = []
@@ -117,7 +112,6 @@ def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device:
         step_gap = max(anchor_t - prev_t, 0)
         delays.append(max(horizon - step_gap, 0))
     return torch.tensor(delays, device=device, dtype=torch.long)
-
 
 def run_epoch(
     *,
@@ -252,7 +246,6 @@ def run_epoch(
         f"{prefix}/updates": float(max_updates.item()),
     }
 
-
 def save_checkpoint(
     path: str,
     *,
@@ -279,7 +272,6 @@ def save_checkpoint(
         payload["vla"] = accelerator.get_state_dict(vla)
     accelerator.save(payload, path)
 
-
 def load_checkpoint(
     path: str,
     *,
@@ -289,11 +281,6 @@ def load_checkpoint(
     scheduler: Any | None = None,
     train_vla: bool,
 ) -> tuple[int, int]:
-    """加载检查点并恢复训练状态。
-
-    返回:
-        `(epoch, global_step)`，用于恢复训练游标。
-    """
     payload = torch.load(path, map_location=vla.device)
     action_expert.load_state_dict(payload["action_expert"], strict=True)
     if train_vla and "vla" in payload:
@@ -306,18 +293,12 @@ def load_checkpoint(
     global_step = int(payload.get("global_step", 0))
     return epoch, global_step
 
-
 @hydra.main(
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.parent / "configs"),
     config_name="train_libero90_async",
 )
 def main(cfg: DictConfig) -> None:
-    """离线训练入口：构建数据、模型、优化器并驱动 epoch 循环。
-
-    参数:
-        cfg: Hydra 注入的训练配置。
-    """
     OmegaConf.resolve(cfg)
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=False,

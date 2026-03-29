@@ -4,15 +4,11 @@ from dataclasses import dataclass
 
 import torch
 
-
 def validate_rtc_params(*, horizon: int, step_delay_steps: int) -> None:
-    """校验基于真实 step delay 的 RTC 调度参数。"""
-
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
     if step_delay_steps < 0:
         raise ValueError(f"step_delay_steps must be non-negative, got {step_delay_steps}")
-
 
 def stitch_action_for_execution(
     *,
@@ -20,7 +16,6 @@ def stitch_action_for_execution(
     next_chunk: torch.Tensor,
     step_delay_steps: int,
 ) -> tuple[torch.Tensor, int]:
-    """按真实 step delay 将历史重叠前缀与新预测拼接成当前时刻对齐的 chunk。"""
 
     if prev_chunk.shape != next_chunk.shape:
         raise ValueError(
@@ -33,13 +28,11 @@ def stitch_action_for_execution(
     right = next_chunk[:, prefix_len:]
     return torch.cat([left, right], dim=1), int(prefix_len)
 
-
 def roll_chunk_after_execution(
     *,
     stitched_chunk: torch.Tensor,
     executed_steps: int,
 ) -> torch.Tensor:
-    """在执行后滚动缓存 chunk，保留未执行尾部并在末尾补零。"""
 
     horizon = int(stitched_chunk.shape[1])
     if executed_steps < 0 or executed_steps > horizon:
@@ -52,11 +45,8 @@ def roll_chunk_after_execution(
     )
     return torch.cat([tail, pad], dim=1)
 
-
 @dataclass
 class RTCChunkScheduler:
-    """状态化的 RTC chunk 调度器，管理跨 step 的上一轮完整 stitched chunk。"""
-
     horizon: int
     action_dim: int
     device: torch.device
@@ -64,8 +54,6 @@ class RTCChunkScheduler:
     last_stitched_chunk: torch.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
-        """按批次大小重置上一轮完整 stitched chunk 缓存。"""
-
         self.last_stitched_chunk = torch.zeros(
             (batch_size, self.horizon, self.action_dim),
             device=self.device,
@@ -73,8 +61,6 @@ class RTCChunkScheduler:
         )
 
     def get_prefix_chunk(self, *, batch_size: int, step_delay_steps: int) -> torch.Tensor:
-        """按当前 observation 的 delay 现场对齐上一轮 chunk，得到 RTC 前缀来源。"""
-
         validate_rtc_params(horizon=self.horizon, step_delay_steps=int(step_delay_steps))
         if self.last_stitched_chunk is None or self.last_stitched_chunk.shape[0] != batch_size:
             self.reset(batch_size)
@@ -90,7 +76,6 @@ class RTCChunkScheduler:
         next_chunk: torch.Tensor,
         step_delay_steps: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-        """生成当前时刻对齐的 stitched chunk、可执行片段，并更新上一轮完整 chunk 缓存。"""
 
         if next_chunk.dim() != 3:
             raise ValueError(f"next_chunk must be [B, H, D], got {tuple(next_chunk.shape)}")
