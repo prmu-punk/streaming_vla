@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - /data: libero_2cam
+  - /model: fastwam_streaming
+  - /task: libero_streaming_action_ft_2cam224_1e-4
+  - _self_
+
+mixed_precision: "bf16"
+seed: 42
+device: cuda
+output_path: ./runs/profile/fastwam_streaming_profile.json
+checkpoint_path: null
+
+profile:
+  warmup_iters: 3
+  measure_iters: 10
+  num_inference_steps: 10
+  frontier_schedule: null
+  rand_device: cuda
+  tiled: false
+  obs_timestamp_ms: 0.0
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

@@ -30,7 +30,7 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.", "proprio_embedding.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "ffn_dim",
@@ -53,6 +53,7 @@ class ActionDiT(nn.Module):
         num_heads: int,
         attn_head_dim: int,
         num_layers: int,
+        proprio_dim: int | None = None,
         use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
@@ -63,6 +64,7 @@ class ActionDiT(nn.Module):
         self.freq_dim = freq_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
+        self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -82,6 +84,13 @@ class ActionDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.proprio_embedding = None
+        if self.proprio_dim is not None:
+            self.proprio_embedding = nn.Sequential(
+                nn.Linear(self.proprio_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.blocks = nn.ModuleList(
             [
@@ -114,6 +123,7 @@ class ActionDiT(nn.Module):
         action_dit_config: dict[str, Any],
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
+        proprio_dim: int | None = None,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
     ) -> "ActionDiT":
@@ -124,10 +134,16 @@ class ActionDiT(nn.Module):
                 "Skipping ActionDiT pretrained load (`skip_dit_load_from_pretrain=True`); "
                 "initializing action expert randomly and expecting checkpoint override."
             )
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+            config = dict(action_dit_config)
+            if proprio_dim is not None:
+                config["proprio_dim"] = int(proprio_dim)
+            return cls(**config).to(device=device, dtype=torch_dtype)
         if not action_dit_pretrained_path:
             logger.info("No `action_dit_pretrained_path` provided, initializing ActionDiT with random weights.")
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+            config = dict(action_dit_config)
+            if proprio_dim is not None:
+                config["proprio_dim"] = int(proprio_dim)
+            return cls(**config).to(device=device, dtype=torch_dtype)
         from pathlib import Path
         p = Path(action_dit_pretrained_path)
         if not p.is_absolute():
@@ -139,6 +155,8 @@ class ActionDiT(nn.Module):
             )
 
         action_cfg = dict(action_dit_config)
+        if proprio_dim is not None:
+            action_cfg["proprio_dim"] = int(proprio_dim)
         action_expert = cls(**action_cfg).to(device=device, dtype=torch_dtype)
         action_state = action_expert.state_dict()
         expected_backbone_keys = cls.backbone_key_set(action_state.keys())
@@ -229,6 +247,7 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -277,7 +296,24 @@ class ActionDiT(nn.Module):
                 f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
             )
 
+        if proprio is not None:
+            if self.proprio_embedding is None or self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `ActionDiT` was initialized without `proprio_dim`.")
+            if proprio.ndim != 2:
+                raise ValueError(f"`proprio` must be 2D [B, D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between action tokens and proprio: {batch_size} vs {proprio.shape[0]}"
+                )
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(
+                    f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}"
+                )
+
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
+        if proprio is not None:
+            # Inject proprio into AdaLN modulation without polluting the shared text/video context.
+            t = t + self.proprio_embedding(proprio.to(device=t.device, dtype=t.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
         tokens = self.action_encoder(action_tokens)
@@ -307,12 +343,14 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pre_state = self.pre_dit(
             action_tokens=action_tokens,
             timestep=timestep,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
         x = pre_state["tokens"]
         context = pre_state["context"]

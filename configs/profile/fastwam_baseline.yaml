@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - /data: libero_2cam
+  - /model: fastwam
+  - /task: libero_uncond_2cam224_1e-4
+  - _self_
+
+mixed_precision: "bf16"
+seed: 42
+device: cuda
+output_path: ./runs/profile/fastwam_baseline_profile.json
+checkpoint_path: null
+
+profile:
+  warmup_iters: 3
+  measure_iters: 10
+  num_inference_steps: 10
+  rand_device: cuda
+  tiled: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

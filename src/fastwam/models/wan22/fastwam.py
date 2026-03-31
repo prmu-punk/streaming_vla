@@ -134,6 +134,7 @@ class FastWAM(torch.nn.Module):
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            proprio_dim=proprio_dim,
             device=device,
             torch_dtype=torch_dtype,
         )
@@ -263,6 +264,25 @@ class FastWAM(torch.nn.Module):
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
         return z
+
+    @torch.no_grad()
+    def _encode_input_image_latents_batch(
+        self,
+        input_image: torch.Tensor,
+        tiled: bool = False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    ) -> torch.Tensor:
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [B,3,H,W], got {tuple(input_image.shape)}"
+            )
+        return self._encode_video_latents(
+            input_image.unsqueeze(2),
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -701,12 +721,14 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
         action_tokens = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
@@ -1082,6 +1104,108 @@ class FastWAM(torch.nn.Module):
             sigma_shift=sigma_shift,
             seed=seed,
             rand_device=rand_device,
+            tiled=tiled,
+        )
+
+    def prepare_action_pre(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        return self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+        )
+
+    def postprocess_action_tokens(self, action_tokens: torch.Tensor, action_pre: dict[str, Any]) -> torch.Tensor:
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
+    def build_joint_attention_mask(
+        self,
+        video_seq_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=device,
+        )
+
+    @torch.no_grad()
+    def build_streaming_video_cache_from_latents(
+        self,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        del tiled
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self.build_joint_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=1,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+        return {
+            "video_pre": video_pre,
+            "video_kv_cache": video_kv_cache,
+            "video_seq_len": video_seq_len,
+        }
+
+    @torch.no_grad()
+    def build_streaming_video_cache_from_input_image(
+        self,
+        input_image: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [B,3,H,W], got {tuple(input_image.shape)}"
+            )
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_batch(input_image=input_image, tiled=tiled)
+        return self.build_streaming_video_cache_from_latents(
+            first_frame_latents=first_frame_latents,
+            context=context,
+            context_mask=context_mask,
             tiled=tiled,
         )
 

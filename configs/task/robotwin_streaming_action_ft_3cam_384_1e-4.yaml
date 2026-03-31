@@ -1,0 +1,45 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: fastwam_streaming
+  - _self_
+
+batch_size: 16
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+  streaming:
+    freeze_video_expert: true
+    proprio_to_action_only: true
+    streaming_train:
+      enabled: true
+      obs_gap_choices: [1, 2, 3]
+      obs_new_frame_choices: [1, 2]
+      mix_with_base_loss: false
+      lambda_streaming_action: 1.0
+      lambda_base: 1.0
+      frontier:
+        min_layers: 4
+        max_layers: 30
+        random_jitter: 2
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 500
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+profile_bootstrap:
+  target_obs_period_ms: 100.0
+  action_trigger_every_n_obs: 2
+  expected_video_prefill_ms: null
+  expected_action_full_ms: null
+  expected_action_step_ms: null

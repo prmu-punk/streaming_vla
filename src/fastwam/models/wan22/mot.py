@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -261,6 +261,7 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
+        layer_callback: Optional[Callable[[int, dict[str, torch.Tensor]], None]] = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -337,7 +338,10 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
-            kv_cache.append({"k": k, "v": v})
+            layer_cache = {"k": k, "v": v}
+            kv_cache.append(layer_cache)
+            if layer_callback is not None:
+                layer_callback(layer_idx, layer_cache)
         return kv_cache
 
     def forward_action_with_video_cache(

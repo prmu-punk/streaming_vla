@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - /data: libero_2cam
+  - /model: fastwam_streaming
+  - /task: libero_streaming_action_ft_2cam224_1e-4
+  - _self_
+
+mixed_precision: "bf16"
+seed: 42
+device: cuda
+output_path: ./runs/profile/fastwam_async_runtime_trace.json
+checkpoint_path: null
+
+trace:
+  sample_index: 0
+  obs_start_index: 0
+  num_obs: 6
+  obs_dt_ms: 50.0
+  action_trigger_every_n_obs: 2
+  sigma_shift: null
+  rand_device: cuda
+  tiled: false
+  seed: 42
+  warmup_video_bootstrap: true
+  warmup_action_job: true
+  include_layer_arrays: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
