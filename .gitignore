@@ -2,7 +2,7 @@
 # Misc
 outputs/
 checkpoints
-data/*
+data/
 apex/
 assets/
 runs
