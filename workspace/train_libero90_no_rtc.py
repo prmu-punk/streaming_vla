@@ -281,14 +281,16 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any | None = None,
     train_vla: bool,
+    load_optimizer_state: bool = False,
+    load_scheduler_state: bool = False,
 ) -> tuple[int, int]:
     payload = torch.load(path, map_location=vla.device)
     action_expert.load_state_dict(payload["action_expert"], strict=True)
-    if train_vla and "vla" in payload:
+    if "vla" in payload:
         vla.load_state_dict(payload["vla"], strict=True)
-    if optimizer is not None and "optimizer" in payload:
+    if load_optimizer_state and optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
-    if scheduler is not None and "scheduler" in payload:
+    if load_scheduler_state and scheduler is not None and "scheduler" in payload:
         scheduler.load_state_dict(payload["scheduler"])
     epoch = int(payload.get("epoch", -1))
     global_step = int(payload.get("global_step", 0))
@@ -480,6 +482,8 @@ def main(cfg: DictConfig) -> None:
             optimizer=optimizer,
             scheduler=scheduler,
             train_vla=bool(cfg.rtc_async.train_vla),
+            load_optimizer_state=bool(cfg.checkpoint.get("load_optimizer_state", False)),
+            load_scheduler_state=bool(cfg.checkpoint.get("load_scheduler_state", False)),
         )
         start_epoch = resumed_epoch + 1
         accelerator.print(

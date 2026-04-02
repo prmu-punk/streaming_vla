@@ -375,7 +375,8 @@ def evaluate_benchmark_success_rate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate async RTC rollout success rate on LIBERO benchmarks.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--vla-checkpoint", type=str, required=True)
+    parser.add_argument("--action-expert-checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/train_libero90_async.yaml")
     parser.add_argument("--benchmark", type=str, default="libero_90")
     parser.add_argument("--vlm-device", type=str, default=None)
@@ -409,7 +410,8 @@ def main() -> None:
         vlm_device=args.vlm_device,
         dit_device=args.dit_device,
     )
-    pipeline.load_action_expert_checkpoint(str(args.checkpoint), strict=False)
+    pipeline.load_action_expert_checkpoint(str(args.vla_checkpoint), strict=False)
+    pipeline.load_action_expert_checkpoint(str(args.action_expert_checkpoint), strict=False)
 
     metrics = evaluate_benchmark_success_rate(
         pipeline=pipeline,

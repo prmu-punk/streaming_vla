@@ -5,6 +5,9 @@ rtc_async:
   config_path: configs/rtc_async_vla.yaml
   train_vla: true
   use_attention_mask: true
+  low_bias_beta: 0.35
+  front_weight_steps: 0
+  front_weight: 1.0
 
 dataset:
   zarr_path: /inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/streaming_vla/oat/data/libero_256/libero90_N4500.zarr
@@ -65,10 +68,10 @@ val_dataloader:
 eval:
   every_epochs: 1
   max_val_batches: null
-  denoise_mse_num_samples: 64
+  denoise_mse_num_samples: 8
 
-checkpoint:
-  save_every: 2
+checkpoint: 
+  save_every: 1
   best_monitor: val/rtc_loss
   best_mode: min
   resume_from: "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/Streaming_VLA/checkpoints/epoch_0000.pt"

@@ -39,7 +39,7 @@ from dataset.bucket_sampler import BucketBatchSampler
 from dataset.libero90_async_offline_context_dataset import LiberoOfflineContextDataset, offline_context_collate
 from model.rtc_async.action_expert.runner import ActionExpertRunner, ActionExpertRunnerConfig
 from model.rtc_async.qwen3_stream.kv_export import export_selected_kv_cache
-from model.rtc_async.training.loss_rtc import build_rtc_inpainting_batch, rtc_velocity_loss
+from model.rtc_async.training.loss_rtc import build_rtc_inpainting_batch, rtc_denoise_mse
 from model.vla_qwen3_rtc import Qwen3RTCVLAEncoder
 from normalization import RTCNormalizer
 
@@ -100,7 +100,13 @@ def _stack_anchor_state(sample_list: List[Dict[str, Any]], device: str) -> torch
     state = torch.stack([sample["anchor_state"] for sample in sample_list], dim=0)
     return state.to(device)
 
-def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device: torch.device) -> torch.Tensor:
+def _stack_rtc_delay(
+    sample_list: List[Dict[str, Any]],
+    *,
+    horizon: int,
+    device: torch.device,
+    low_bias_beta: float = 0.35,
+) -> torch.Tensor:
     delays = []
     for sample in sample_list:
         history = sample["context_time_indices"]
@@ -110,7 +116,12 @@ def _stack_rtc_delay(sample_list: List[Dict[str, Any]], *, horizon: int, device:
         anchor_t = int(sample["anchor_time_idx"].item())
         prev_t = int(history[-1].item())
         step_gap = max(anchor_t - prev_t, 0)
-        delays.append(max(horizon - step_gap, 0))
+        prefix_len = max(horizon - step_gap, 0)
+        if prefix_len > 0:
+            choices = list(range(prefix_len + 1))
+            weights = [math.exp(-float(low_bias_beta) * float(x)) for x in choices]
+            prefix_len = int(random.choices(choices, weights=weights, k=1)[0])
+        delays.append(prefix_len)
     return torch.tensor(delays, device=device, dtype=torch.long)
 
 def run_epoch(
@@ -136,6 +147,7 @@ def run_epoch(
 
     total_loss = 0.0
     total_delay = 0.0
+    total_denoise_mse = 0.0
     n_samples = 0
     n_updates = 0
     max_batches_key = "max_train_batches" if train else "max_val_batches"
@@ -181,6 +193,7 @@ def run_epoch(
             sample_list,
             horizon=int(target_chunk.shape[1]),
             device=accelerator.device,
+            low_bias_beta=float(cfg.rtc_async.get("low_bias_beta", 0.35)),
         )
 
         rtc_batch = build_rtc_inpainting_batch(
@@ -200,7 +213,34 @@ def run_epoch(
             prompt_mask=prompt_mask,
             step_mask=step_mask,
         )
-        loss = rtc_velocity_loss(pred_u_t=pred_u_t, batch=rtc_batch)
+        per_step_loss = (pred_u_t - rtc_batch.u_t).pow(2).mean(dim=-1)
+        step_weight = torch.ones_like(per_step_loss)
+        front_weight_steps = max(0, int(cfg.rtc_async.get("front_weight_steps", 0)))
+        front_weight = float(cfg.rtc_async.get("front_weight", 1.0))
+        if front_weight_steps > 0 and front_weight != 1.0:
+            step_weight[:, :front_weight_steps] = float(front_weight)
+        weighted_mask = rtc_batch.loss_mask.to(per_step_loss.dtype) * step_weight
+        loss = (per_step_loss * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
+        denoise_mse_value = None
+        if not train:
+            denoise_mse_num_samples = max(1, int(cfg.eval.get("denoise_mse_num_samples", 1)))
+            denoise_mse_acc = 0.0
+            for _ in range(denoise_mse_num_samples):
+                eval_batch = build_rtc_inpainting_batch(
+                    action=target_chunk,
+                    delay=delay,
+                )
+                eval_pred_u_t = action_expert(
+                    noisy_action=eval_batch.x_t,
+                    state=state,
+                    time=eval_batch.time,
+                    kv_cache=kv_cache,
+                    attention_mask=attention_mask,
+                    prompt_mask=prompt_mask,
+                    step_mask=step_mask,
+                )
+                denoise_mse_acc += float(rtc_denoise_mse(pred_u_t=eval_pred_u_t, batch=eval_batch).item())
+            denoise_mse_value = denoise_mse_acc / float(denoise_mse_num_samples)
 
         if train:
             accelerator.backward(loss)
@@ -218,6 +258,8 @@ def run_epoch(
         bs = int(target_chunk.shape[0])
         total_loss += float(loss.detach().item()) * bs
         total_delay += float(rtc_batch.delay.float().mean().item()) * bs
+        if denoise_mse_value is not None:
+            total_denoise_mse += float(denoise_mse_value) * bs
         n_samples += bs
 
         if accelerator.is_local_main_process and hasattr(progress, "set_postfix"):
@@ -230,21 +272,24 @@ def run_epoch(
             break
 
     local_stats = torch.tensor(
-        [[total_loss, total_delay, float(n_samples), float(n_updates)]],
+        [[total_loss, total_delay, total_denoise_mse, float(n_samples), float(n_updates)]],
         device=accelerator.device,
         dtype=torch.float64,
     )
     gathered_stats = accelerator.gather(local_stats)
-    summed_stats = gathered_stats[:, :3].sum(dim=0)
-    max_updates = gathered_stats[:, 3].max()
+    summed_stats = gathered_stats[:, :4].sum(dim=0)
+    max_updates = gathered_stats[:, 4].max()
 
     prefix = "train" if train else "val"
-    return {
-        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/avg_delay": float(summed_stats[1].item() / max(summed_stats[2].item(), 1.0)),
-        f"{prefix}/samples": float(summed_stats[2].item()),
+    metrics = {
+        f"{prefix}/rtc_loss": float(summed_stats[0].item() / max(summed_stats[3].item(), 1.0)),
+        f"{prefix}/avg_delay": float(summed_stats[1].item() / max(summed_stats[3].item(), 1.0)),
+        f"{prefix}/samples": float(summed_stats[3].item()),
         f"{prefix}/updates": float(max_updates.item()),
     }
+    if not train:
+        metrics[f"{prefix}/denoise_mse"] = float(summed_stats[2].item() / max(summed_stats[3].item(), 1.0))
+    return metrics
 
 def save_checkpoint(
     path: str,
@@ -280,14 +325,16 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any | None = None,
     train_vla: bool,
+    load_optimizer_state: bool = False,
+    load_scheduler_state: bool = False,
 ) -> tuple[int, int]:
     payload = torch.load(path, map_location=vla.device)
     action_expert.load_state_dict(payload["action_expert"], strict=True)
-    if train_vla and "vla" in payload:
+    if "vla" in payload:
         vla.load_state_dict(payload["vla"], strict=True)
-    if optimizer is not None and "optimizer" in payload:
+    if load_optimizer_state and optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
-    if scheduler is not None and "scheduler" in payload:
+    if load_scheduler_state and scheduler is not None and "scheduler" in payload:
         scheduler.load_state_dict(payload["scheduler"])
     epoch = int(payload.get("epoch", -1))
     global_step = int(payload.get("global_step", 0))
@@ -302,7 +349,7 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=False,
-        static_graph=bool(cfg.rtc_async.train_vla),
+        static_graph=True,
     )
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(int(cfg.training.seed))
@@ -478,6 +525,8 @@ def main(cfg: DictConfig) -> None:
             optimizer=optimizer,
             scheduler=scheduler,
             train_vla=bool(cfg.rtc_async.train_vla),
+            load_optimizer_state=bool(cfg.checkpoint.get("load_optimizer_state", False)),
+            load_scheduler_state=bool(cfg.checkpoint.get("load_scheduler_state", False)),
         )
         start_epoch = resumed_epoch + 1
         accelerator.print(

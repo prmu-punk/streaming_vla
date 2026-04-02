@@ -77,3 +77,21 @@ def rtc_velocity_loss(
     per_elem = (pred_u_t - batch.u_t).pow(2).mean(dim=-1)
     denom = batch.loss_mask.sum().clamp_min(1).to(per_elem.dtype)
     return (per_elem * batch.loss_mask.to(per_elem.dtype)).sum() / denom
+
+
+def rtc_denoise_mse(
+    *,
+    pred_u_t: torch.Tensor,
+    batch: RTCInpaintingBatch,
+) -> torch.Tensor:
+
+    if pred_u_t.shape != batch.u_t.shape:
+        raise ValueError(f"pred_u_t shape mismatch: {tuple(pred_u_t.shape)} vs {tuple(batch.u_t.shape)}")
+    if batch.time.dim() != 2:
+        raise ValueError(f"batch.time must be [B, H], got {tuple(batch.time.shape)}")
+    one_minus_t = 1.0 - batch.time[:, :, None]
+    pred_action = batch.x_t + one_minus_t * pred_u_t
+    target_action = batch.x_t + one_minus_t * batch.u_t
+    per_elem = (pred_action - target_action).pow(2).mean(dim=-1)
+    denom = batch.loss_mask.sum().clamp_min(1).to(per_elem.dtype)
+    return (per_elem * batch.loss_mask.to(per_elem.dtype)).sum() / denom

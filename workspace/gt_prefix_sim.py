@@ -454,7 +454,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/train_libero90_async.yaml")
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--match-rank", type=int, default=0)
-    parser.add_argument("--anchor-pos", type=int, default=0)
+    parser.add_argument("--anchor-pos", type=int, default=10)
     parser.add_argument("--save-video", action="store_true")
     args = parser.parse_args()
 

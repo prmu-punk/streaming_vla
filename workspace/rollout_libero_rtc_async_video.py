@@ -59,6 +59,7 @@ _ensure_libero_config()
 
 from libero.libero import benchmark, get_libero_path
 from model import Qwen3RTCVLAOnlinePipeline
+from model.rtc_async.pipeline.pipeline_types import ExecutePacket
 from oat.oat.env.libero.env import LiberoEnv, task_name_to_suite_and_ids
 
 
@@ -109,6 +110,84 @@ class ScheduledExecuteChunk:
     step_delay_steps: int
     prefix_len: int
     actions: np.ndarray
+
+
+class PrefixScaledRTCOnlinePipeline(Qwen3RTCVLAOnlinePipeline):
+    def __init__(self, *, prefix_scale: float = 1.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.prefix_scale = float(prefix_scale)
+
+    def _scaled_step_delay_steps(self, step_delay_steps: int) -> int:
+        horizon = int(self.scheduler.horizon)
+        natural_prefix_len = max(horizon - int(step_delay_steps), 0)
+        scaled_prefix_len = int(round(float(natural_prefix_len) * float(self.prefix_scale)))
+        scaled_prefix_len = max(0, min(horizon, scaled_prefix_len))
+        return int(horizon - scaled_prefix_len)
+
+    def _drain_context_to_action(
+        self,
+        *,
+        kv_cache_key: Optional[tuple[Any, ...]] = None,
+        generator: torch.Generator | None = None,
+    ) -> Any:
+        context_packet = self.queues.context_queue.pop()
+        if context_packet is None:
+            return None
+        step_delay_steps = self._resolve_step_delay_steps(context_packet.ts_ms)
+        effective_step_delay_steps = self._scaled_step_delay_steps(step_delay_steps)
+        prefix_len = max(self.scheduler.horizon - int(effective_step_delay_steps), 0)
+        known_action = None
+        known_mask = None
+        if prefix_len > 0:
+            prefix_chunk = self.scheduler.get_prefix_chunk(
+                batch_size=context_packet.state.shape[0],
+                step_delay_steps=int(effective_step_delay_steps),
+            )
+            if prefix_chunk.shape[0] != context_packet.state.shape[0]:
+                raise RuntimeError(
+                    f"scheduler prefix_chunk batch mismatch: {prefix_chunk.shape[0]} vs {context_packet.state.shape[0]}"
+                )
+            known_action = prefix_chunk.to(device=self.dit_device, non_blocking=True)
+            if self.normalizer is not None:
+                known_action = self.normalizer.normalize_action(known_action)
+            known_mask = torch.zeros(
+                (known_action.shape[0], known_action.shape[1]),
+                dtype=torch.bool,
+                device=known_action.device,
+            )
+            known_mask[:, :prefix_len] = True
+        packet = self.dit_stage(
+            context_packet,
+            step_delay_steps=effective_step_delay_steps,
+            known_action=known_action,
+            known_mask=known_mask,
+            normalizer=self.normalizer,
+            kv_cache_key=kv_cache_key,
+            generator=generator,
+        )
+        self.queues.action_queue.put_latest(packet)
+        return packet
+
+    def _drain_action_to_execute(self) -> Any:
+        action_packet = self.queues.action_queue.pop()
+        if action_packet is None:
+            return None
+        effective_step_delay_steps = self._scaled_step_delay_steps(action_packet.step_delay_steps)
+        stitched_chunk, execute_chunk, _, prefix_len, _ = self.scheduler.schedule(
+            next_chunk=action_packet.action_chunk,
+            step_delay_steps=int(effective_step_delay_steps),
+        )
+        packet = ExecutePacket(
+            step_id=action_packet.step_id,
+            ts_ms=action_packet.ts_ms,
+            step_delay_steps=int(effective_step_delay_steps),
+            prefix_len=int(prefix_len),
+            action_chunk=action_packet.action_chunk,
+            stitched_chunk=stitched_chunk,
+            execute_chunk=execute_chunk,
+        )
+        self.queues.execute_queue.put_latest(packet)
+        return packet
 
 
 def _ingest_execute_packet(
@@ -387,7 +466,8 @@ def run_async_rollout(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a single async RTC rollout on LIBERO and save a video.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--vla-checkpoint", type=str, required=True)
+    parser.add_argument("--action-expert-checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/train_libero90_async.yaml")
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--vlm-device", type=str, default=None)
@@ -398,6 +478,7 @@ def main() -> None:
     parser.add_argument("--observation-gap-steps", type=int, default=None)
     parser.add_argument("--step-dt-min-ms", type=int, default=None)
     parser.add_argument("--step-dt-max-ms", type=int, default=None)
+    parser.add_argument("--prefix-scale", type=float, default=1.0)
     parser.add_argument("--max-wait-s", type=float, default=2.0)
     parser.add_argument("--video-path", type=str, default=None)
     args = parser.parse_args()
@@ -405,13 +486,15 @@ def main() -> None:
     cfg = OmegaConf.load(args.config)
     OmegaConf.resolve(cfg)
 
-    pipeline = Qwen3RTCVLAOnlinePipeline(
+    pipeline = PrefixScaledRTCOnlinePipeline(
         vla_config_path=str(cfg.model.vla_config_path),
         rtc_config_path=str(cfg.rtc_async.config_path),
         vlm_device=args.vlm_device,
         dit_device=args.dit_device,
+        prefix_scale=float(args.prefix_scale),
     )
-    pipeline.load_action_expert_checkpoint(str(args.checkpoint), strict=False)
+    pipeline.load_action_expert_checkpoint(str(args.vla_checkpoint), strict=False)
+    pipeline.load_action_expert_checkpoint(str(args.action_expert_checkpoint), strict=False)
 
     num_frames = int(cfg.model.get("num_frames", 1) if args.num_frames is None else args.num_frames)
     video_path = args.video_path
