@@ -89,6 +89,20 @@ def _maybe_attach_default_norm_stats(data_cfg: DictConfig) -> DictConfig:
     return data_cfg
 
 
+def _resolve_action_horizon(profile_cfg: DictConfig, data_cfg: DictConfig) -> int:
+    action_horizon_cfg = profile_cfg.get("action_horizon", None)
+    if action_horizon_cfg is None:
+        train_cfg = data_cfg.get("train")
+        if train_cfg is None or train_cfg.get("num_frames") is None:
+            raise ValueError("Unable to resolve rollout action horizon from data.train.num_frames.")
+        action_horizon = int(train_cfg.num_frames) - 1
+    else:
+        action_horizon = int(action_horizon_cfg)
+    if action_horizon <= 0:
+        raise ValueError(f"Resolved action horizon must be positive, got {action_horizon}.")
+    return action_horizon
+
+
 @hydra.main(config_path="../configs", config_name="profile/fastwam_streaming", version_base="1.3")
 def main(cfg: DictConfig):
     cfg.data = _absolutize_data_cfg(cfg.data)
@@ -110,10 +124,7 @@ def main(cfg: DictConfig):
     if sample.get("proprio") is not None:
         proprio = sample["proprio"][0].to(device=model.device, dtype=model.torch_dtype)
 
-    action = sample["action"]
-    num_frames = int(sample["video"].shape[1])
-    action_horizon = int(action.shape[0] // max(num_frames - 1, 1))
-    action_horizon = max(1, action_horizon)
+    action_horizon = _resolve_action_horizon(cfg.profile, cfg.data)
 
     warmup_iters = int(cfg.profile.warmup_iters)
     measure_iters = int(cfg.profile.measure_iters)

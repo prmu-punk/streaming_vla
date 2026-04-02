@@ -40,13 +40,16 @@ from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_js
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
-from action_ensembler import ActionEnsembler
+from experiments.libero.action_ensembler import ActionEnsembler
+from experiments.libero.async_streaming_runtime import AsyncStreamingActionRuntime
 
 OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("max", lambda x: max(x))
 OmegaConf.register_new_resolver("split", lambda s, idx: s.split("/")[int(idx)])
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -86,6 +89,29 @@ def _resolve_eval_device(cfg: DictConfig) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _resolve_async_runtime_devices(cfg: DictConfig, fallback_device: str) -> tuple[str, str]:
+    video_device = cfg.EVALUATION.get("async_video_device")
+    action_device = cfg.EVALUATION.get("async_action_device")
+    resolved_video_device = fallback_device if video_device is None else str(video_device)
+    resolved_action_device = fallback_device if action_device is None else str(action_device)
+    return resolved_video_device, resolved_action_device
+
+
+def _build_eval_model(cfg: DictConfig, *, model_dtype: torch.dtype, device: str) -> torch.nn.Module:
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=device)
+    if cfg.get("ckpt") is not None:
+        _load_model_checkpoint(model, str(cfg.ckpt))
+    else:
+        logging.warning("No checkpoint provided; using randomly initialized weights for rollout timing.")
+    return model.to(device).eval()
+
+
+def _configure_egl_device(cfg: DictConfig) -> int:
+    gpu_id = int(cfg.get("gpu_id", 0))
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
+    return gpu_id
+
+
 def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     explicit = cfg.EVALUATION.get("dataset_stats_path")
     candidates: list[Path] = []
@@ -93,9 +119,16 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     if explicit is not None:
         candidates.append(Path(os.path.expanduser(os.path.expandvars(str(explicit)))))
 
-    ckpt = Path(os.path.expanduser(os.path.expandvars(str(cfg.ckpt))))
-    for parent in list(ckpt.parents)[:4]:
-        candidates.append(parent / "dataset_stats.json")
+    if cfg.get("ckpt") is not None:
+        ckpt = Path(os.path.expanduser(os.path.expandvars(str(cfg.ckpt))))
+        for parent in list(ckpt.parents)[:4]:
+            candidates.append(parent / "dataset_stats.json")
+
+    dataset_dirs = [str(v) for v in cfg.data.train.get("dataset_dirs", [])]
+    if any("libero" in v for v in dataset_dirs):
+        candidates.append(project_root / "checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json")
+    elif any("robotwin" in v for v in dataset_dirs):
+        candidates.append(project_root / "checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json")
 
     seen = set()
     for path in candidates:
@@ -118,38 +151,6 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
     return
-
-    # deprecated legacy checkpoint loading
-    payload = torch.load(ckpt, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
-
-    if "mot" in payload and hasattr(model, "mot"):
-        missing, unexpected = model.mot.load_state_dict(payload["mot"], strict=False)
-        logging.warning(
-            "Loaded fallback `mot` state_dict with strict=False. Missing=%d Unexpected=%d",
-            len(missing),
-            len(unexpected),
-        )
-        return
-
-    state_dict = None
-    for key in ("model_state_dict", "state_dict", "model"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            state_dict = value
-            break
-    if state_dict is None and all(torch.is_tensor(v) for v in payload.values()):
-        state_dict = payload
-    if state_dict is None:
-        raise ValueError(f"Cannot parse legacy checkpoint keys from: {ckpt}")
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    logging.warning(
-        "Loaded fallback model state_dict with strict=False. Missing=%d Unexpected=%d",
-        len(missing),
-        len(unexpected),
-    )
 
 
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -429,6 +430,20 @@ def _predict_action_chunk(
     return action, imgs, predicted_future_frames
 
 
+def _postprocess_libero_action_chunk(
+    action_latents: torch.Tensor,
+    *,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+) -> np.ndarray:
+    action = _denormalize_action(action_latents, processor)[0]
+    action[..., -1] = action[..., -1] * 2 - 1
+    action = invert_gripper_action(action)
+    if bool(cfg.EVALUATION.get("binarize_gripper", False)):
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
 def _get_max_steps(task_suite_name: str) -> int:
     suite_steps = {
         "libero_spatial": 400,
@@ -442,11 +457,56 @@ def _get_max_steps(task_suite_name: str) -> int:
     return suite_steps[task_suite_name]
 
 
+def _summarize_async_runtime_episodes(episodes: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if len(episodes) == 0:
+        return None
+
+    scalar_keys = [
+        "submitted_obs",
+        "submitted_jobs",
+        "completed_jobs",
+        "actions_served",
+        "actions_missed",
+        "dropped_prefix_actions",
+    ]
+    summary: dict[str, Any] = {"num_episodes": int(len(episodes))}
+    for key in scalar_keys:
+        values = [float(ep[key]) for ep in episodes]
+        summary[f"{key}_total"] = float(np.sum(values))
+        summary[f"{key}_mean"] = float(np.mean(values))
+
+    timing_keys = ["video_refresh", "action_job", "action_step", "snapshot_copy"]
+    timing_summary: dict[str, Any] = {}
+    for key in timing_keys:
+        counts = [
+            int(ep.get("timing_ms", {}).get(key, {}).get("count", 0))
+            for ep in episodes
+        ]
+        avg_values = [
+            ep.get("timing_ms", {}).get(key, {}).get("avg_ms")
+            for ep in episodes
+        ]
+        weighted_sum = 0.0
+        total_count = 0
+        for count, avg_value in zip(counts, avg_values):
+            if avg_value is None or count <= 0:
+                continue
+            weighted_sum += float(avg_value) * int(count)
+            total_count += int(count)
+        timing_summary[key] = {
+            "count_total": int(total_count),
+            "avg_ms": (None if total_count == 0 else float(weighted_sum / total_count)),
+        }
+    summary["timing_ms"] = timing_summary
+    return summary
+
+
 def run_single_episode(
     env,
     initial_state,
     task_description: str,
     model: torch.nn.Module,
+    action_model: Optional[torch.nn.Module],
     processor: FastWAMProcessor,
     cfg: DictConfig,
     episode_idx: int,
@@ -455,7 +515,24 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
+    action_device: str,
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], Optional[dict[str, Any]]]:
+    if bool(cfg.EVALUATION.get("async_streaming_enabled", False)):
+        return run_single_episode_async(
+            env=env,
+            initial_state=initial_state,
+            task_description=task_description,
+            video_model=model,
+            action_model=(model if action_model is None else action_model),
+            processor=processor,
+            cfg=cfg,
+            episode_idx=episode_idx,
+            action_horizon=action_horizon,
+            input_w=input_w,
+            input_h=input_h,
+            video_device=model_device,
+        )
+
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -578,13 +655,210 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, None
+
+
+def run_single_episode_async(
+    env,
+    initial_state,
+    task_description: str,
+    video_model: torch.nn.Module,
+    action_model: torch.nn.Module,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+    episode_idx: int,
+    *,
+    action_horizon: int,
+    input_w: int,
+    input_h: int,
+    video_device: str,
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], dict[str, Any]]:
+    if bool(cfg.EVALUATION.get("visualize_future_video", False)):
+        raise ValueError("Async LIBERO rollout does not yet support visualize_future_video=true.")
+
+    if not hasattr(video_model, "start_action_job") or not hasattr(action_model, "start_action_job"):
+        raise ValueError("Async LIBERO rollout requires a FastWAMStreaming-style model.")
+
+    max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
+    num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
+    obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", 3))
+    trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", 3))
+    video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
+    force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
+    control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
+    warmup_action_jobs = int(cfg.EVALUATION.get("async_warmup_action_jobs", 8))
+    warmup_latest_only = bool(cfg.EVALUATION.get("async_warmup_latest_only", True))
+    if warmup_action_jobs < 0:
+        raise ValueError(f"`async_warmup_action_jobs` must be >= 0, got {warmup_action_jobs}.")
+
+    prompt = DEFAULT_PROMPT.format(task=task_description)
+    with torch.no_grad():
+        video_context, video_context_mask = video_model.encode_prompt(prompt)
+        if action_model is video_model:
+            action_context, action_context_mask = video_context, video_context_mask
+        else:
+            action_context, action_context_mask = action_model.encode_prompt(prompt)
+
+    action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
+    runtime = AsyncStreamingActionRuntime(
+        video_model=video_model,
+        action_model=action_model,
+        video_context=video_context,
+        video_context_mask=video_context_mask,
+        action_context=action_context,
+        action_context_mask=action_context_mask,
+        action_postprocess=action_postprocess,
+        action_horizon=action_horizon,
+        num_inference_steps=int(cfg.EVALUATION.get("num_inference_steps", cfg.get("eval_num_inference_steps", 10))),
+        sigma_shift=(
+            None if cfg.EVALUATION.get("sigma_shift") is None else float(cfg.EVALUATION.get("sigma_shift"))
+        ),
+        rand_device=str(cfg.EVALUATION.get("rand_device", "cpu")),
+        tiled=bool(cfg.EVALUATION.get("tiled", False)),
+        action_trigger_every_n_obs=trigger_every_n_obs,
+        video_layers_per_chunk=video_layers_per_chunk,
+        seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+    )
+
+    replay_images = []
+    predicted_future_video_clips: list[dict[str, Any]] = []
+    episode_future_clip_psnr: list[float] = []
+    runtime_started = False
+    done = False
+    terminated_during_wait = False
+
+    env.reset()
+    obs = env.set_init_state(initial_state)
+    try:
+        runtime.start()
+        runtime_started = True
+        image, proprio, imgs = _obs_to_model_input(
+            obs,
+            cfg=cfg,
+            processor=processor,
+            width=input_w,
+            height=input_h,
+            device=video_device,
+            dtype=video_model.torch_dtype,
+        )
+        runtime.bootstrap_sync(
+            input_image=image,
+            obs_index=0,
+            obs_timestamp_ms=0.0,
+        )
+
+        obs_counter = 0
+        warmup_env_step = 0
+        warmup_obs_count = 0
+        warmup_first_triggered = False
+        while runtime.completed_jobs() < warmup_action_jobs:
+            if warmup_env_step % obs_stride_env_steps == 0:
+                warmup_obs_index = obs_counter
+                should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
+                if force_first_job and not warmup_first_triggered:
+                    should_trigger = True
+                runtime.submit_observation(
+                    input_image=image,
+                    proprio=proprio,
+                    env_step=warmup_env_step,
+                    obs_index=warmup_obs_index,
+                    obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
+                    trigger_job=should_trigger,
+                    latest_only_job=bool(should_trigger and warmup_latest_only),
+                )
+                obs_counter += 1
+                warmup_obs_count += 1
+                if should_trigger:
+                    warmup_first_triggered = True
+            obs, _, done, _ = env.step(get_libero_dummy_action())
+            if done:
+                runtime.wait_until_idle()
+                terminated_during_wait = True
+                break
+            warmup_env_step += 1
+            image, proprio, imgs = _obs_to_model_input(
+                obs,
+                cfg=cfg,
+                processor=processor,
+                width=input_w,
+                height=input_h,
+                device=video_device,
+                dtype=video_model.torch_dtype,
+            )
+        if not terminated_during_wait:
+            formal_start_step = int(warmup_env_step)
+
+            t = formal_start_step
+            first_formal_triggered = False
+            pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (async)")
+            while t < max_steps + formal_start_step:
+                pbar.update(1)
+                if (t - formal_start_step) % obs_stride_env_steps == 0:
+                    formal_obs_index = obs_counter
+                    should_trigger = runtime.should_trigger_on_obs()
+                    if force_first_job and warmup_action_jobs <= 0 and not first_formal_triggered:
+                        should_trigger = True
+                    runtime.submit_observation(
+                        input_image=image,
+                        proprio=proprio,
+                        env_step=t,
+                        obs_index=formal_obs_index,
+                        obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
+                        trigger_job=should_trigger,
+                    )
+                    obs_counter += 1
+                    if should_trigger:
+                        first_formal_triggered = True
+
+                replay_images.append(imgs.copy())
+                action = runtime.get_action(t)
+                if action is None:
+                    action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+
+                obs, _, done, _ = env.step(action.tolist())
+                if done:
+                    break
+                t += 1
+                image, proprio, imgs = _obs_to_model_input(
+                    obs,
+                    cfg=cfg,
+                    processor=processor,
+                    width=input_w,
+                    height=input_h,
+                    device=video_device,
+                    dtype=video_model.torch_dtype,
+                )
+            pbar.close()
+    finally:
+        if runtime_started:
+            runtime.stop()
+
+    runtime_summary = runtime.stats()
+    logging.info(
+        "Async runtime stats | episode=%s submitted_obs=%s submitted_jobs=%s completed_jobs=%s "
+        "actions_served=%s actions_missed=%s dropped_prefix_actions=%s",
+        episode_idx,
+        runtime_summary["submitted_obs"],
+        runtime_summary["submitted_jobs"],
+        runtime_summary["completed_jobs"],
+        runtime_summary["actions_served"],
+        runtime_summary["actions_missed"],
+        runtime_summary["dropped_prefix_actions"],
+    )
+    return (
+        bool(done),
+        replay_images,
+        predicted_future_video_clips,
+        float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None,
+        runtime_summary,
+    )
 
 
 def run_single_task(
     task,
     initial_states,
     model: torch.nn.Module,
+    action_model: Optional[torch.nn.Module],
     processor: FastWAMProcessor,
     cfg: DictConfig,
     video_dir: Path,
@@ -594,25 +868,40 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
+    action_device: str,
+    render_gpu_device_id: int,
 ) -> dict:
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    env, task_description = get_libero_env(
+        task,
+        LIBERO_ENV_RESOLUTION,
+        cfg.get("seed"),
+        render_gpu_device_id=render_gpu_device_id,
+    )
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
         "failure_episodes": [],
         "success_episodes": [],
         "task_description": task_description,
+        "action_horizon": int(action_horizon),
     }
+    async_streaming_enabled = bool(cfg.EVALUATION.get("async_streaming_enabled", False))
+    if async_streaming_enabled:
+        results["async_runtime_episodes"] = []
+        results["async_runtime_summary"] = None
+        results["async_video_device"] = str(model_device)
+        results["async_action_device"] = str(action_device)
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, runtime_summary = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
             model=model,
+            action_model=action_model,
             processor=processor,
             cfg=cfg,
             episode_idx=trial_idx,
@@ -620,12 +909,20 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            action_device=action_device,
         )
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)
         else:
             results["failure_episodes"].append(trial_idx)
+        if async_streaming_enabled and runtime_summary is not None:
+            results["async_runtime_episodes"].append(
+                {
+                    "episode_idx": int(trial_idx),
+                    **runtime_summary,
+                }
+            )
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
@@ -672,6 +969,8 @@ def run_single_task(
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
+    if async_streaming_enabled:
+        results["async_runtime_summary"] = _summarize_async_runtime_episodes(results["async_runtime_episodes"])
     return results
 
 
@@ -680,12 +979,11 @@ def eval_single_process(cfg: DictConfig):
     start_time = time.time()
     partial_state = PartialState()
     partial_state.config = cfg
+    render_gpu_device_id = _configure_egl_device(cfg)
 
     if cfg.get("seed") is not None:
         set_global_seed(int(cfg.seed), get_worker_init_fn=False)
 
-    if cfg.ckpt is None:
-        raise ValueError("cfg.ckpt must not be None.")
     _validate_visualize_future_video_cfg(cfg)
 
     env_num = int(cfg.EVALUATION.get("env_num", 1))
@@ -697,9 +995,20 @@ def eval_single_process(cfg: DictConfig):
 
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    _load_model_checkpoint(model, str(cfg.ckpt))
-    model = model.to(model_device).eval()
+    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
+    action_model: Optional[torch.nn.Module] = None
+    if bool(cfg.EVALUATION.get("async_streaming_enabled", False)) and async_action_device != async_video_device:
+        logging.info(
+            "Async dual-device runtime enabled: video_device=%s action_device=%s",
+            async_video_device,
+            async_action_device,
+        )
+        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
+        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
+    elif bool(cfg.EVALUATION.get("async_streaming_enabled", False)):
+        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
+    else:
+        model = _build_eval_model(cfg, model_dtype=model_dtype, device=model_device)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -743,6 +1052,9 @@ def eval_single_process(cfg: DictConfig):
         "task_suite": cfg.EVALUATION.task_suite_name,
         "task_id": cfg.EVALUATION.task_id,
         "task_description": None,
+        "action_horizon": int(action_horizon),
+        "async_streaming_enabled": bool(cfg.EVALUATION.get("async_streaming_enabled", False)),
+        "ckpt_loaded": bool(cfg.get("ckpt") is not None),
         "successes": 0,
         "total_episodes": int(cfg.EVALUATION.num_trials),
         "gpu_id": int(cfg.gpu_id),
@@ -764,7 +1076,10 @@ def eval_single_process(cfg: DictConfig):
         action_horizon=action_horizon,
         input_w=input_w,
         input_h=input_h,
-        model_device=model_device,
+        model_device=(async_video_device if bool(cfg.EVALUATION.get("async_streaming_enabled", False)) else model_device),
+        action_device=(async_action_device if bool(cfg.EVALUATION.get("async_streaming_enabled", False)) else model_device),
+        action_model=action_model,
+        render_gpu_device_id=render_gpu_device_id,
     )
     results.update(task_results)
 

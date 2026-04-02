@@ -711,7 +711,6 @@ class FastWAM(torch.nn.Module):
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
         return pred_action
 
-    @torch.no_grad()
     def _predict_action_noise_with_cache(
         self,
         latents_action: torch.Tensor,

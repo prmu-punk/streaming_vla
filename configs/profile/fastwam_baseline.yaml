@@ -13,6 +13,7 @@ output_path: ./runs/profile/fastwam_baseline_profile.json
 checkpoint_path: null
 
 profile:
+  action_horizon: null
   warmup_iters: 3
   measure_iters: 10
   num_inference_steps: 10

@@ -92,6 +92,20 @@ def _compress_layer_sources(layer_obs_indices: list[int], layer_obs_timestamps_m
     return runs
 
 
+def _resolve_action_horizon(trace_cfg: DictConfig, data_cfg: DictConfig) -> int:
+    action_horizon_cfg = trace_cfg.get("action_horizon", None)
+    if action_horizon_cfg is None:
+        train_cfg = data_cfg.get("train")
+        if train_cfg is None or train_cfg.get("num_frames") is None:
+            raise ValueError("Unable to resolve rollout action horizon from data.train.num_frames.")
+        action_horizon = int(train_cfg.num_frames) - 1
+    else:
+        action_horizon = int(action_horizon_cfg)
+    if action_horizon <= 0:
+        raise ValueError(f"Resolved action horizon must be positive, got {action_horizon}.")
+    return action_horizon
+
+
 @hydra.main(config_path="../configs", config_name="profile/fastwam_async_runtime_trace", version_base="1.3")
 def main(cfg: DictConfig):
     cfg.data = _absolutize_data_cfg(cfg.data)
@@ -124,10 +138,7 @@ def main(cfg: DictConfig):
     if sample.get("proprio") is not None:
         proprio_seq = sample["proprio"][obs_start_index:obs_end_index].to(device=model.device, dtype=model.torch_dtype)
 
-    action = sample["action"]
-    num_frames = int(sample["video"].shape[1])
-    action_horizon = int(action.shape[0] // max(num_frames - 1, 1))
-    action_horizon = max(1, action_horizon)
+    action_horizon = _resolve_action_horizon(cfg.trace, cfg.data)
 
     payload = model.simulate_async_runtime_trace(
         observation_images=obs_images,
@@ -145,6 +156,8 @@ def main(cfg: DictConfig):
         tiled=bool(cfg.trace.tiled),
         warmup_video_bootstrap=bool(cfg.trace.get("warmup_video_bootstrap", True)),
         warmup_action_job=bool(cfg.trace.get("warmup_action_job", True)),
+        warmup_num_obs=int(cfg.trace.get("warmup_num_obs", 1)),
+        video_layers_per_chunk=int(cfg.trace.get("video_layers_per_chunk", 2)),
     )
 
     for job in payload["jobs"]:
@@ -163,6 +176,7 @@ def main(cfg: DictConfig):
             "sample_index": int(cfg.trace.sample_index),
             "obs_start_index": int(obs_start_index),
             "num_obs": int(num_obs),
+            "action_horizon": int(action_horizon),
         }
     )
     output_path = Path(str(cfg.output_path))

@@ -26,6 +26,16 @@ EVALUATION:
   binarize_gripper: true
   use_action_ensembler: false
   visualize_future_video: false
+  async_streaming_enabled: false
+  async_obs_stride_env_steps: 3
+  async_action_trigger_every_n_obs: 3
+  async_video_layers_per_chunk: 2
+  async_video_device: null
+  async_action_device: null
+  async_force_first_job: true
+  async_control_dt_ms: 50.0
+  async_warmup_action_jobs: 25
+  async_warmup_latest_only: true
 
   # Action inference
   action_horizon: null
@@ -33,7 +43,7 @@ EVALUATION:
   sigma_shift: null
   text_cfg_scale: 1.0
   negative_prompt: ""
-  rand_device: cpu
+  rand_device: cuda
   tiled: false
 
   # Optional external inputs

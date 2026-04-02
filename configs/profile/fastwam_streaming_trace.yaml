@@ -13,6 +13,7 @@ output_path: ./runs/profile/fastwam_streaming_trace.json
 checkpoint_path: null
 
 trace:
+  action_horizon: null
   sample_index: 0
   current_obs_index: 1
   obs_gap: 1

@@ -36,6 +36,7 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        self.dataloader_disable_shared_memory = bool(cfg.get("dataloader_disable_shared_memory", False))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -171,14 +172,24 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
-        return DataLoader(
-            dataset,
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=self.batch_size,
             shuffle=False,
             sampler=self.train_sampler,
             num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=bool(getattr(self.cfg, "dataloader_pin_memory", torch.cuda.is_available())),
             worker_init_fn=worker_init_fn,
+        )
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = bool(
+                getattr(self.cfg, "dataloader_persistent_workers", False)
+            )
+            prefetch_factor = getattr(self.cfg, "dataloader_prefetch_factor", None)
+            if prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+        return DataLoader(
+            **loader_kwargs,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -391,6 +402,20 @@ class Wan22Trainer:
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
+
+        if "video" not in sample:
+            local_metrics = torch.tensor(
+                [float(val_loss)],
+                device=self.accelerator.device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+            gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
+            mean_val_loss = float(gathered_metrics[:, 0].mean().item())
+            if was_dit_training:
+                self._set_dit_only_train_mode()
+            return {
+                "val_loss": mean_val_loss,
+            }
         
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
@@ -672,6 +697,25 @@ class Wan22Trainer:
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
+                if not torch.is_tensor(loss):
+                    loss = torch.as_tensor(loss, device=self.accelerator.device)
+                if loss.numel() != 1:
+                    logger.warning(
+                        "training_loss returned non-scalar shape %s; reducing via mean() before backward.",
+                        tuple(loss.shape),
+                    )
+                    loss = loss.mean()
+                else:
+                    loss = loss.reshape(())
+                if loss.ndim != 0:
+                    raise RuntimeError(
+                        f"Loss must be 0-d before backward, got shape={tuple(loss.shape)} numel={loss.numel()}."
+                    )
+                if not loss.requires_grad:
+                    raise RuntimeError(
+                        "Loss does not require grad before backward. "
+                        f"shape={tuple(loss.shape)} dtype={loss.dtype} device={loss.device}"
+                    )
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
@@ -733,12 +777,15 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
                             )
+                            if "psnr_rd" in metrics and "ssim_rd" in metrics:
+                                description += " infer_psnr=%.4f infer_ssim=%.4f" % (
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                )
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
@@ -746,13 +793,10 @@ class Wan22Trainer:
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
+                            for key in ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"):
+                                if key in metrics:
+                                    eval_payload[f"eval/{key}"] = float(metrics[key])
                             if "action_l2" in metrics:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:

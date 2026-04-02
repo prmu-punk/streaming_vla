@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 import torch
@@ -9,6 +10,17 @@ from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class VideoPrefillState:
+    x: torch.Tensor
+    video_freqs: torch.Tensor
+    video_t_mod: torch.Tensor
+    video_context_payload: Optional[dict]
+    video_attention_mask: torch.Tensor
+    next_layer_idx: int
+    kv_cache: list[Optional[dict[str, torch.Tensor]]]
 
 
 class MoT(nn.Module):
@@ -280,6 +292,30 @@ class MoT(nn.Module):
                 - `k`: video key tensor [B, Sv, H*Dh]
                 - `v`: video value tensor [B, Sv, H*Dh]
         """
+        state = self.init_video_prefill_state(
+            video_tokens=video_tokens,
+            video_freqs=video_freqs,
+            video_t_mod=video_t_mod,
+            video_context_payload=video_context_payload,
+            video_attention_mask=video_attention_mask,
+        )
+        self.advance_video_prefill_state(
+            state=state,
+            max_layers=self.num_layers,
+            layer_callback=layer_callback,
+        )
+        if any(layer is None for layer in state.kv_cache):
+            raise RuntimeError("Video prefill finished with incomplete cache state.")
+        return [layer for layer in state.kv_cache if layer is not None]
+
+    def init_video_prefill_state(
+        self,
+        video_tokens: torch.Tensor,
+        video_freqs: torch.Tensor,
+        video_t_mod: torch.Tensor,
+        video_context_payload: Optional[dict],
+        video_attention_mask: torch.Tensor,
+    ) -> VideoPrefillState:
         if "video" not in self.mixtures:
             raise ValueError("MoT requires `video` expert for `prefill_video_cache`.")
         if video_attention_mask.ndim != 2:
@@ -295,13 +331,28 @@ class MoT(nn.Module):
                 "`video_attention_mask` seq length mismatch: "
                 f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
             )
+        return VideoPrefillState(
+            x=video_tokens,
+            video_freqs=video_freqs,
+            video_t_mod=video_t_mod,
+            video_context_payload=video_context_payload,
+            video_attention_mask=video_attention_mask,
+            next_layer_idx=0,
+            kv_cache=[None] * self.num_layers,
+        )
 
+    def advance_video_prefill_state(
+        self,
+        state: VideoPrefillState,
+        max_layers: int = 1,
+        layer_callback: Optional[Callable[[int, dict[str, torch.Tensor]], None]] = None,
+    ) -> int:
         expert = self.mixtures["video"]
-        x = video_tokens
-        kv_cache: list[dict[str, torch.Tensor]] = []
-        for layer_idx in range(self.num_layers):
+        advanced = 0
+        requested = max(0, int(max_layers))
+        while state.next_layer_idx < self.num_layers and advanced < requested:
+            layer_idx = state.next_layer_idx
             block = expert.blocks[layer_idx]
-            # Build video Q/K/V from current layer input tokens.
             (
                 q,
                 k,
@@ -315,19 +366,17 @@ class MoT(nn.Module):
             ) = self._build_expert_attention_io(
                 expert=expert,
                 block=block,
-                x=x,
-                freqs=video_freqs,
-                t_mod=video_t_mod,
+                x=state.x,
+                freqs=state.video_freqs,
+                t_mod=state.video_t_mod,
             )
-            # Video prefill uses only video self-attention mask.
             mixed = self._mixed_attention(
                 q_cat=q,
                 k_cat=k,
                 v_cat=v,
-                attention_mask=video_attention_mask,
+                attention_mask=state.video_attention_mask,
             )
-            # Update video tokens for the next layer and persist current layer K/V.
-            x = self._apply_post_with_optional_checkpoint(
+            state.x = self._apply_post_with_optional_checkpoint(
                 block=block,
                 residual_x=residual_x,
                 gate_msa=gate_msa,
@@ -336,13 +385,15 @@ class MoT(nn.Module):
                 gate_mlp=gate_mlp,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
-                context_payload=video_context_payload,
+                context_payload=state.video_context_payload,
             )
             layer_cache = {"k": k, "v": v}
-            kv_cache.append(layer_cache)
+            state.kv_cache[layer_idx] = layer_cache
             if layer_callback is not None:
                 layer_callback(layer_idx, layer_cache)
-        return kv_cache
+            state.next_layer_idx += 1
+            advanced += 1
+        return advanced
 
     def forward_action_with_video_cache(
         self,

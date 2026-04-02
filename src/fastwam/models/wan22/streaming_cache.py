@@ -83,7 +83,7 @@ class StreamingCacheState:
         with self._lock:
             if any(layer is None for layer in version.cache_layers):
                 raise ValueError("Cannot bootstrap live cache from a partially built version.")
-            self.live_cache_layers = clone_cache_layers(version.cache_layers)  # type: ignore[arg-type]
+            self.live_cache_layers = copy_cache_layer_refs(version.cache_layers)  # type: ignore[arg-type]
             self.live_context = version.context
             self.live_context_mask = version.context_mask
             self.live_video_seq_len = int(version.video_seq_len)
@@ -214,7 +214,7 @@ class StreamingCacheState:
                 frontier=int(frontier),
                 video_seq_len=int(self.live_video_seq_len),
                 tokens_per_frame=int(self.live_tokens_per_frame),
-                cache_layers=clone_cache_layers(self.live_cache_layers),
+                cache_layers=copy_cache_layer_refs(self.live_cache_layers),
                 context=self.live_context,
                 context_mask=self.live_context_mask,
                 layer_version_ids=list(self.live_layer_version_ids),
@@ -224,10 +224,10 @@ class StreamingCacheState:
             )
 
 
-def clone_cache_layers(cache_layers: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+def copy_cache_layer_refs(cache_layers: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
     out: list[dict[str, torch.Tensor]] = []
     for layer in cache_layers:
-        out.append({"k": layer["k"], "v": layer["v"]})
+        out.append(layer)
     return out
 
 
