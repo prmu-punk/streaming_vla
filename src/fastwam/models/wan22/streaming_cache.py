@@ -59,6 +59,16 @@ class StreamingCacheState:
         self._lock = threading.Lock()
         self.reset()
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        # `threading.Lock` is not picklable under multiprocessing spawn.
+        state["_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def reset(self) -> None:
         self.live_cache_layers: Optional[list[dict[str, torch.Tensor]]] = None
         self.live_context: Optional[torch.Tensor] = None

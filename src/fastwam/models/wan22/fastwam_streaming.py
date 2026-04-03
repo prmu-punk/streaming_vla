@@ -33,6 +33,7 @@ class FastWAMStreaming(FastWAM):
         self.freeze_video_expert = True
         self.streaming_proprio_to_action_only = True
         self._streaming_infer_timestep_cache: dict[int, torch.Tensor] = {}
+        self._action_attn_mask: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
 
     def configure_streaming(self, streaming: Optional[dict[str, Any]] = None) -> "FastWAMStreaming":
         cfg = {} if streaming is None else dict(streaming)
@@ -49,6 +50,7 @@ class FastWAMStreaming(FastWAM):
     def reset_streaming_state(self) -> None:
         self.streaming_cache_state.reset()
         self.streaming_version_counter = 0
+        self._action_attn_mask.clear()
 
     def training_loss_base(self, sample, tiled: bool = False):
         return super().training_loss(sample, tiled=tiled)
@@ -328,10 +330,10 @@ class FastWAMStreaming(FastWAM):
             dtype=job.latents_action.dtype,
         )
         step_delta = job.deltas[job.current_step_idx]
-        attention_mask = self.build_joint_attention_mask(
-            video_seq_len=snapshot.video_seq_len,
-            action_seq_len=job.latents_action.shape[1],
-            video_tokens_per_frame=snapshot.tokens_per_frame,
+        attention_mask = self._get_action_attn_mask(
+            video_seq_len=int(snapshot.video_seq_len),
+            action_seq_len=int(job.latents_action.shape[1]),
+            video_tokens_per_frame=int(snapshot.tokens_per_frame),
             device=job.latents_action.device,
         )
         pred_action = self._predict_action_noise_with_cache(
@@ -348,6 +350,33 @@ class FastWAMStreaming(FastWAM):
         job.snapshot_history.append(snapshot)
         job.current_step_idx += 1
         return job.latents_action
+
+    def _get_action_attn_mask(
+        self,
+        *,
+        video_seq_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (
+            int(video_seq_len),
+            int(action_seq_len),
+            int(video_tokens_per_frame),
+            str(device.type),
+            device.index,
+        )
+        cached = self._action_attn_mask.get(key)
+        if cached is not None:
+            return cached
+        mask = self.build_joint_attention_mask(
+            video_seq_len=int(video_seq_len),
+            action_seq_len=int(action_seq_len),
+            video_tokens_per_frame=int(video_tokens_per_frame),
+            device=device,
+        )
+        self._action_attn_mask[key] = mask
+        return mask
 
     @torch.no_grad()
     def infer_action_streaming(
