@@ -73,12 +73,7 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         **kwargs: Any,
     ) -> None:
         # We deliberately do NOT call `super().__init__` because the parent
-        # forces `model_cfg_copy.load_text_encoder = True`, which would
-        # trigger a 10 GB T5 download on a fresh server. The streaming runtime
-        # only needs prompt context tensors, not real text encoding — the
-        # `_streaming_patches` module installs a fallback `encode_prompt`
-        # that returns zeros when text_encoder is None. We therefore inline
-        # the parent ctor and respect the user's `load_text_encoder` setting.
+        # forces `model_cfg_copy.load_text_encoder = True`.
         from hydra.utils import instantiate
         from fastwam.datasets.lerobot.processors.fastwam_processor import (
             FastWAMProcessor,
@@ -93,8 +88,6 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         model_cfg_copy = OmegaConf.create(
             OmegaConf.to_container(kwargs["model_cfg"], resolve=True)
         )
-        # Respect whatever load_text_encoder the cfg already has (default false
-        # in the streaming entrypoint to avoid the T5 download).
         self.model = instantiate(
             model_cfg_copy, model_dtype=kwargs["model_dtype"], device=kwargs["device"]
         )
@@ -130,14 +123,14 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             device=action_device,
         )
         action_model.load_checkpoint(ckpt_str)
-        # Detach text_encoder before .to() so it stays on CPU; the patched
-        # FastWAM.to already does this, but be explicit.
-        if getattr(action_model, "text_encoder", None) is not None:
-            try:
-                action_model.text_encoder.to("cpu")
-            except Exception:  # pragma: no cover - defensive
-                pass
         self.action_model = action_model.to(action_device).eval()
+        # The action-side text encoder is not used: prompt encoding is shared
+        # from the video-side model. Keep it on CPU to reduce action GPU load.
+        if getattr(self.action_model, "text_encoder", None) is not None:
+            try:
+                self.action_model.text_encoder.to("cpu")
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Failed moving action-side text encoder to CPU.")
         self._action_device = str(action_device)
 
         self._async_obs_stride_env_steps = int(async_obs_stride_env_steps)
@@ -201,15 +194,20 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         self._runtime = None
         self._runtime_started = False
 
-    def _build_runtime(self, instruction: str) -> None:
+    def _build_runtime(
+        self,
+        instruction: str,
+        *,
+        image_cpu: torch.Tensor,
+        proprio: torch.Tensor,
+    ) -> None:
         prompt = DEFAULT_PROMPT.format(task=instruction)
         with torch.no_grad():
             v_ctx, v_mask = self.model.encode_prompt(prompt)
-            a_ctx, a_mask = self.action_model.encode_prompt(prompt)
         v_ctx = v_ctx.to(device="cpu", dtype=self.model.torch_dtype)
         v_mask = v_mask.to(device="cpu", dtype=torch.bool)
-        a_ctx = a_ctx.to(device="cpu", dtype=self.action_model.torch_dtype)
-        a_mask = a_mask.to(device="cpu", dtype=torch.bool)
+        a_ctx = v_ctx.to(device="cpu", dtype=self.action_model.torch_dtype)
+        a_mask = v_mask.to(device="cpu", dtype=torch.bool)
 
         action_postprocess = lambda x: self._denormalize_action(x)[0]
 
@@ -232,7 +230,39 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         )
         self._runtime.start()
         self._runtime_started = True
+        if self._async_warmup_action_jobs > 0:
+            self._run_warmup(image_cpu=image_cpu, proprio=proprio)
         self._runtime.reset_for_formal_phase(env_step=0)
+
+    def _run_warmup(self, *, image_cpu: torch.Tensor, proprio: torch.Tensor) -> None:
+        if self._runtime is None:
+            return
+        warmup_t = 0
+        warmup_obs_count = 0
+        warmup_obs_index = 0
+        warmup_first_triggered = False
+        while self._runtime.completed_jobs() < self._async_warmup_action_jobs:
+            if warmup_t % self._async_obs_stride_env_steps == 0:
+                should_trigger = self._runtime.should_trigger_on_obs(warmup_obs_count + 1)
+                if self._async_force_first_job and not warmup_first_triggered:
+                    should_trigger = True
+                self._runtime.submit_observation(
+                    input_image=image_cpu,
+                    proprio=proprio,
+                    env_step=warmup_t,
+                    obs_index=warmup_obs_index,
+                    obs_timestamp_ms=float(warmup_obs_index)
+                    * self._async_control_dt_ms
+                    * float(self._async_obs_stride_env_steps),
+                    trigger_job=should_trigger,
+                )
+                warmup_obs_index += 1
+                warmup_obs_count += 1
+                if should_trigger:
+                    warmup_first_triggered = True
+            self._runtime.get_action(warmup_t)
+            warmup_t += 1
+        self._runtime.wait_until_idle()
 
     def _encode_observation(
         self, observation: Dict[str, Any]
@@ -253,12 +283,11 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
                 "(should_request_observation always returns True)."
             )
 
+        image_cpu, proprio = self._encode_observation(observation)
         instruction = task_env.get_instruction()
         if self._runtime is None:
             self._current_instruction = instruction
-            self._build_runtime(instruction)
-
-        image_cpu, proprio = self._encode_observation(observation)
+            self._build_runtime(instruction, image_cpu=image_cpu, proprio=proprio)
         t = self._t_env
 
         if t % self._async_obs_stride_env_steps == 0:
@@ -284,10 +313,13 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
 
         action = self._runtime.get_action(t)
         if action is None:
+            fallback_action = np.asarray(
+                observation["joint_action"]["vector"], dtype=np.float32
+            )
             action = (
                 self._last_action
                 if self._last_action is not None
-                else np.zeros(14, dtype=np.float32)
+                else fallback_action
             )
 
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
@@ -319,8 +351,13 @@ def get_model(usr_args: Dict[str, Any]):
 
     want_text_encoder = _parse_bool(usr_args.get("load_text_encoder", True))
     want_redirect = _parse_bool(usr_args.get("redirect_common_files", True))
+    if not want_text_encoder:
+        raise ValueError(
+            "`load_text_encoder=false` is not supported for "
+            "streaming RobotWin profiling. Keep it enabled."
+        )
     OmegaConf.set_struct(cfg, False)
-    cfg.model.load_text_encoder = bool(want_text_encoder)
+    cfg.model.load_text_encoder = True
     cfg.model.redirect_common_files = bool(want_redirect)
     OmegaConf.set_struct(cfg, True)
 

@@ -142,8 +142,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tiled", type=int, default=0)
     p.add_argument("--timing-enabled", type=int, default=1)
     p.add_argument("--load-text-encoder", type=int, default=1,
-                   help="1 = real T5 conditioning (default on real machine). "
-                        "0 = zero-context fallback (only for bandwidth-limited envs).")
+                   help="Must be 1 for streaming RobotWin profiling.")
     p.add_argument("--redirect-common-files", type=int, default=1)
     # --- episode loop
     p.add_argument("--eval-num-episodes", type=int, default=10)
