@@ -45,6 +45,12 @@ class AsyncStreamingActionRuntimeProfiled(AsyncStreamingActionRuntime):
         self._layer_source_frontier_samples: dict[int, dict[str, list[int]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self._layer_source_latest_offset_counts: dict[int, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self._layer_source_older_offset_counts: dict[int, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
         self._layer_source_age_counts: dict[int, dict[str, int]] = defaultdict(
             lambda: {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}
         )
@@ -151,6 +157,10 @@ class AsyncStreamingActionRuntimeProfiled(AsyncStreamingActionRuntime):
                 msg = self._result_queue.get_nowait()
             except queue.Empty:
                 break
+            except (FileNotFoundError, EOFError, OSError, ConnectionError):
+                # Child processes may already exit before pending tensor handles
+                # are detached from multiprocessing's resource sharer.
+                break
             if str(msg.get("type")) != "job_done":
                 continue
             self._completed_jobs += 1
@@ -175,10 +185,16 @@ class AsyncStreamingActionRuntimeProfiled(AsyncStreamingActionRuntime):
             mode = str(step.get("mode", "full_cur"))
             frontier = int(step.get("frontier", 0))
             age_hist = dict(step.get("age_hist", {}))
+            latest_offset = step.get("latest_offset", None)
+            older_offset = step.get("older_offset", None)
             self._layer_source_step_samples[denoise_step] += 1
             self._layer_source_mode_counts[denoise_step][mode] += 1
             if "_to_" in mode:
                 self._layer_source_frontier_samples[denoise_step][mode].append(frontier)
+            if latest_offset is not None:
+                self._layer_source_latest_offset_counts[denoise_step][int(latest_offset)] += 1
+            if older_offset is not None:
+                self._layer_source_older_offset_counts[denoise_step][int(older_offset)] += 1
             self._layer_source_age_counts[denoise_step]["age0"] += int(age_hist.get("age0", 0))
             self._layer_source_age_counts[denoise_step]["age1"] += int(age_hist.get("age1", 0))
             self._layer_source_age_counts[denoise_step]["age2"] += int(age_hist.get("age2", 0))
@@ -200,6 +216,24 @@ class AsyncStreamingActionRuntimeProfiled(AsyncStreamingActionRuntime):
                 mode: _summarize_int_samples(values)
                 for mode, values in frontier_samples_by_mode.items()
             }
+            latest_offset_counts_raw = dict(self._layer_source_latest_offset_counts[denoise_step])
+            latest_offset_counts = {
+                str(key): int(latest_offset_counts_raw[key]) for key in sorted(latest_offset_counts_raw.keys())
+            }
+            latest_offset_probs = {
+                key: float(value) / float(samples) for key, value in latest_offset_counts.items()
+            }
+            older_offset_counts_raw = dict(self._layer_source_older_offset_counts[denoise_step])
+            older_offset_counts = {
+                str(key): int(older_offset_counts_raw[key]) for key in sorted(older_offset_counts_raw.keys())
+            }
+            older_total = int(sum(older_offset_counts.values()))
+            if older_total > 0:
+                older_offset_probs = {
+                    key: float(value) / float(older_total) for key, value in older_offset_counts.items()
+                }
+            else:
+                older_offset_probs = {}
             age_counts = dict(self._layer_source_age_counts[denoise_step])
             age_total = int(sum(age_counts.values()))
             if age_total > 0:
@@ -214,6 +248,10 @@ class AsyncStreamingActionRuntimeProfiled(AsyncStreamingActionRuntime):
                     "mode_probs": mode_probs,
                     "frontier_samples_by_mode": frontier_samples_by_mode,
                     "frontier_stats_by_mode": frontier_stats_by_mode,
+                    "latest_offset_counts": latest_offset_counts,
+                    "latest_offset_probs": latest_offset_probs,
+                    "older_offset_counts": older_offset_counts,
+                    "older_offset_probs": older_offset_probs,
                     "age_counts": age_counts,
                     "age_probs": age_probs,
                 }

@@ -104,6 +104,19 @@ class AsyncStreamingActionRuntime:
         self._snapshot_copy_samples_ms: list[float] = []
         self._action_job_samples_raw_ms: list[float] = []
 
+    @staticmethod
+    def _close_mp_queue(q) -> None:
+        if q is None:
+            return
+        try:
+            q.close()
+        except Exception:
+            pass
+        try:
+            q.join_thread()
+        except Exception:
+            pass
+
     def _raise_if_error(self) -> None:
         if self._pending_worker_error is not None:
             raise RuntimeError(self._pending_worker_error)
@@ -299,6 +312,18 @@ class AsyncStreamingActionRuntime:
         self._poll_control_queue()
         self._drain_action_results()
         self._started = False
+        self._close_mp_queue(self._obs_queue)
+        self._close_mp_queue(self._job_queue)
+        self._close_mp_queue(self._layer_queue)
+        self._close_mp_queue(self._result_queue)
+        self._close_mp_queue(self._control_queue)
+        self._obs_queue = None
+        self._job_queue = None
+        self._layer_queue = None
+        self._result_queue = None
+        self._control_queue = None
+        self._video_process = None
+        self._action_process = None
         self._raise_if_error()
 
     def bootstrap_sync(
@@ -364,22 +389,32 @@ class AsyncStreamingActionRuntime:
         self._submitted_obs += 1
         self._obs_count += 1
         if trigger_job:
-            prop_cpu = None
-            if proprio is not None:
-                if proprio.ndim == 1:
-                    proprio = proprio.unsqueeze(0)
-                prop_cpu = proprio.detach().to(device="cpu", dtype=torch.float32)
-            self._put_queue(
-                self._job_queue,
-                {
-                    "type": "job",
-                    "trigger_env_step": int(env_step),
-                    "proprio": prop_cpu,
-                    "job_seed_offset": int(self._job_seed_counter),
-                },
-            )
-            self._job_seed_counter += 1
-            self._submitted_jobs += 1
+            self.submit_action_job(env_step=env_step, proprio=proprio)
+
+    def submit_action_job(
+        self,
+        *,
+        env_step: int,
+        proprio: Optional[torch.Tensor],
+    ) -> None:
+        self._poll_control_queue()
+        self._raise_if_error()
+        prop_cpu = None
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            prop_cpu = proprio.detach().to(device="cpu", dtype=torch.float32)
+        self._put_queue(
+            self._job_queue,
+            {
+                "type": "job",
+                "trigger_env_step": int(env_step),
+                "proprio": prop_cpu,
+                "job_seed_offset": int(self._job_seed_counter),
+            },
+        )
+        self._job_seed_counter += 1
+        self._submitted_jobs += 1
 
     def should_trigger_on_obs(self, obs_count: Optional[int] = None) -> bool:
         count = self._obs_count if obs_count is None else int(obs_count)
@@ -388,6 +423,10 @@ class AsyncStreamingActionRuntime:
     def completed_jobs(self) -> int:
         self._sync_main_state()
         return int(self._completed_jobs)
+
+    def pending_jobs(self) -> int:
+        self._sync_main_state()
+        return max(0, int(self._submitted_jobs - self._completed_jobs))
 
     def _publish_action_chunk(self, action_chunk: np.ndarray, *, trigger_env_step: int) -> int:
         dropped = 0
@@ -401,12 +440,13 @@ class AsyncStreamingActionRuntime:
         self._dropped_prefix_actions += dropped
         return dropped
 
-    def get_action(self, env_step: int) -> Optional[np.ndarray]:
+    def get_action(self, env_step: int, *, count_miss: bool = True) -> Optional[np.ndarray]:
         self._sync_main_state()
         self._current_env_step = max(self._current_env_step, int(env_step))
         self._ensembler._cleanup(int(env_step))
         if int(env_step) not in self._ensembler.action_cache:
-            self._actions_missed += 1
+            if count_miss:
+                self._actions_missed += 1
             return None
         action = np.asarray(self._ensembler.get_action(int(env_step)), dtype=np.float32)
         del self._ensembler.action_cache[int(env_step)]

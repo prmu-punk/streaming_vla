@@ -56,6 +56,14 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        streaming_cfg = cfg.model.get("streaming", None) if cfg.get("model", None) is not None else None
+        streaming_train_cfg = (
+            streaming_cfg.get("streaming_train", None) if streaming_cfg is not None else None
+        )
+        auto_action_only = bool(streaming_cfg and streaming_train_cfg)
+        auto_action_only = auto_action_only and bool(streaming_cfg.get("freeze_video_expert", False))
+        auto_action_only = auto_action_only and bool(streaming_train_cfg.get("enabled", False))
+        self.train_action_expert_only = bool(cfg.get("train_action_expert_only", auto_action_only))
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -81,9 +89,17 @@ class Wan22Trainer:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        # This keeps selected components trainable when ZeRO builds optimizer state.
+        self._apply_dit_only_train_mode(
+            self.model,
+            train_action_expert_only=self.train_action_expert_only,
+        )
+        if self.train_action_expert_only and hasattr(self.model, "action_expert"):
+            trainable_params = list(self.model.action_expert.parameters())
+            logger.info("Optimizer scope: action_expert only.")
+        else:
+            trainable_params = list(self.model.dit.parameters())
+            logger.info("Optimizer scope: full DiT (MoT).")
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
@@ -289,17 +305,32 @@ class Wan22Trainer:
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
 
     def _set_dit_only_train_mode(self):
-        # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
-        logger.info("Setting DiT to train mode and freezing other model components.")
+        if self.train_action_expert_only:
+            logger.info("Setting action_expert to train mode and freezing other model components.")
+        else:
+            logger.info("Setting DiT to train mode and freezing other model components.")
         model = self.accelerator.unwrap_model(self.model)
-        self._apply_dit_only_train_mode(model)
+        self._apply_dit_only_train_mode(
+            model,
+            train_action_expert_only=self.train_action_expert_only,
+        )
 
     @staticmethod
-    def _apply_dit_only_train_mode(model):
+    def _apply_dit_only_train_mode(model, train_action_expert_only: bool = False):
         model.eval()
         model.requires_grad_(False)
-        model.dit.train()
-        model.dit.requires_grad_(True)
+        if bool(train_action_expert_only) and hasattr(model, "action_expert"):
+            # Keep MoT in train mode for checkpointing/runtime behavior, while
+            # only action expert is trainable and video expert remains eval/frozen.
+            model.dit.train()
+            model.action_expert.train()
+            model.action_expert.requires_grad_(True)
+            video_expert = getattr(model, "video_expert", None)
+            if video_expert is not None:
+                video_expert.eval()
+        else:
+            model.dit.train()
+            model.dit.requires_grad_(True)
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
@@ -307,72 +338,60 @@ class Wan22Trainer:
 
     @staticmethod
     def _to_batched_eval_sample(sample):
+        # Streaming episode samples do not carry `video`; keep native keys and
+        # only add batch dimensions so `training_loss` can run in eval.
+        if "video" not in sample:
+            out = dict(sample)
+            for key in ("obs_prev", "obs_cur", "obs_next", "obs_next2"):
+                tensor = out.get(key, None)
+                if isinstance(tensor, torch.Tensor) and tensor.ndim == 3:
+                    out[key] = tensor.unsqueeze(0)
+            tensor = out.get("target_action", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+                out["target_action"] = tensor.unsqueeze(0)
+            tensor = out.get("action_is_pad", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 1:
+                out["action_is_pad"] = tensor.unsqueeze(0)
+            tensor = out.get("proprio_t", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 1:
+                out["proprio_t"] = tensor.unsqueeze(0)
+            tensor = out.get("context", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+                out["context"] = tensor.unsqueeze(0)
+            tensor = out.get("context_mask", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 1:
+                out["context_mask"] = tensor.unsqueeze(0)
+            return out
+
         video = sample["video"]
-        prompt = sample["prompt"]
-        action = sample.get("action", None)
-        proprio = sample.get("proprio", None)
-        context = sample.get("context", None)
-        context_mask = sample.get("context_mask", None)
-
-        if not isinstance(video, torch.Tensor):
-            raise TypeError(
-                f"Expected tensor video for evaluation, got {type(video)}. "
-                "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
-            )
-        if video.ndim == 4:
+        if isinstance(video, torch.Tensor) and video.ndim == 4:
             video = video.unsqueeze(0)
-        if video.ndim != 5:
-            raise ValueError(f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}")
-        num_video_frames = video.shape[2]
-        if num_video_frames <= 1:
-            raise ValueError(f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}")
 
+        prompt = sample.get("prompt", None)
         if isinstance(prompt, str):
             prompt = [prompt]
         elif isinstance(prompt, tuple):
             prompt = list(prompt)
+        elif prompt is None:
+            prompt = []
         elif not isinstance(prompt, list):
-            raise TypeError(f"Expected prompt type str/list[str], got {type(prompt)}")
-        if len(prompt) != video.shape[0]:
-            raise ValueError(f"Prompt batch mismatch: len(prompt)={len(prompt)} vs video batch={video.shape[0]}")
-        
-        action_horizon = None
-        action = None
-        if "action" in sample:
-            action = sample["action"]
-            if not isinstance(action, torch.Tensor):
-                raise TypeError(
-                    f"`sample['action']` must be a torch.Tensor, got {type(action)}"
-                )
-            if action.ndim == 2:
-                action = action.unsqueeze(0)
-            if action.ndim != 3:
-                raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
-            action_horizon = int(action.shape[1])
+            prompt = [prompt]
 
-        proprio = None
-        if "proprio" in sample:
-            proprio = sample["proprio"]
-            if not isinstance(proprio, torch.Tensor):
-                raise TypeError(f"`sample['proprio']` must be a torch.Tensor, got {type(proprio)}")
-            if proprio.ndim == 2:
-                proprio = proprio.unsqueeze(0)
-            if proprio.ndim != 3:
-                raise ValueError(f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}")
+        action = sample.get("action", None)
+        if isinstance(action, torch.Tensor) and action.ndim == 2:
+            action = action.unsqueeze(0)
+        action_horizon = int(action.shape[1]) if isinstance(action, torch.Tensor) and action.ndim == 3 else None
 
-        if context is not None or context_mask is not None:
-            if context is None or context_mask is None:
-                raise ValueError("`context` and `context_mask` must both exist in eval sample.")
-            if context.ndim == 2:
-                context = context.unsqueeze(0)
-            if context_mask.ndim == 1:
-                context_mask = context_mask.unsqueeze(0)
-            if context.ndim != 3 or context_mask.ndim != 2:
-                raise ValueError(
-                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
-                )
+        proprio = sample.get("proprio", None)
+        if isinstance(proprio, torch.Tensor) and proprio.ndim == 2:
+            proprio = proprio.unsqueeze(0)
+
+        context = sample.get("context", None)
+        if isinstance(context, torch.Tensor) and context.ndim == 2:
+            context = context.unsqueeze(0)
+        context_mask = sample.get("context_mask", None)
+        if isinstance(context_mask, torch.Tensor) and context_mask.ndim == 1:
+            context_mask = context_mask.unsqueeze(0)
 
         return {
             "video": video,

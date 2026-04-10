@@ -259,8 +259,10 @@ def _action_worker_loop(
                 continue
             msg_type = str(msg.get("type"))
             if msg_type == "stop":
+                _drain_layer_updates(block=False)
                 break
             if msg_type == "flush":
+                _drain_layer_updates(block=False)
                 control_queue.put(
                     {
                         "type": "flush_ack",

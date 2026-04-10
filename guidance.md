@@ -23,15 +23,6 @@
    - 在真实分布附近加小扰动（少量更旧/更极端 frontier）。
    - 提高调度抖动下稳定性。
 
-## 关于“记录 layer_indices 不影响 rollout”
-
-只保留原则，不做复杂实现：
-
-1. telemetry 默认关闭，仅 profiling 开启。
-2. 不新增任何 CUDA 同步。
-3. 不传大 tensor，只传轻量统计。
-4. step 内本地累计，job 结束后一次上报。
-5. 先做 A/B：确认 telemetry 开关对 `action_job/action_step/action_job_wall` 基本无影响。
 
 ## 训练改动建议（最小版）
 

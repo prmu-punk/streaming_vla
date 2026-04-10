@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,7 +12,7 @@ from tqdm import tqdm
 
 from experiments.libero.async_streaming_runtime import AsyncStreamingActionRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
-from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_dummy_action, get_libero_env, save_rollout_video
+from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 
@@ -68,6 +69,15 @@ def _summarize_async_runtime_episodes(episodes: list[dict[str, Any]]) -> Optiona
     return summary
 
 
+def _step_env_with_min_dt(env, action, *, min_step_dt_s: float):
+    t0 = time.perf_counter()
+    obs, reward, done, info = env.step(action)
+    elapsed_s = time.perf_counter() - t0
+    if min_step_dt_s > 0.0 and elapsed_s < min_step_dt_s:
+        time.sleep(min_step_dt_s - elapsed_s)
+    return obs, reward, done, info
+
+
 def run_single_episode_async(
     env,
     initial_state,
@@ -89,12 +99,12 @@ def run_single_episode_async(
         raise ValueError("Async LIBERO rollout requires a FastWAMStreaming-style model.")
 
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
-    num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", 3))
     trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", 3))
     video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
     force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
     control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
+    min_step_dt_s = max(0.0, control_dt_ms / 1000.0)
     warmup_action_jobs = int(cfg.EVALUATION.get("async_warmup_action_jobs", 0))
     if warmup_action_jobs < 0:
         raise ValueError(f"`async_warmup_action_jobs` must be >= 0, got {warmup_action_jobs}.")
@@ -133,7 +143,6 @@ def run_single_episode_async(
     replay_images = []
     runtime_started = False
     done = False
-    terminated_during_wait = False
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -154,93 +163,81 @@ def run_single_episode_async(
 
         image, proprio, imgs = _encode_obs(obs)
         runtime.bootstrap_sync(input_image=image, obs_index=0, obs_timestamp_ms=0.0)
-
         obs_counter = 0
-        for wait_step in range(num_steps_wait):
-            if wait_step % obs_stride_env_steps == 0:
-                runtime.submit_observation(
-                    input_image=image,
-                    proprio=proprio,
-                    env_step=wait_step,
-                    obs_index=obs_counter,
-                    obs_timestamp_ms=float(obs_counter) * control_dt_ms * float(obs_stride_env_steps),
-                    trigger_job=False,
-                )
-                obs_counter += 1
-            obs, _, done, _ = env.step(get_libero_dummy_action())
-            if done:
-                runtime.wait_until_idle()
-                terminated_during_wait = True
-                break
-            image, proprio, imgs = _encode_obs(obs)
-        if not terminated_during_wait:
-            runtime.wait_until_idle()
-            runtime.reset_for_formal_phase(env_step=num_steps_wait)
+        runtime.wait_until_idle()
+        runtime.reset_for_formal_phase(env_step=0)
 
-            if warmup_action_jobs > 0:
-                warmup_t = num_steps_wait
-                warmup_obs_count = 0
-                warmup_first_triggered = False
-                while runtime.completed_jobs() < warmup_action_jobs:
-                    if (warmup_t - num_steps_wait) % obs_stride_env_steps == 0:
-                        warmup_obs_index = obs_counter
-                        should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
-                        if force_first_job and not warmup_first_triggered:
-                            should_trigger = True
-                        runtime.submit_observation(
-                            input_image=image,
-                            proprio=proprio,
-                            env_step=warmup_t,
-                            obs_index=warmup_obs_index,
-                            obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                            trigger_job=should_trigger,
-                        )
-                        obs_counter += 1
-                        warmup_obs_count += 1
-                        if should_trigger:
-                            warmup_first_triggered = True
-                    runtime.get_action(warmup_t)
-                    warmup_t += 1
-                runtime.wait_until_idle()
-                runtime.reset_for_formal_phase(env_step=num_steps_wait)
-
-            t = num_steps_wait
-            executed_env_steps = 0
-            formal_obs_count = 0
-            first_formal_triggered = False
-            pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (async)")
-            while executed_env_steps < max_steps:
-                if (t - num_steps_wait) % obs_stride_env_steps == 0:
-                    formal_obs_index = obs_counter
-                    should_trigger = runtime.should_trigger_on_obs(formal_obs_count + 1)
-                    if force_first_job and not first_formal_triggered:
+        if warmup_action_jobs > 0:
+            warmup_t = 0
+            warmup_obs_count = 0
+            warmup_first_triggered = False
+            while runtime.completed_jobs() < warmup_action_jobs:
+                if warmup_t % obs_stride_env_steps == 0:
+                    warmup_obs_index = obs_counter
+                    should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
+                    if force_first_job and not warmup_first_triggered:
                         should_trigger = True
                     runtime.submit_observation(
                         input_image=image,
                         proprio=proprio,
-                        env_step=t,
-                        obs_index=formal_obs_index,
-                        obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
+                        env_step=warmup_t,
+                        obs_index=warmup_obs_index,
+                        obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
                         trigger_job=should_trigger,
                     )
                     obs_counter += 1
-                    formal_obs_count += 1
+                    warmup_obs_count += 1
                     if should_trigger:
-                        first_formal_triggered = True
+                        warmup_first_triggered = True
+                runtime.get_action(warmup_t)
+                warmup_t += 1
+            runtime.wait_until_idle()
+            runtime.reset_for_formal_phase(env_step=0)
 
-                action = runtime.get_action(t)
-                replay_images.append(imgs.copy())
-                if action is None:
-                    action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+        t = 0
+        executed_env_steps = 0
+        formal_obs_count = 0
+        first_formal_triggered = False
+        pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (async)")
+        while executed_env_steps < max_steps:
+            if t % obs_stride_env_steps == 0:
+                formal_obs_index = obs_counter
+                should_trigger = runtime.should_trigger_on_obs(formal_obs_count + 1)
+                if force_first_job and not first_formal_triggered:
+                    should_trigger = True
+                runtime.submit_observation(
+                    input_image=image,
+                    proprio=proprio,
+                    env_step=t,
+                    obs_index=formal_obs_index,
+                    obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
+                    trigger_job=should_trigger,
+                )
+                obs_counter += 1
+                formal_obs_count += 1
+                if should_trigger:
+                    first_formal_triggered = True
 
-                obs, _, done, _ = env.step(action.tolist())
-                executed_env_steps += 1
-                pbar.update(1)
-                if done:
-                    break
-                t += 1
-                image, proprio, imgs = _encode_obs(obs)
-            pbar.close()
+            action = runtime.get_action(t)
+            replay_images.append(imgs.copy())
+            while action is None:
+                if runtime.pending_jobs() <= 0:
+                    runtime.submit_action_job(env_step=t, proprio=proprio)
+                runtime.wait_until_idle()
+                action = runtime.get_action(t, count_miss=False)
+
+            obs, _, done, _ = _step_env_with_min_dt(
+                env,
+                action.tolist(),
+                min_step_dt_s=min_step_dt_s,
+            )
+            executed_env_steps += 1
+            pbar.update(1)
+            if done:
+                break
+            t += 1
+            image, proprio, imgs = _encode_obs(obs)
+        pbar.close()
     finally:
         if runtime_started:
             runtime.stop()
@@ -294,41 +291,47 @@ def run_single_task(
         "async_video_device": str(model_device),
         "async_action_device": str(action_device),
     }
+    try:
+        for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+            success, replay_images, runtime_summary = run_single_episode_async(
+                env=env,
+                initial_state=initial_states[trial_idx],
+                task_description=task_description,
+                video_model=model,
+                action_model=resolved_action_model,
+                processor=processor,
+                cfg=cfg,
+                episode_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+            )
+            if success:
+                results["successes"] += 1
+                results["success_episodes"].append(trial_idx)
+            else:
+                results["failure_episodes"].append(trial_idx)
 
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, runtime_summary = run_single_episode_async(
-            env=env,
-            initial_state=initial_states[trial_idx],
-            task_description=task_description,
-            video_model=model,
-            action_model=resolved_action_model,
-            processor=processor,
-            cfg=cfg,
-            episode_idx=trial_idx,
-            action_horizon=action_horizon,
-            input_w=input_w,
-            input_h=input_h,
-        )
-        if success:
-            results["successes"] += 1
-            results["success_episodes"].append(trial_idx)
-        else:
-            results["failure_episodes"].append(trial_idx)
+            results["async_runtime_episodes"].append(
+                {
+                    "episode_idx": int(trial_idx),
+                    **runtime_summary,
+                }
+            )
 
-        results["async_runtime_episodes"].append(
-            {
-                "episode_idx": int(trial_idx),
-                **runtime_summary,
-            }
-        )
-
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
+            save_rollout_video(
+                video_dir,
+                replay_images,
+                f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                success=success,
+                task_description=task_description,
+            )
+    finally:
+        if hasattr(env, "close"):
+            try:
+                env.close()
+            except Exception:
+                logging.exception("Failed to close LIBERO env cleanly.")
 
     results["async_runtime_summary"] = _summarize_async_runtime_episodes(results["async_runtime_episodes"])
     return results

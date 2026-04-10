@@ -12,23 +12,29 @@ from fastwam.models.wan22.streaming_cache import CacheSnapshot
 from experiments.libero.async_streaming_workers import _snapshot_header, _video_worker_loop
 
 
-def _offset_to_full_mode(offset: int) -> str:
-    if offset <= -1:
-        return "full_prev"
+def _offset_to_label(offset: int) -> str:
     if offset == 0:
-        return "full_cur"
+        return "cur"
     if offset == 1:
-        return "full_next"
-    return "full_next2"
+        return "next"
+    if offset > 1:
+        return f"next{offset}"
+    if offset == -1:
+        return "prev"
+    return f"prev{abs(offset)}"
+
+
+def _offset_to_full_mode(offset: int) -> str:
+    return f"full_{_offset_to_label(offset)}"
 
 
 def _classify_layer_sources(
     *,
     layer_obs_indices: list[int],
     trigger_obs_index: int,
-) -> tuple[str, int, dict[str, int]]:
+) -> tuple[str, int, dict[str, int], int, Optional[int]]:
     if len(layer_obs_indices) == 0:
-        return "full_cur", 0, {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}
+        return "full_cur", 0, {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}, 0, None
 
     latest_obs_index = max(int(v) for v in layer_obs_indices)
     latest_frontier = 0
@@ -46,16 +52,12 @@ def _classify_layer_sources(
             older_obs_index = int(obs_idx)
             break
 
-    latest_offset = max(-1, min(2, int(latest_obs_index - int(trigger_obs_index))))
+    latest_offset = int(latest_obs_index - int(trigger_obs_index))
     mode = _offset_to_full_mode(latest_offset)
+    older_offset: Optional[int] = None
     if older_obs_index is not None:
-        older_offset = max(-1, min(2, int(older_obs_index - int(trigger_obs_index))))
-        pair_to_mode = {
-            (-1, 0): "prev_to_cur",
-            (0, 1): "cur_to_next",
-            (1, 2): "next_to_next2",
-        }
-        mode = pair_to_mode.get((older_offset, latest_offset), mode)
+        older_offset = int(older_obs_index - int(trigger_obs_index))
+        mode = f"{_offset_to_label(older_offset)}_to_{_offset_to_label(latest_offset)}"
 
     age_hist = {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}
     for obs_idx in layer_obs_indices:
@@ -68,7 +70,7 @@ def _classify_layer_sources(
             age_hist["age2"] += 1
         else:
             age_hist["age3p"] += 1
-    return mode, int(latest_frontier), age_hist
+    return mode, int(latest_frontier), age_hist, int(latest_offset), older_offset
 
 
 def _action_worker_loop_profiled(
@@ -155,8 +157,10 @@ def _action_worker_loop_profiled(
                 continue
             msg_type = str(msg.get("type"))
             if msg_type == "stop":
+                _drain_layer_updates(block=False)
                 break
             if msg_type == "flush":
+                _drain_layer_updates(block=False)
                 control_queue.put(
                     {
                         "type": "flush_ack",
@@ -231,7 +235,7 @@ def _action_worker_loop_profiled(
                     layer_obs_timestamps_ms=list(layer_obs_timestamps_ms),
                     layer_ready_events=[None] * num_layers,
                 )
-                mode, mode_frontier, age_hist = _classify_layer_sources(
+                mode, mode_frontier, age_hist, latest_offset, older_offset = _classify_layer_sources(
                     layer_obs_indices=snapshot.layer_obs_indices,
                     trigger_obs_index=trigger_obs_index,
                 )
@@ -246,6 +250,8 @@ def _action_worker_loop_profiled(
                             "age2": int(age_hist["age2"]),
                             "age3p": int(age_hist["age3p"]),
                         },
+                        "latest_offset": int(latest_offset),
+                        "older_offset": None if older_offset is None else int(older_offset),
                     }
                 )
                 if action_model.device.type == "cuda":
