@@ -378,9 +378,9 @@ def get_model(usr_args: Dict[str, Any]):
     async_obs_stride = int(usr_args.get("async_obs_stride_env_steps", 3))
     async_trigger = int(usr_args.get("async_action_trigger_every_n_obs", 3))
     async_layers = int(usr_args.get("async_video_layers_per_chunk", 2))
-    async_force_first = _parse_bool(usr.args.get("async_force_first_job", True))
-    async_warmup = int(usr.args.get("async_warmup_action_jobs", 0))
-    async_dt_ms = float(usr.args.get("async_control_dt_ms", 50.0))
+    async_force_first = _parse_bool(usr_args.get("async_force_first_job", True))
+    async_warmup = int(usr_args.get("async_warmup_action_jobs", 0))
+    async_dt_ms = float(usr_args.get("async_control_dt_ms", 50.0))
 
     policy = StreamingWorldActionRobotWinPolicy(
         # parent ctor args
