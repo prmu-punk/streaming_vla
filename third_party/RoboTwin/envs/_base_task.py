@@ -520,7 +520,6 @@ class Base_Task(gym.Env):
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
-
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()
         self.cameras.update_picture()

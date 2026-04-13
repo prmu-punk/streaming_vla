@@ -1,7 +1,7 @@
 """
 Streaming variant of `experiments/robotwin/fastwam_policy/deploy_policy.py`.
 
-Drives the `AsyncStreamingActionRuntimeProfiled` from inside a RoboTwin-shaped 
+Drives the `SpawnInitRuntime` from inside a RoboTwin-shaped 
 policy step. Designed to be plugged into the real `third_party/RoboTwin/script/eval_policy.py` 
 via the `policy/fastwam_streaming_policy` symlink.
 
@@ -11,7 +11,10 @@ normalization, action denormalization).
 """
 from __future__ import annotations
 
+import atexit
+import faulthandler
 import logging
+import os
 import sys
 import time
 from collections import deque
@@ -29,9 +32,6 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from experiments.libero.async_streaming_runtime_profiled import (  # noqa: E402
-    AsyncStreamingActionRuntimeProfiled,
-)
 from experiments.robotwin.fastwam_policy.deploy_policy import (  # noqa: E402
     WorldActionRobotWinPolicy,
     _compose_sim_cfg,
@@ -43,6 +43,13 @@ from experiments.robotwin.fastwam_policy.deploy_policy import (  # noqa: E402
     _resolve_dataset_stats_path,
 )
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # noqa: E402
+from fastwam.utils.async_streaming_runner import AsyncStreamingRunner  # noqa: E402
+from fastwam.utils.async_streaming_runtime import (  # noqa: E402
+    SpawnInitRuntime,
+)
+from fastwam.utils import async_streaming_runtime as _runtime_mod  # noqa: E402
+from fastwam.utils import async_streaming_workers as _workers_mod  # noqa: E402
+from fastwam.utils.async_streaming_workers import torch_dtype_to_name  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,79 @@ _LAST_POLICY: Optional["StreamingWorldActionRobotWinPolicy"] = None
 
 def get_last_policy() -> Optional["StreamingWorldActionRobotWinPolicy"]:
     return _LAST_POLICY
+
+
+def _maybe_enable_worker_faulthandler(worker_name: str) -> None:
+    fault_dir_raw = os.environ.get("FASTWAM_FAULT_DIR", "").strip()
+    if not fault_dir_raw:
+        return
+    enable_raw = str(os.environ.get("FASTWAM_CHILD_FAULTHANDLER", "1")).strip().lower()
+    if enable_raw in {"0", "false", "no", "n"}:
+        return
+
+    handle = None
+    try:
+        fault_dir = Path(fault_dir_raw)
+        fault_dir.mkdir(parents=True, exist_ok=True)
+        fault_file = fault_dir / f"{worker_name}_pid{os.getpid()}_faulthandler.log"
+        handle = open(fault_file, "a", encoding="utf-8")
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        return
+
+    def _flush_and_close() -> None:
+        try:
+            handle.flush()
+        except Exception:
+            pass
+        try:
+            os.fsync(handle.fileno())
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    atexit.register(_flush_and_close)
+
+
+def _robotwin_video_worker_loop_with_fault(**kwargs: Any) -> None:
+    _maybe_enable_worker_faulthandler("streaming_video_worker")
+    _workers_mod._video_worker_loop(**kwargs)
+
+
+def _robotwin_action_worker_loop_spawn_init_profiled_with_fault(**kwargs: Any) -> None:
+    _maybe_enable_worker_faulthandler("streaming_action_worker")
+    _workers_mod._action_worker_loop_spawn_init_profiled(**kwargs)
+
+
+_runtime_mod._video_worker_loop = _robotwin_video_worker_loop_with_fault
+_runtime_mod._action_worker_loop_spawn_init_profiled = _robotwin_action_worker_loop_spawn_init_profiled_with_fault
+
+
+def _summarize_ms(samples_ms: list[float]) -> dict[str, float | int | None]:
+    if len(samples_ms) == 0:
+        return {
+            "count": 0,
+            "avg_ms": None,
+            "p50_ms": None,
+            "p90_ms": None,
+            "max_ms": None,
+        }
+    arr = np.asarray(samples_ms, dtype=np.float64)
+    return {
+        "count": int(arr.shape[0]),
+        "avg_ms": float(np.mean(arr)),
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p90_ms": float(np.percentile(arr, 90)),
+        "max_ms": float(np.max(arr)),
+    }
 
 
 class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
@@ -140,15 +220,14 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         self._async_warmup_action_jobs = int(async_warmup_action_jobs)
         self._async_control_dt_ms = float(async_control_dt_ms)
 
-        self._runtime: Optional[AsyncStreamingActionRuntimeProfiled] = None
+        self._action_model_cfg = OmegaConf.create(OmegaConf.to_container(action_model_cfg, resolve=True))
+        self._runtime: Optional[SpawnInitRuntime] = None
+        self._runner: Optional[AsyncStreamingRunner] = None
         self._runtime_started = False
         self._t_env: int = 0
-        self._obs_counter: int = 0
-        self._formal_obs_count: int = 0
-        self._first_formal_triggered: bool = False
-        self._last_action: Optional[np.ndarray] = None
         self._episode_stats: list[dict[str, Any]] = []
         self._current_instruction: Optional[str] = None
+        self._env_step_samples_ms: list[float] = []
 
         # We do not use the parent's pending_actions deque; force-empty so
         # `should_request_observation()` always returns True.
@@ -172,11 +251,8 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         super().reset()
         self._teardown_runtime()
         self._t_env = 0
-        self._obs_counter = 0
-        self._formal_obs_count = 0
-        self._first_formal_triggered = False
-        self._last_action = None
         self._current_instruction = None
+        self._env_step_samples_ms = []
 
     def _teardown_runtime(self) -> None:
         if self._runtime is not None and self._runtime_started:
@@ -190,8 +266,14 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             except Exception:
                 logger.exception("Failed to collect runtime stats.")
             if stats is not None:
+                stats.setdefault("timing_ms", {})
+                stats["timing_ms"]["env_step"] = _summarize_ms(self._env_step_samples_ms)
+                stats.setdefault("timing_samples_ms", {})
+                stats["timing_samples_ms"]["env_step"] = [float(v) for v in self._env_step_samples_ms]
                 self._episode_stats.append(stats)
+            self._env_step_samples_ms = []
         self._runtime = None
+        self._runner = None
         self._runtime_started = False
 
     def _build_runtime(
@@ -211,7 +293,15 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
 
         action_postprocess = lambda x: self._denormalize_action(x)[0]
 
-        self._runtime = AsyncStreamingActionRuntimeProfiled(
+        action_model_spec = {
+            "model_cfg": OmegaConf.to_container(self._action_model_cfg, resolve=True),
+            "checkpoint_path": self._checkpoint_path,
+            "device": self._action_device,
+            "model_dtype_name": torch_dtype_to_name(self.model.torch_dtype),
+            "move_text_encoder_to_cpu": True,
+        }
+
+        self._runtime = SpawnInitRuntime(
             video_model=self.model,
             action_model=self.action_model,
             video_context=v_ctx,
@@ -227,42 +317,35 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             action_trigger_every_n_obs=self._async_action_trigger_every_n_obs,
             video_layers_per_chunk=self._async_video_layers_per_chunk,
             seed=self.seed,
+            action_model_spec=action_model_spec,
+            debug_process_start=True,
         )
         self._runtime.start()
         self._runtime_started = True
+        self._runtime.bootstrap_sync(
+            input_image=image_cpu,
+            obs_index=0,
+            obs_timestamp_ms=0.0,
+        )
+        self._runner = AsyncStreamingRunner(
+            runtime=self._runtime,
+            obs_stride_env_steps=self._async_obs_stride_env_steps,
+            control_dt_ms=self._async_control_dt_ms,
+            force_first_job=self._async_force_first_job,
+        )
+        obs_counter = 0
         if self._async_warmup_action_jobs > 0:
-            self._run_warmup(image_cpu=image_cpu, proprio=proprio)
+            warmup_span = max(1, self._async_warmup_action_jobs) * max(1, self.action_horizon)
+            warmup_start = -int(warmup_span)
+            obs_counter = self._runner.run_warmup(
+                input_image=image_cpu,
+                proprio=proprio,
+                warmup_action_jobs=self._async_warmup_action_jobs,
+                start_env_step=warmup_start,
+                start_obs_index=warmup_start,
+            )
         self._runtime.reset_for_formal_phase(env_step=0)
-
-    def _run_warmup(self, *, image_cpu: torch.Tensor, proprio: torch.Tensor) -> None:
-        if self._runtime is None:
-            return
-        warmup_t = 0
-        warmup_obs_count = 0
-        warmup_obs_index = 0
-        warmup_first_triggered = False
-        while self._runtime.completed_jobs() < self._async_warmup_action_jobs:
-            if warmup_t % self._async_obs_stride_env_steps == 0:
-                should_trigger = self._runtime.should_trigger_on_obs(warmup_obs_count + 1)
-                if self._async_force_first_job and not warmup_first_triggered:
-                    should_trigger = True
-                self._runtime.submit_observation(
-                    input_image=image_cpu,
-                    proprio=proprio,
-                    env_step=warmup_t,
-                    obs_index=warmup_obs_index,
-                    obs_timestamp_ms=float(warmup_obs_index)
-                    * self._async_control_dt_ms
-                    * float(self._async_obs_stride_env_steps),
-                    trigger_job=should_trigger,
-                )
-                warmup_obs_index += 1
-                warmup_obs_count += 1
-                if should_trigger:
-                    warmup_first_triggered = True
-            self._runtime.get_action(warmup_t)
-            warmup_t += 1
-        self._runtime.wait_until_idle()
+        self._runner.start_formal_phase(obs_index_start=obs_counter)
 
     def _encode_observation(
         self, observation: Dict[str, Any]
@@ -288,46 +371,29 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         if self._runtime is None:
             self._current_instruction = instruction
             self._build_runtime(instruction, image_cpu=image_cpu, proprio=proprio)
+        if self._runtime is None or self._runner is None:
+            raise RuntimeError("Streaming runtime runner is not initialized.")
         t = self._t_env
 
-        if t % self._async_obs_stride_env_steps == 0:
-            should_trigger = self._runtime.should_trigger_on_obs(
-                self._formal_obs_count + 1
-            )
-            if self._async_force_first_job and not self._first_formal_triggered:
-                should_trigger = True
-            self._runtime.submit_observation(
-                input_image=image_cpu,
-                proprio=proprio,
-                env_step=t,
-                obs_index=self._obs_counter,
-                obs_timestamp_ms=float(self._obs_counter)
-                * self._async_control_dt_ms
-                * float(self._async_obs_stride_env_steps),
-                trigger_job=should_trigger,
-            )
-            self._obs_counter += 1
-            self._formal_obs_count += 1
-            if should_trigger:
-                self._first_formal_triggered = True
+        self._runner.maybe_submit_formal_observation(
+            input_image=image_cpu,
+            proprio=proprio,
+            env_step=t,
+        )
+        action = self._runner.wait_for_action(env_step=t, proprio=proprio)
 
-        action = self._runtime.get_action(t)
-        if action is None:
-            fallback_action = np.asarray(
-                observation["joint_action"]["vector"], dtype=np.float32
-            )
-            action = (
-                self._last_action
-                if self._last_action is not None
-                else fallback_action
-            )
-
-        sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
+        step_t0 = time.perf_counter()
+        sim_t0 = step_t0 if self.timing_enabled else 0.0
         task_env.take_action(action, action_type="qpos")
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
+        elapsed_s = time.perf_counter() - step_t0
+        min_step_dt_s = max(0.0, self._async_control_dt_ms / 1000.0)
+        if min_step_dt_s > 0.0 and elapsed_s < min_step_dt_s:
+            time.sleep(min_step_dt_s - elapsed_s)
+            elapsed_s = min_step_dt_s
+        self._env_step_samples_ms.append(float(elapsed_s * 1000.0))
 
-        self._last_action = np.asarray(action, dtype=np.float32)
         self._t_env += 1
         self.step_count += 1
 

@@ -19,7 +19,7 @@ or equivalently:
         --task-config demo_randomized \
         --ckpt-setting checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
         --dataset-stats checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json \
-        --eval-num-episodes 10 \
+        --eval-num-episodes 1 \
         --async-video-device cuda:0 \
         --async-action-device cuda:1 \
         --profile-output-dir ./evaluate_results/robotwin_profile/real
@@ -32,6 +32,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import os
@@ -90,7 +91,7 @@ def _summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(ep.get(key, 0)) for ep in episodes]
         summary[f"{key}_total"] = float(np.sum(values))
         summary[f"{key}_mean"] = float(np.mean(values))
-    timing_keys = ["video_refresh", "action_job", "action_job_wall", "action_step", "snapshot_copy"]
+    timing_keys = ["video_refresh", "action_job", "action_job_wall", "action_step", "snapshot_copy", "env_step"]
     timing_summary: dict[str, Any] = {}
     for key in timing_keys:
         weighted = 0.0
@@ -127,13 +128,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--async-obs-stride-env-steps", type=int, default=3)
     p.add_argument("--async-action-trigger-every-n-obs", type=int, default=3)
     p.add_argument("--async-video-layers-per-chunk", type=int, default=2)
-    p.add_argument("--async-force-first-job", type=int, default=1)
-    p.add_argument("--async-warmup-action-jobs", type=int, default=0)
+    p.add_argument("--async-force-first-job", type=int, default=0)
+    p.add_argument("--async-warmup-action-jobs", type=int, default=20)
     p.add_argument("--async-control-dt-ms", type=float, default=50.0)
     # --- model / inference knobs
     p.add_argument("--mixed-precision", default="bf16")
     p.add_argument("--replan-steps", type=int, default=24)
-    p.add_argument("--num-inference-steps", type=int, default=10)
+    p.add_argument("--num-inference-steps", type=int, default=8)
     p.add_argument("--action-horizon", type=int, default=None)
     p.add_argument("--sigma-shift", type=float, default=None)
     p.add_argument("--text-cfg-scale", type=float, default=1.0)
@@ -145,7 +146,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Must be 1 for streaming RobotWin profiling.")
     p.add_argument("--redirect-common-files", type=int, default=1)
     # --- episode loop
-    p.add_argument("--eval-num-episodes", type=int, default=10)
+    p.add_argument("--eval-num-episodes", type=int, default=1)
     p.add_argument("--instruction-type", default="unseen")
     p.add_argument("--skip-get-obs-within-replan", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
@@ -202,60 +203,119 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args()
     usr_args = _build_usr_args(args)
-
-    # RoboTwin's main() reads `./task_config/<task_config>.yml` relative to
-    # cwd, so chdir into the RoboTwin root for the duration of the run.
-    original_cwd = Path.cwd()
-    os.chdir(ROBOTWIN_ROOT)
-    logger.info("Changed cwd to %s for RoboTwin main()", ROBOTWIN_ROOT)
-
-    start_time = time.time()
-    try:
-        # Import lazily so all the `sys.path.insert`s + chdir are in effect.
-        from script import eval_policy as robotwin_eval_policy  # type: ignore
-
-        logger.info("Delegating to RoboTwin eval_policy.main with usr_args=%s", usr_args)
-        robotwin_eval_policy.main(usr_args)
-    finally:
-        os.chdir(original_cwd)
-
-    duration = time.time() - start_time
-
-    policy = streaming_policy.get_last_policy()
-    if policy is None:
-        raise RuntimeError(
-            "StreamingWorldActionRobotWinPolicy was never built — did RoboTwin "
-            "main() fail before calling get_model?"
+    os.environ.setdefault("PYTHONFAULTHANDLER", "1")
+    preferred_tmp = os.environ.get("FASTWAM_TMPDIR", "/tmp/fw")
+    tmp_root = Path(preferred_tmp)
+    # torch_shm_manager uses UNIX sockets; overly long TMPDIR can cause EINVAL.
+    if len(str(tmp_root)) > 60:
+        fallback_tmp = Path("/tmp/fw")
+        logger.warning(
+            "FASTWAM_TMPDIR is too long for safe torch_shm_manager socket paths (%s). "
+            "Falling back to %s.",
+            tmp_root,
+            fallback_tmp,
         )
-    episodes = policy.collect_episode_stats()
+        tmp_root = fallback_tmp
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TMPDIR", str(tmp_root))
+    os.environ.setdefault("TMP", str(tmp_root))
+    os.environ.setdefault("TEMP", str(tmp_root))
+    try:
+        import torch.multiprocessing as torch_mp
 
-    task_name = args.task_name
-    output_root = Path(args.profile_output_dir)
-    output_dir = output_root / task_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"gpu{args.gpu_tag}_task{task_name}_results.json"
+        torch_mp.set_sharing_strategy("file_descriptor")
+        logger.info(
+            "Set torch multiprocessing sharing strategy to file_descriptor (TMPDIR=%s).",
+            tmp_root,
+        )
+    except Exception:
+        logger.exception("Failed to set torch multiprocessing sharing strategy file_descriptor.")
 
-    payload = {
-        "task_suite": "robotwin_real",
-        "task_id": task_name,
-        "task_config": args.task_config,
-        "instruction_type": args.instruction_type,
-        "ckpt_loaded": True,
-        "total_episodes": int(args.eval_num_episodes),
-        "duration": float(duration),
-        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "async_video_device": str(args.async_video_device),
-        "async_action_device": str(args.async_action_device),
-        "async_runtime_episodes": episodes,
-        "async_runtime_summary": _summarize_episodes(episodes),
-        "layer_source_stats": episodes[-1].get("layer_source_stats") if episodes else None,
-    }
+    fault_dir = Path(args.profile_output_dir).resolve() / args.task_name
+    fault_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["FASTWAM_FAULT_DIR"] = str(fault_dir)
+    os.environ.setdefault("FASTWAM_CHILD_FAULTHANDLER", "1")
+    fault_log_file = fault_dir / f"gpu{args.gpu_tag}_task{args.task_name}_faulthandler.log"
+    fault_log_handle = open(fault_log_file, "a", encoding="utf-8")
+    try:
+        faulthandler.enable(file=fault_log_handle, all_threads=True)
+    except Exception:
+        logger.exception("Failed to enable faulthandler file logging; falling back to stderr.")
+        faulthandler.enable(all_threads=True)
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=4, cls=_NumpyEncoder)
+    try:
+        # RoboTwin's main() reads `./task_config/<task_config>.yml` relative to
+        # cwd, so chdir into the RoboTwin root for the duration of the run.
+        original_cwd = Path.cwd()
+        os.chdir(ROBOTWIN_ROOT)
+        logger.info("Changed cwd to %s for RoboTwin main()", ROBOTWIN_ROOT)
 
-    logger.info("Wrote profile results to %s", output_file)
-    logger.info("Total duration: %.2f s across %d episodes", duration, args.eval_num_episodes)
+        start_time = time.time()
+        try:
+            # Import lazily so all the `sys.path.insert`s + chdir are in effect.
+            from script import eval_policy as robotwin_eval_policy  # type: ignore
+
+            logger.info("Delegating to RoboTwin eval_policy.main with usr_args=%s", usr_args)
+            robotwin_eval_policy.main(usr_args)
+        except BaseException:
+            logger.exception("RoboTwin eval_policy.main failed; attempting streaming policy teardown.")
+            try:
+                policy = streaming_policy.get_last_policy()
+                if policy is not None:
+                    policy.collect_episode_stats()
+            except Exception:
+                logger.exception("Failed during emergency streaming policy teardown.")
+            raise
+        finally:
+            os.chdir(original_cwd)
+
+        duration = time.time() - start_time
+
+        policy = streaming_policy.get_last_policy()
+        if policy is None:
+            raise RuntimeError(
+                "StreamingWorldActionRobotWinPolicy was never built — did RoboTwin "
+                "main() fail before calling get_model?"
+            )
+        episodes = policy.collect_episode_stats()
+
+        task_name = args.task_name
+        output_root = Path(args.profile_output_dir)
+        output_dir = output_root / task_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"gpu{args.gpu_tag}_task{task_name}_results.json"
+
+        payload = {
+            "task_suite": "robotwin_real",
+            "task_id": task_name,
+            "task_config": args.task_config,
+            "instruction_type": args.instruction_type,
+            "ckpt_loaded": True,
+            "total_episodes": int(args.eval_num_episodes),
+            "duration": float(duration),
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "async_video_device": str(args.async_video_device),
+            "async_action_device": str(args.async_action_device),
+            "async_runtime_episodes": episodes,
+            "async_runtime_summary": _summarize_episodes(episodes),
+            "layer_source_stats": episodes[-1].get("layer_source_stats") if episodes else None,
+        }
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4, cls=_NumpyEncoder)
+
+        logger.info("Wrote profile results to %s", output_file)
+        logger.info("Total duration: %.2f s across %d episodes", duration, args.eval_num_episodes)
+    finally:
+        try:
+            fault_log_handle.flush()
+        except Exception:
+            pass
+        try:
+            os.fsync(fault_log_handle.fileno())
+        except Exception:
+            pass
+        fault_log_handle.close()
 
 
 if __name__ == "__main__":
