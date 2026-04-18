@@ -276,6 +276,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         proprio: Optional[torch.Tensor] = None,
+        trigger_obs_index: int = -1,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
@@ -307,6 +308,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             context=resolved_context,
             context_mask=resolved_context_mask,
             proprio=action_proprio,
+            trigger_obs_index=int(trigger_obs_index),
         )
 
     @torch.no_grad()
@@ -336,7 +338,18 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             timestep_action=step_t,
             context=job.context,
             context_mask=job.context_mask,
-            video_kv_cache=snapshot.cache_layers,
+            video_kv_cache=[
+                {
+                    "k": layer["k"],
+                    "v": layer["v"],
+                    "source_delta": (
+                        0
+                        if int(job.trigger_obs_index) < 0
+                        else int(snapshot.layer_obs_indices[layer_idx]) - int(job.trigger_obs_index)
+                    ),
+                }
+                for layer_idx, layer in enumerate(snapshot.cache_layers)
+            ],
             attention_mask=attention_mask,
             video_seq_len=snapshot.video_seq_len,
             proprio=job.proprio,

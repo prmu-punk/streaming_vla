@@ -228,6 +228,8 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         self._episode_stats: list[dict[str, Any]] = []
         self._current_instruction: Optional[str] = None
         self._env_step_samples_ms: list[float] = []
+        self._episode_physical_elapsed_ms: float = 0.0
+        self._next_obs_due_ms: float = 0.0
 
         # We do not use the parent's pending_actions deque; force-empty so
         # `should_request_observation()` always returns True.
@@ -253,6 +255,8 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         self._t_env = 0
         self._current_instruction = None
         self._env_step_samples_ms = []
+        self._episode_physical_elapsed_ms = 0.0
+        self._next_obs_due_ms = 0.0
 
     def _teardown_runtime(self) -> None:
         if self._runtime is not None and self._runtime_started:
@@ -346,6 +350,8 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             )
         self._runtime.reset_for_formal_phase(env_step=0)
         self._runner.start_formal_phase(obs_index_start=obs_counter)
+        self._episode_physical_elapsed_ms = 0.0
+        self._next_obs_due_ms = 0.0
 
     def _encode_observation(
         self, observation: Dict[str, Any]
@@ -358,6 +364,47 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
         )
         proprio = self._normalize_state(state_vector)
         return image_cpu, proprio
+
+    def _submit_timed_formal_observation(
+        self,
+        observation: Dict[str, Any],
+        *,
+        obs_timestamp_ms: float,
+        env_step: int,
+    ) -> None:
+        if self._runtime is None or self._runner is None:
+            return
+        image_cpu, proprio = self._encode_observation(observation)
+        obs_index = int(self._runner.obs_counter)
+        should_trigger = bool(
+            self._runtime.should_trigger_on_obs(self._runner.formal_obs_count + 1)
+        )
+        if self._runner.force_first_job and not self._runner.first_formal_triggered:
+            should_trigger = True
+        self._runtime.submit_observation(
+            input_image=image_cpu,
+            proprio=proprio,
+            env_step=int(env_step),
+            obs_index=obs_index,
+            obs_timestamp_ms=float(obs_timestamp_ms),
+            trigger_job=should_trigger,
+        )
+        self._runner.obs_counter += 1
+        self._runner.formal_obs_count += 1
+        if should_trigger:
+            self._runner.first_formal_triggered = True
+
+    @staticmethod
+    def _current_physical_step(task_env) -> int:
+        return int(getattr(task_env, "physical_step_idx", 0))
+
+    @staticmethod
+    def _current_physical_time_ms(task_env) -> float:
+        return (
+            float(getattr(task_env, "physical_step_idx", 0))
+            * float(getattr(task_env, "sim_timestep_s", 0.0))
+            * 1000.0
+        )
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         if observation is None:
@@ -373,25 +420,47 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             self._build_runtime(instruction, image_cpu=image_cpu, proprio=proprio)
         if self._runtime is None or self._runner is None:
             raise RuntimeError("Streaming runtime runner is not initialized.")
-        t = self._t_env
+        physical_step = self._current_physical_step(task_env)
+        physical_time_ms = self._current_physical_time_ms(task_env)
 
-        self._runner.maybe_submit_formal_observation(
-            input_image=image_cpu,
-            proprio=proprio,
-            env_step=t,
-        )
-        action = self._runner.wait_for_action(env_step=t, proprio=proprio)
+        if self._runner.formal_obs_count == 0:
+            self._submit_timed_formal_observation(
+                observation,
+                obs_timestamp_ms=physical_time_ms,
+                env_step=physical_step,
+            )
+            self._next_obs_due_ms = float(physical_time_ms) + float(
+                self._async_control_dt_ms
+            )
+        action = self._runner.wait_for_action(env_step=physical_step, proprio=proprio)
 
         step_t0 = time.perf_counter()
         sim_t0 = step_t0 if self.timing_enabled else 0.0
-        task_env.take_action(action, action_type="qpos")
+        task_env._streaming_obs_callback = (
+            lambda obs, obs_timestamp_ms, physical_step_idx: self._submit_timed_formal_observation(
+                obs,
+                obs_timestamp_ms=obs_timestamp_ms,
+                env_step=int(physical_step_idx),
+            )
+        )
+        task_env._streaming_obs_target_period_ms = float(self._async_control_dt_ms)
+        task_env._streaming_next_obs_due_ms = float(self._next_obs_due_ms)
+        task_env._streaming_bind_wall_clock_to_physical_step = True
+        try:
+            task_env.take_action(action, action_type="qpos")
+        finally:
+            self._next_obs_due_ms = float(
+                getattr(task_env, "_streaming_next_obs_due_ms", self._next_obs_due_ms)
+            )
+            step_physical_elapsed_ms = float(
+                getattr(task_env, "_last_take_action_elapsed_ms", 0.0)
+            )
+            self._episode_physical_elapsed_ms += step_physical_elapsed_ms
+            task_env._streaming_obs_callback = None
+            task_env._streaming_bind_wall_clock_to_physical_step = False
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
         elapsed_s = time.perf_counter() - step_t0
-        min_step_dt_s = max(0.0, self._async_control_dt_ms / 1000.0)
-        if min_step_dt_s > 0.0 and elapsed_s < min_step_dt_s:
-            time.sleep(min_step_dt_s - elapsed_s)
-            elapsed_s = min_step_dt_s
         self._env_step_samples_ms.append(float(elapsed_s * 1000.0))
 
         self._t_env += 1
@@ -483,7 +552,7 @@ def get_model(usr_args: Dict[str, Any]):
     async_layers = int(usr_args.get("async_video_layers_per_chunk", 2))
     async_force_first = _parse_bool(usr_args.get("async_force_first_job", True))
     async_warmup = int(usr_args.get("async_warmup_action_jobs", 0))
-    async_dt_ms = float(usr_args.get("async_control_dt_ms", 50.0))
+    async_dt_ms = float(usr_args.get("async_control_dt_ms", 150.0))
 
     policy = StreamingWorldActionRobotWinPolicy(
         # parent ctor args

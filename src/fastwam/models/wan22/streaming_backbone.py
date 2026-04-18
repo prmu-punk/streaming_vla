@@ -10,68 +10,6 @@ from .streaming_cache import stitch_prefix_cache
 
 
 class StreamingBackbone:
-    def _sample_streaming_batch_pair(self, sample) -> dict[str, Any]:
-        video = sample["video"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        action = sample["action"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        context = sample["context"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        context_mask = sample["context_mask"].to(device=self.device, dtype=torch.bool, non_blocking=True)
-        batch_size, _, num_frames, _, _ = video.shape
-        if num_frames <= 1:
-            raise ValueError("Streaming action fine-tuning requires at least 2 video frames.")
-        if action.shape[1] % (num_frames - 1) != 0:
-            raise ValueError(
-                f"`action` temporal dim must be divisible by num_transitions ({num_frames - 1}), got {action.shape[1]}."
-            )
-
-        obs_gap_choices = list(self.streaming_train_cfg.get("obs_gap_choices", [1]))
-        obs_new_frame_choices = list(
-            self.streaming_train_cfg.get(
-                "obs_new_frame_choices",
-                [1],
-            )
-        )
-        if not obs_gap_choices:
-            raise ValueError("`streaming_train.obs_gap_choices` cannot be empty.")
-        obs_gap = int(obs_gap_choices[torch.randint(0, len(obs_gap_choices), (1,)).item()])
-        valid_new_choices = [int(v) for v in obs_new_frame_choices if 0 < int(v) < (num_frames - 1)]
-        if not valid_new_choices:
-            raise ValueError(
-                "`streaming_train.obs_new_frame_choices` must contain frame indices in [1, num_frames-2]."
-            )
-        obs_new_idx = valid_new_choices[torch.randint(0, len(valid_new_choices), (1,)).item()]
-        obs_old_idx = max(0, obs_new_idx - obs_gap)
-
-        actions_per_transition = action.shape[1] // (num_frames - 1)
-        action_start = obs_new_idx * actions_per_transition
-        if action_start >= action.shape[1]:
-            raise ValueError(
-                f"Selected `obs_new_idx={obs_new_idx}` leaves no future action tokens."
-            )
-
-        target_action = action[:, action_start:]
-        action_is_pad = sample.get("action_is_pad")
-        if action_is_pad is not None:
-            action_is_pad = action_is_pad[:, action_start:].to(device=self.device, dtype=torch.bool, non_blocking=True)
-
-        proprio_new = None
-        if self.proprio_dim is not None and sample.get("proprio") is not None:
-            proprio = sample["proprio"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-            proprio_new = proprio[:, obs_new_idx, :]
-            if proprio_new.shape != (batch_size, self.proprio_dim):
-                raise ValueError(
-                    f"`proprio_new` shape mismatch, got {tuple(proprio_new.shape)} expected ({batch_size}, {self.proprio_dim})."
-                )
-
-        return {
-            "obs_old_img": video[:, :, obs_old_idx],
-            "obs_new_img": video[:, :, obs_new_idx],
-            "target_action": target_action,
-            "action_is_pad": action_is_pad,
-            "context": context,
-            "context_mask": context_mask,
-            "proprio_new": proprio_new,
-        }
-
     def _sample_split_point(self, timestep_action: torch.Tensor) -> int:
         frontier_cfg = dict(self.streaming_train_cfg.get("frontier", {}))
         min_layers = int(frontier_cfg.get("min_layers", 0))
@@ -201,9 +139,22 @@ class StreamingBackbone:
                 {
                     "k": layer["k"][start:end],
                     "v": layer["v"][start:end],
+                    "source_delta": int(layer.get("source_delta", 0)),
                 }
             )
         return sliced
+
+    @staticmethod
+    def _cache_key_to_source_delta(cache_key: str) -> int:
+        mapping = {
+            "prev": -1,
+            "cur": 0,
+            "next": 1,
+            "next2": 2,
+        }
+        if str(cache_key) not in mapping:
+            raise ValueError(f"Unsupported cache key for source delta: {cache_key}")
+        return int(mapping[str(cache_key)])
 
     def _build_selected_video_cache_payload(
         self,
@@ -241,7 +192,11 @@ class StreamingBackbone:
         for idx, key in enumerate(ordered_keys):
             start = idx * batch_size
             end = (idx + 1) * batch_size
-            output[key] = self._slice_cache_batch(full_cache, start, end)
+            sliced_cache = self._slice_cache_batch(full_cache, start, end)
+            source_delta = self._cache_key_to_source_delta(key)
+            for layer in sliced_cache:
+                layer["source_delta"] = int(source_delta)
+            output[key] = sliced_cache
         return output
 
     def _get_streaming_infer_timesteps(self, infer_num_inference_steps: int) -> torch.Tensor:
@@ -441,104 +396,66 @@ class StreamingBackbone:
         raise ValueError(f"Unsupported streaming cache mode: {mode}")
 
     def training_loss_streaming_action_ft(self, sample, tiled: bool = False):
-        episode_batch = self._extract_streaming_episode_batch(sample)
-        if episode_batch is not None:
-            target_action = episode_batch["target_action"]
-            timestep_action, noisy_action, target_noise = self._sample_noisy_triplet(target_action)
-
-            bucket = self._map_training_timestep_to_bucket(timestep_action)
-            mode, frontier = self._sample_cache_distribution(bucket)
-            required_cache_keys = self._required_cache_keys_for_mode(mode)
-            video_ctx = nullcontext() if not self.freeze_video_expert else torch.no_grad()
-            with video_ctx:
-                selected_caches = self._build_selected_video_cache_payload(
-                    episode_batch,
-                    required_cache_keys=required_cache_keys,
-                )
-            stitched_cache = self._compose_distribution_cache(
-                caches=selected_caches,
-                mode=mode,
-                frontier=frontier,
-            )
-            pred_action = self._predict_stream_noise(
-                noisy_action=noisy_action,
-                timestep_action=timestep_action,
-                context=episode_batch["context"],
-                context_mask=episode_batch["context_mask"],
-                video_kv_cache=stitched_cache,
-                video_seq_len=int(selected_caches["video_seq_len"]),
-                video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
-                proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
-            )
-            loss_stream = self._loss_stream_full_chunk(
-                pred_action=pred_action,
-                target_noise=target_noise,
-                timestep_action=timestep_action,
-                action_is_pad=episode_batch["action_is_pad"],
-            )
-            if bool(self.streaming_train_cfg.get("mix_with_base_loss", False)):
-                raise ValueError("`mix_with_base_loss=true` is unsupported for episode-based streaming dataset.")
-            return loss_stream, {
-                "loss_streaming_action": float(loss_stream.detach().item()),
-                "bucket": float(bucket),
-                "mode_id": self._distribution_mode_to_id(mode),
-                "frontier": -1.0 if frontier is None else float(frontier),
-            }
-
         del tiled
-        pair = self._sample_streaming_batch_pair(sample)
-        target_action = pair["target_action"]
+        episode_batch = self._extract_streaming_episode_batch(sample)
+        if episode_batch is None:
+            required_keys = (
+                "obs_prev",
+                "obs_cur",
+                "obs_next",
+                "obs_next2",
+                "target_action",
+                "proprio_t",
+                "context",
+                "context_mask",
+            )
+            present_keys = sorted(str(key) for key in sample.keys())
+            raise ValueError(
+                "Streaming action FT now requires episode-style samples and no longer falls back to pair mode. "
+                f"Missing one or more required keys: {required_keys}. "
+                f"Present keys: {present_keys}"
+            )
+
+        target_action = episode_batch["target_action"]
         timestep_action, noisy_action, target_noise = self._sample_noisy_triplet(target_action)
 
-        with torch.no_grad():
-            cache_old_payload = self.build_streaming_video_cache_from_input_image(
-                input_image=pair["obs_old_img"],
-                context=pair["context"],
-                context_mask=pair["context_mask"],
+        bucket = self._map_training_timestep_to_bucket(timestep_action)
+        mode, frontier = self._sample_cache_distribution(bucket)
+        required_cache_keys = self._required_cache_keys_for_mode(mode)
+        video_ctx = nullcontext() if not self.freeze_video_expert else torch.no_grad()
+        with video_ctx:
+            selected_caches = self._build_selected_video_cache_payload(
+                episode_batch,
+                required_cache_keys=required_cache_keys,
             )
-            cache_new_payload = self.build_streaming_video_cache_from_input_image(
-                input_image=pair["obs_new_img"],
-                context=pair["context"],
-                context_mask=pair["context_mask"],
-            )
-
-        split_point = self._sample_split_point(timestep_action)
-        stitched_cache = stitch_prefix_cache(
-            cache_new=cache_new_payload["video_kv_cache"],
-            cache_old=cache_old_payload["video_kv_cache"],
-            split_point=split_point,
+        stitched_cache = self._compose_distribution_cache(
+            caches=selected_caches,
+            mode=mode,
+            frontier=frontier,
         )
         pred_action = self._predict_stream_noise(
             noisy_action=noisy_action,
             timestep_action=timestep_action,
-            context=pair["context"],
-            context_mask=pair["context_mask"],
+            context=episode_batch["context"],
+            context_mask=episode_batch["context_mask"],
             video_kv_cache=stitched_cache,
-            video_seq_len=int(cache_new_payload["video_seq_len"]),
-            video_tokens_per_frame=int(cache_new_payload["video_pre"]["meta"]["tokens_per_frame"]),
-            proprio=pair["proprio_new"] if self.streaming_proprio_to_action_only else None,
+            video_seq_len=int(selected_caches["video_seq_len"]),
+            video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
+            proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
         )
         loss_stream = self._loss_stream_full_chunk(
             pred_action=pred_action,
             target_noise=target_noise,
             timestep_action=timestep_action,
-            action_is_pad=pair["action_is_pad"],
+            action_is_pad=episode_batch["action_is_pad"],
         )
 
         if bool(self.streaming_train_cfg.get("mix_with_base_loss", False)):
-            loss_base, loss_dict_base = self.training_loss_base(sample)
-            total_loss = (
-                float(self.streaming_train_cfg.get("lambda_streaming_action", 1.0)) * loss_stream
-                + float(self.streaming_train_cfg.get("lambda_base", 1.0)) * loss_base
-            )
-            loss_dict = {
-                "loss_streaming_action": float(loss_stream.detach().item()),
-                "split_point": float(split_point),
-                **loss_dict_base,
-            }
-            return total_loss, loss_dict
+            raise ValueError("`mix_with_base_loss=true` is unsupported for episode-based streaming dataset.")
 
         return loss_stream, {
             "loss_streaming_action": float(loss_stream.detach().item()),
-            "split_point": float(split_point),
+            "bucket": float(bucket),
+            "mode_id": self._distribution_mode_to_id(mode),
+            "frontier": -1.0 if frontier is None else float(frontier),
         }

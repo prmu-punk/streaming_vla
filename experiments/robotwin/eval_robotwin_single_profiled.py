@@ -130,7 +130,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--async-video-layers-per-chunk", type=int, default=2)
     p.add_argument("--async-force-first-job", type=int, default=0)
     p.add_argument("--async-warmup-action-jobs", type=int, default=20)
-    p.add_argument("--async-control-dt-ms", type=float, default=50.0)
+    p.add_argument("--async-control-dt-ms", type=float, default=150.0)
     # --- model / inference knobs
     p.add_argument("--mixed-precision", default="bf16")
     p.add_argument("--replan-steps", type=int, default=24)

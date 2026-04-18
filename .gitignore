@@ -1,14 +1,20 @@
 
 # Misc
-outputs/
+/outputs/
 checkpoints
-data/
+/data/
 apex/
-assets/
+/assets/
+tmp/
 runs
 runs/
 evaluate_results/
 .deepspeed*
+
+# Keep third_party source trackable, but exclude RoboTwin asset payloads.
+/third_party/RoboTwin/assets/background_texture/
+/third_party/RoboTwin/assets/embodiments/
+/third_party/RoboTwin/assets/objects/
 
 
 # ai coding

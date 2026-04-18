@@ -31,6 +31,7 @@ extract_task_basename() {
 }
 
 TASK_BASENAME="train"
+TRAIN_ENTRY="scripts/train.py"
 for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
   arg="${EXTRA_ARGS[$i]}"
   case "${arg}" in
@@ -55,6 +56,10 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
       ;;
   esac
 done
+
+if [[ "${TASK_BASENAME}" == *"streaming_action_ft"* ]]; then
+  TRAIN_ENTRY="scripts/train_streaming_action_ft.py"
+fi
 
 if [[ -z "${RUN_ID:-}" ]]; then
   if (( NUM_MACHINES <= 1 )); then
@@ -110,7 +115,7 @@ echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} mac
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero2_ds.yaml \
   --num_processes "${NPROC_PER_NODE}" \
-  scripts/train.py \
+  "${TRAIN_ENTRY}" \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
   "wandb.name=${TASK_BASENAME}" \
   "${EXTRA_ARGS[@]}"

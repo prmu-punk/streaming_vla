@@ -10,7 +10,7 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime_profiled import AsyncStreamingActionRuntimeProfiled
+from experiments.libero.async_streaming_runtime_profiled import ProfiledRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_dummy_action, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
@@ -123,7 +123,7 @@ def run_single_episode_async(
     action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
 
     action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
-    runtime = AsyncStreamingActionRuntimeProfiled(
+    runtime = ProfiledRuntime(
         video_model=video_model,
         action_model=action_model,
         video_context=video_context,
@@ -193,12 +193,13 @@ def run_single_episode_async(
             runtime.reset_for_formal_phase(env_step=num_steps_wait)
 
             if warmup_action_jobs > 0:
-                warmup_t = num_steps_wait
+                warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
+                warmup_t = -int(warmup_span)
+                warmup_obs_index = -int(warmup_span)
                 warmup_obs_count = 0
                 warmup_first_triggered = False
                 while runtime.completed_jobs() < warmup_action_jobs:
-                    if (warmup_t - num_steps_wait) % obs_stride_env_steps == 0:
-                        warmup_obs_index = obs_counter
+                    if (warmup_t + int(warmup_span)) % obs_stride_env_steps == 0:
                         should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
                         if force_first_job and not warmup_first_triggered:
                             should_trigger = True
@@ -210,7 +211,7 @@ def run_single_episode_async(
                             obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
                             trigger_job=should_trigger,
                         )
-                        obs_counter += 1
+                        warmup_obs_index += 1
                         warmup_obs_count += 1
                         if should_trigger:
                             warmup_first_triggered = True

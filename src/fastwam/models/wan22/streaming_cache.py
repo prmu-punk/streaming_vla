@@ -14,7 +14,7 @@ class VideoCacheVersion:
     obs_timestamp_ms: float
     video_seq_len: int
     tokens_per_frame: int
-    cache_layers: list[Optional[dict[str, torch.Tensor]]]
+    cache_layers: list[Optional[dict[str, Any]]]
     context: torch.Tensor
     context_mask: torch.Tensor
     obs_index: int = -1
@@ -27,7 +27,7 @@ class CacheSnapshot:
     frontier: int
     video_seq_len: int
     tokens_per_frame: int
-    cache_layers: list[dict[str, torch.Tensor]]
+    cache_layers: list[dict[str, Any]]
     context: torch.Tensor
     context_mask: torch.Tensor
     obs_index: int = -1
@@ -45,6 +45,7 @@ class StreamingActionJob:
     context: torch.Tensor
     context_mask: torch.Tensor
     proprio: Optional[torch.Tensor] = None
+    trigger_obs_index: int = -1
     current_step_idx: int = 0
     snapshot_history: list[CacheSnapshot] = field(default_factory=list)
 
@@ -143,6 +144,7 @@ class StreamingCacheState:
             self.live_cache_layers[layer_idx] = {
                 "k": layer_cache["k"],
                 "v": layer_cache["v"],
+                "source_delta": int(layer_cache.get("source_delta", 0)),
             }
             self.live_context = version.context
             self.live_context_mask = version.context_mask
@@ -234,18 +236,18 @@ class StreamingCacheState:
             )
 
 
-def copy_cache_layer_refs(cache_layers: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
-    out: list[dict[str, torch.Tensor]] = []
+def copy_cache_layer_refs(cache_layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for layer in cache_layers:
         out.append(layer)
     return out
 
 
 def stitch_prefix_cache(
-    cache_new: list[dict[str, torch.Tensor]],
-    cache_old: list[dict[str, torch.Tensor]],
+    cache_new: list[dict[str, Any]],
+    cache_old: list[dict[str, Any]],
     split_point: int,
-) -> list[dict[str, torch.Tensor]]:
+) -> list[dict[str, Any]]:
     if len(cache_new) != len(cache_old):
         raise ValueError(
             f"`cache_new` and `cache_old` must have same layer count, got {len(cache_new)} and {len(cache_old)}."
@@ -254,13 +256,14 @@ def stitch_prefix_cache(
     if split_point < 0 or split_point > len(cache_new):
         raise ValueError(f"`split_point` must be in [0, {len(cache_new)}], got {split_point}.")
 
-    stitched: list[dict[str, torch.Tensor]] = []
+    stitched: list[dict[str, Any]] = []
     for idx in range(len(cache_new)):
         src = cache_new if idx < split_point else cache_old
         stitched.append(
             {
                 "k": src[idx]["k"],
                 "v": src[idx]["v"],
+                "source_delta": int(src[idx].get("source_delta", 0)),
             }
         )
     return stitched

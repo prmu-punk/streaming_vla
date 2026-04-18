@@ -10,11 +10,12 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime_profiled import AsyncStreamingActionRuntimeProfiled
+from experiments.libero.async_streaming_runtime_profiled import ProfiledRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.async_streaming_runner import AsyncStreamingRunner
 
 
 def _summarize_ms(samples_ms: list[float]) -> dict[str, float | int | None]:
@@ -143,7 +144,7 @@ def run_single_episode_async(
     action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
 
     action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
-    runtime = AsyncStreamingActionRuntimeProfiled(
+    runtime = ProfiledRuntime(
         video_model=video_model,
         action_model=action_model,
         video_context=video_context,
@@ -185,69 +186,43 @@ def run_single_episode_async(
 
         image, proprio, imgs = _encode_obs(obs)
         runtime.bootstrap_sync(input_image=image, obs_index=0, obs_timestamp_ms=0.0)
-        obs_counter = 0
         runtime.wait_until_idle()
         runtime.reset_for_formal_phase(env_step=0)
+        runner = AsyncStreamingRunner(
+            runtime=runtime,
+            obs_stride_env_steps=obs_stride_env_steps,
+            control_dt_ms=control_dt_ms,
+            force_first_job=force_first_job,
+        )
+        obs_counter = 0
 
         if warmup_action_jobs > 0:
-            warmup_t = 0
-            warmup_obs_count = 0
-            warmup_first_triggered = False
-            while runtime.completed_jobs() < warmup_action_jobs:
-                if warmup_t % obs_stride_env_steps == 0:
-                    warmup_obs_index = obs_counter
-                    should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
-                    if force_first_job and not warmup_first_triggered:
-                        should_trigger = True
-                    runtime.submit_observation(
-                        input_image=image,
-                        proprio=proprio,
-                        env_step=warmup_t,
-                        obs_index=warmup_obs_index,
-                        obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                        trigger_job=should_trigger,
-                    )
-                    obs_counter += 1
-                    warmup_obs_count += 1
-                    if should_trigger:
-                        warmup_first_triggered = True
-                runtime.get_action(warmup_t)
-                warmup_t += 1
-            runtime.wait_until_idle()
+            warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
+            warmup_start = -int(warmup_span)
+            obs_counter = runner.run_warmup(
+                input_image=image,
+                proprio=proprio,
+                warmup_action_jobs=warmup_action_jobs,
+                start_env_step=warmup_start,
+                start_obs_index=warmup_start,
+            )
             runtime.reset_for_formal_phase(env_step=0)
+        runner.start_formal_phase(obs_index_start=obs_counter)
 
         t = 0
         executed_env_steps = 0
-        formal_obs_count = 0
-        first_formal_triggered = False
         pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (async)")
         while executed_env_steps < max_steps:
-            if t % obs_stride_env_steps == 0:
-                formal_obs_index = obs_counter
-                should_trigger = runtime.should_trigger_on_obs(formal_obs_count + 1)
-                if force_first_job and not first_formal_triggered:
-                    should_trigger = True
-                runtime.submit_observation(
-                    input_image=image,
-                    proprio=proprio,
-                    env_step=t,
-                    obs_index=formal_obs_index,
-                    obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                    trigger_job=should_trigger,
-                )
-                obs_counter += 1
-                formal_obs_count += 1
-                if should_trigger:
-                    first_formal_triggered = True
-
+            runner.maybe_submit_formal_observation(
+                input_image=image,
+                proprio=proprio,
+                env_step=t,
+            )
             action = runtime.get_action(t)
             if collect_replay:
                 replay_images.append(imgs.copy())
-            while action is None:
-                if runtime.pending_jobs() <= 0:
-                    runtime.submit_action_job(env_step=t, proprio=proprio)
-                runtime.wait_until_idle()
-                action = runtime.get_action(t, count_miss=False)
+            if action is None:
+                action = runner.wait_for_action(env_step=t, proprio=proprio)
 
             obs, _, done, _, elapsed_ms = _step_env_with_min_dt(
                 env,

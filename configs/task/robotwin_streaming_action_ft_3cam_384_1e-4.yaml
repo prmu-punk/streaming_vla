@@ -1,12 +1,16 @@
 # @package _global_
 
 defaults:
-  - override /data: robotwin
+  - override /data: robotwin_streaming_episode_3cam
   - override /model: fastwam_streaming
   - _self_
 
-batch_size: 16
+batch_size: 96
 num_workers: 8
+dataloader_disable_shared_memory: true
+dataloader_pin_memory: false
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2
 
 model:
   mot_checkpoint_mixed_attn: false
@@ -15,25 +19,151 @@ model:
     proprio_to_action_only: true
     streaming_train:
       enabled: true
-      obs_gap_choices: [1, 2, 3]
-      obs_new_frame_choices: [1, 2]
       mix_with_base_loss: false
       lambda_streaming_action: 1.0
       lambda_base: 1.0
-      frontier:
-        min_layers: 4
-        max_layers: 30
-        random_jitter: 2
+      infer_num_inference_steps: 10
+      distribution:
+        0:
+          - mode: full_prev
+            prob: 0.9691358024691358
+          - mode: full_cur
+            prob: 0.024691358024691357
+          - mode: prev_to_cur
+            prob: 0.00411522633744856
+            frontier_min: 11
+            frontier_max: 26
+          - mode: full_next
+            prob: 0.00205761316872428
+        1:
+          - mode: prev_to_cur
+            prob: 0.7983539094650206
+            frontier_min: 16
+            frontier_max: 24
+          - mode: full_cur
+            prob: 0.19547325102880658
+          - mode: cur_to_next
+            prob: 0.00411522633744856
+            frontier_min: 11
+            frontier_max: 22
+          - mode: full_next
+            prob: 0.00205761316872428
+        2:
+          - mode: full_cur
+            prob: 0.9897119341563786
+          - mode: full_next
+            prob: 0.00823045267489712
+          - mode: cur_to_next
+            prob: 0.00205761316872428
+            frontier_min: 4
+            frontier_max: 4
+        3:
+          - mode: full_cur
+            prob: 0.977366255144033
+          - mode: full_next
+            prob: 0.01440329218106996
+          - mode: cur_to_next
+            prob: 0.00823045267489712
+            frontier_min: 8
+            frontier_max: 26
+        4:
+          - mode: full_cur
+            prob: 0.9382716049382716
+          - mode: full_next
+            prob: 0.03497942386831276
+          - mode: cur_to_next
+            prob: 0.026748971193415638
+            frontier_min: 2
+            frontier_max: 22
+        5:
+          - mode: full_cur
+            prob: 0.8888888888888888
+          - mode: full_next
+            prob: 0.05761316872427984
+          - mode: cur_to_next
+            prob: 0.043209876543209874
+            frontier_min: 5
+            frontier_max: 25
+          - mode: next_to_next2
+            prob: 0.00823045267489712
+            frontier_min: 8
+            frontier_max: 23
+          - mode: full_next2
+            prob: 0.00205761316872428
+        6:
+          - mode: full_cur
+            prob: 0.5102880658436214
+          - mode: cur_to_next
+            prob: 0.3148148148148148
+            frontier_min: 1
+            frontier_max: 25
+          - mode: full_next
+            prob: 0.15432098765432098
+          - mode: full_next2
+            prob: 0.012345679012345678
+          - mode: next_to_next2
+            prob: 0.00823045267489712
+            frontier_min: 5
+            frontier_max: 23
+        7:
+          - mode: full_next
+            prob: 0.588477366255144
+          - mode: cur_to_next
+            prob: 0.3786008230452675
+            frontier_min: 21
+            frontier_max: 29
+          - mode: full_next2
+            prob: 0.02263374485596708
+          - mode: full_cur
+            prob: 0.006172839506172839
+          - mode: next2_to_next3
+            prob: 0.00205761316872428
+            frontier_min: 1
+            frontier_max: 1
+          - mode: next_to_next2
+            prob: 0.00205761316872428
+            frontier_min: 6
+            frontier_max: 6
+        8:
+          - mode: full_next
+            prob: 0.9362139917695473
+          - mode: full_next2
+            prob: 0.030864197530864196
+          - mode: next_to_next2
+            prob: 0.0205761316872428
+            frontier_min: 2
+            frontier_max: 18
+          - mode: full_cur
+            prob: 0.006172839506172839
+          - mode: next2_to_next3
+            prob: 0.00411522633744856
+            frontier_min: 11
+            frontier_max: 27
+          - mode: full_next3
+            prob: 0.00205761316872428
+        9:
+          - mode: full_next
+            prob: 0.9032921810699589
+          - mode: full_next2
+            prob: 0.053497942386831275
+          - mode: next_to_next2
+            prob: 0.030864197530864196
+            frontier_min: 4
+            frontier_max: 24
+          - mode: full_cur
+            prob: 0.006172839506172839
+          - mode: full_next3
+            prob: 0.006172839506172839
 
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4
 num_epochs: 5
 max_steps: null
 log_every: 10
-save_every: 2500
-eval_every: 500
+save_every: 1000
+eval_every: 1000
 
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 weight_decay: 1e-2
 resume: null
 

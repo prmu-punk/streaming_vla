@@ -274,25 +274,28 @@ class Robot:
                                                [joint.get_name() for joint in self.right_entity.get_active_joints()],
                                                yml_path=abs_right_curobo_yml_path)
         else:
-            self.left_conn, left_child_conn = mp.Pipe()
-            self.right_conn, right_child_conn = mp.Pipe()
+            mp_ctx = mp.get_context("spawn")
+            self.left_conn, left_child_conn = mp_ctx.Pipe()
+            self.right_conn, right_child_conn = mp_ctx.Pipe()
 
             left_args = {
-                "origin_pose": self.left_entity_origion_pose,
+                "origin_pose_p": np.asarray(self.left_entity_origion_pose.p, dtype=np.float32).tolist(),
+                "origin_pose_q": np.asarray(self.left_entity_origion_pose.q, dtype=np.float32).tolist(),
                 "joints_name": self.left_arm_joints_name,
                 "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
                 "yml_path": abs_left_curobo_yml_path
             }
 
             right_args = {
-                "origin_pose": self.right_entity_origion_pose,
+                "origin_pose_p": np.asarray(self.right_entity_origion_pose.p, dtype=np.float32).tolist(),
+                "origin_pose_q": np.asarray(self.right_entity_origion_pose.q, dtype=np.float32).tolist(),
                 "joints_name": self.right_arm_joints_name,
                 "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
                 "yml_path": abs_right_curobo_yml_path
             }
 
-            self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
-            self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
+            self.left_proc = mp_ctx.Process(target=planner_process_worker, args=(left_child_conn, left_args))
+            self.right_proc = mp_ctx.Process(target=planner_process_worker, args=(right_child_conn, right_args))
 
             self.left_proc.daemon = True
             self.right_proc.daemon = True
@@ -660,10 +663,58 @@ class Robot:
 
 
 def planner_process_worker(conn, args):
+    import atexit
+    import faulthandler
     import os
+    from pathlib import Path
     from .planner import CuroboPlanner  # 或者绝对路径导入
 
-    planner = CuroboPlanner(args["origin_pose"], args["joints_name"], args["all_joints"], yml_path=args["yml_path"])
+    fault_dir_raw = os.environ.get("FASTWAM_FAULT_DIR", "").strip()
+    if fault_dir_raw:
+        handle = None
+        try:
+            fault_dir = Path(fault_dir_raw)
+            fault_dir.mkdir(parents=True, exist_ok=True)
+            fault_file = fault_dir / f"robotwin_planner_worker_pid{os.getpid()}_faulthandler.log"
+            handle = open(fault_file, "a", encoding="utf-8")
+            faulthandler.enable(file=handle, all_threads=True)
+        except Exception:
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            handle = None
+
+        if handle is not None:
+            def _flush_and_close() -> None:
+                try:
+                    handle.flush()
+                except Exception:
+                    pass
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+            atexit.register(_flush_and_close)
+
+    origin_pose = args.get("origin_pose", None)
+    if origin_pose is None:
+        class _PoseLike:
+            __slots__ = ("p", "q")
+
+            def __init__(self, p, q):
+                self.p = np.asarray(p, dtype=np.float32)
+                self.q = np.asarray(q, dtype=np.float32)
+
+        origin_pose = _PoseLike(args["origin_pose_p"], args["origin_pose_q"])
+
+    planner = CuroboPlanner(origin_pose, args["joints_name"], args["all_joints"], yml_path=args["yml_path"])
 
     while True:
         try:

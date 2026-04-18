@@ -133,6 +133,7 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     )
 
 
+## 支持遍历传入的所有suite（一级列表），取出对应task_id（二级列表）
 def _resolve_task_ids(task_suite, cfg: DictConfig) -> list[int]:
     n_tasks = int(task_suite.n_tasks)
     explicit = cfg.EVALUATION.get("collect_task_ids", None)
@@ -219,9 +220,12 @@ def main(cfg: DictConfig):
     input_w = int(video_size[1])
 
     benchmark_dict = benchmark.get_benchmark_dict()
+    
+    ## Edit here for muti suite
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
-    task_ids = _resolve_task_ids(task_suite, cfg)
+    task_ids = _resolve_task_ids(task_suite, cfg) ## need modify
     num_trials = int(cfg.EVALUATION.num_trials)
+    
     mode_prob_threshold = float(cfg.EVALUATION.get("collect_mode_prob_threshold", 0.0))
 
     step_mode_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))

@@ -25,6 +25,26 @@ from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_s
 logger = get_logger(__name__)
 
 
+def _non_shared_collate(batch):
+    elem = batch[0]
+
+    if isinstance(elem, torch.Tensor):
+        return torch.stack(batch, dim=0)
+    if isinstance(elem, np.ndarray):
+        return _non_shared_collate([torch.as_tensor(x) for x in batch])
+    if isinstance(elem, dict):
+        return {key: _non_shared_collate([d[key] for d in batch]) for key in elem}
+    if isinstance(elem, tuple):
+        return tuple(_non_shared_collate(items) for items in zip(*batch))
+    if isinstance(elem, list):
+        return [_non_shared_collate(items) for items in zip(*batch)]
+    if isinstance(elem, (float, int, np.floating, np.integer)):
+        return torch.as_tensor(batch)
+    if isinstance(elem, str):
+        return list(batch)
+    return batch
+
+
 class Wan22Trainer:
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
@@ -197,6 +217,8 @@ class Wan22Trainer:
             pin_memory=bool(getattr(self.cfg, "dataloader_pin_memory", torch.cuda.is_available())),
             worker_init_fn=worker_init_fn,
         )
+        if self.dataloader_disable_shared_memory:
+            loader_kwargs["collate_fn"] = _non_shared_collate
         if self.num_workers > 0:
             loader_kwargs["persistent_workers"] = bool(
                 getattr(self.cfg, "dataloader_persistent_workers", False)
@@ -412,7 +434,6 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
@@ -699,7 +720,7 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
-
+        
         while self.global_step < self.max_steps:
             try:
                 sample = next(data_iter)

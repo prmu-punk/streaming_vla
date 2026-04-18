@@ -9,7 +9,6 @@ from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
 import transforms3d as t3d
 import envs._GLOBAL_CONFIGS as CONFIGS
 
-
 try:
     # ********************** CuroboPlanner (optional) **********************
     from curobo.types.math import Pose as CuroboPose

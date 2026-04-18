@@ -38,30 +38,6 @@ class Base_Task(gym.Env):
     def __init__(self):
         pass
 
-    def _get_eval_video_frame(self):
-        obs = self.now_obs["observation"]
-        head_rgb = obs["head_camera"]["rgb"]
-
-        if "left_camera" not in obs or "right_camera" not in obs:
-            return head_rgb
-
-        left_rgb = obs["left_camera"]["rgb"]
-        right_rgb = obs["right_camera"]["rgb"]
-        bottom_rgb = np.concatenate([left_rgb, right_rgb], axis=1)
-        target_w = max(head_rgb.shape[1], bottom_rgb.shape[1])
-
-        def _pad_width(rgb, width):
-            if rgb.shape[1] == width:
-                return rgb
-            if rgb.shape[1] > width:
-                return rgb[:, :width, :]
-            pad_w = width - rgb.shape[1]
-            return np.pad(rgb, ((0, 0), (0, pad_w), (0, 0)), mode="constant")
-
-        head_rgb = _pad_width(head_rgb, target_w)
-        bottom_rgb = _pad_width(bottom_rgb, target_w)
-        return np.concatenate([head_rgb, bottom_rgb], axis=0)
-
     # =========================================================== Init Task Env ===========================================================
     def _init_task_env_(self, table_xy_bias=[0, 0], table_height_bias=0, **kwags):
         """
@@ -92,6 +68,7 @@ class Base_Task(gym.Env):
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
+
         self.need_topp = True  # TODO
 
         # Random
@@ -506,6 +483,7 @@ class Base_Task(gym.Env):
             pkl_dic["endpose"]["right_gripper"] = norm_gripper_val[1]
         # qpos
         if self.data_type.get("qpos", False):
+
             left_jointstate = self.robot.get_left_arm_jointState()
             right_jointstate = self.robot.get_right_arm_jointState()
 
@@ -520,6 +498,7 @@ class Base_Task(gym.Env):
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
+
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()
         self.cameras.update_picture()
@@ -1503,11 +1482,10 @@ class Base_Task(gym.Env):
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            eval_frame = self._get_eval_video_frame()
-            self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
+            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
-        # print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
+        print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
         self._update_render()
         if self.render_freq:
@@ -1680,8 +1658,7 @@ class Base_Task(gym.Env):
                 self.eval_success = True
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
-                    eval_frame = self._get_eval_video_frame()
-                    self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
+                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
         self._update_render()
