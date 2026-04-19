@@ -35,3 +35,5 @@ python experiments/libero/eval_libero_single_profiled.py --config-name sim_liber
 - 分布聚合：`experiments/libero/collect_libero_layer_distribution.py`
 - 训练核心实现：`src/fastwam/models/wan22/fastwam_streaming.py`
 
+在阅读项目时，你只需要从上面的入口文件进入，阅读部分较重要的代码文件即可。json等实验结果文件以及其他更加细节的代码，除非我们的讨论中涉及到这些内容，否则不要阅读
+

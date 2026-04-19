@@ -282,7 +282,7 @@ def _resolve_streaming_submit_obs(*, obs_history: list[dict[str, Any]]) -> tuple
         raise ValueError("obs_history must be non-empty when resolving streaming submit obs.")
 
     history_index = len(obs_history) - 1
-    selected_obs = _clone_obs_dict(obs_history[history_index])
+    selected_obs = clone_obs_dict(obs_history[history_index])
     meta = {
         "requested_source": "current",
         "applied_source": "current",
@@ -305,7 +305,7 @@ def _run_sync_anchor_chunk(
     task_description: str,
     anchor_step: int,
 ) -> dict[str, Any]:
-    obs = _clone_obs_dict(episode_obs_trace[int(anchor_step)])
+    obs = clone_obs_dict(episode_obs_trace[int(anchor_step)])
     image, proprio, _ = _encode_obs(
         obs,
         cfg=cfg,

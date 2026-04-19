@@ -78,6 +78,7 @@ class ExperimentSpec:
     name: str
     perturb_sources: list[str]
     perturb_steps: Optional[list[int]]
+    selected_steps_use_full_wrong_cache: bool = False
 
 
 @dataclass
@@ -116,6 +117,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-jobs-per-episode", type=int, default=None)
     parser.add_argument("--source-for-step-tests", default="curr")
     parser.add_argument("--wrong-obs-seed", type=int, default=0)
+    parser.add_argument("--save-job-results", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     return parser.parse_args()
 
@@ -290,17 +292,23 @@ def load_profile_jobs(
 
 
 def build_experiment_specs(*, source_for_step_tests: str) -> list[ExperimentSpec]:
-    chosen_source = str(source_for_step_tests)
+    _ = str(source_for_step_tests)  # Kept for CLI compatibility; step tests now ablate the full cache.
     return [
         ExperimentSpec(name="clean", perturb_sources=[], perturb_steps=None),
         ExperimentSpec(name="all-prev-wrong", perturb_sources=["prev"], perturb_steps=None),
         ExperimentSpec(name="all-curr-wrong", perturb_sources=["curr"], perturb_steps=None),
         ExperimentSpec(name="all-future-wrong", perturb_sources=["future"], perturb_steps=None),
-        ExperimentSpec(name=f"steps01-{chosen_source}-wrong", perturb_sources=[chosen_source], perturb_steps=[0, 1]),
         ExperimentSpec(
-            name=f"steps2plus-{chosen_source}-wrong",
-            perturb_sources=[chosen_source],
-            perturb_steps=list(range(2, 64)),
+            name="steps06-fullcache-wrong",
+            perturb_sources=[],
+            perturb_steps=[0, 5],
+            selected_steps_use_full_wrong_cache=True,
+        ),
+        ExperimentSpec(
+            name="steps6plus-fullcache-wrong",
+            perturb_sources=[],
+            perturb_steps=list(range(6, 64)),
+            selected_steps_use_full_wrong_cache=True,
         ),
     ]
 
@@ -377,12 +385,15 @@ def _build_profile_obs_index_schedule(
         else:
             formal_obs_offset = int(obs_index) - int(formal_obs_index_start)
             env_step = int(formal_obs_offset) * int(obs_stride_env_steps)
-            if env_step < 0 or env_step >= len(obs_trace):
+            if env_step < 0:
                 raise IndexError(
                     f"Profile requires obs_index={obs_index} -> env_step={env_step}, "
                     f"but obs_trace only has {len(obs_trace)} steps."
                 )
-            obs_dict = clone_obs_dict(obs_trace[env_step])
+            if env_step >= len(obs_trace):
+                obs_dict = clone_obs_dict(obs_trace[-1])
+            else:
+                obs_dict = clone_obs_dict(obs_trace[env_step])
         schedule[int(obs_index)] = (
             obs_dict,
             float(obs_index) * float(obs_stride_env_steps) * float(control_dt_ms),
@@ -544,17 +555,50 @@ def _get_required_wrong_obs_indices(*, jobs: list[ProfileJobTrace], experiment: 
     required: set[int] = set()
     step_filter = None if experiment.perturb_steps is None else set(int(v) for v in experiment.perturb_steps)
     source_filter = set(str(v) for v in experiment.perturb_sources)
-    if len(source_filter) == 0:
+    if not experiment.selected_steps_use_full_wrong_cache and len(source_filter) == 0:
         return required
     for job in jobs:
         for step in job.steps:
             if step_filter is not None and int(step.denoise_step) not in step_filter:
+                continue
+            if experiment.selected_steps_use_full_wrong_cache:
+                required.update(int(v) for v in step.layer_obs_indices)
                 continue
             for obs_index in step.layer_obs_indices:
                 source = classify_source(layer_obs_index=obs_index, trigger_obs_index=job.trigger_obs_index)
                 if source in source_filter:
                     required.add(int(obs_index))
     return required
+
+
+def _get_required_wrong_obs_indices_for_job(*, job: ProfileJobTrace, experiment: ExperimentSpec) -> set[int]:
+    required: set[int] = set()
+    step_filter = None if experiment.perturb_steps is None else set(int(v) for v in experiment.perturb_steps)
+    source_filter = set(str(v) for v in experiment.perturb_sources)
+    if not experiment.selected_steps_use_full_wrong_cache and len(source_filter) == 0:
+        return required
+    for step in job.steps:
+        if step_filter is not None and int(step.denoise_step) not in step_filter:
+            continue
+        if experiment.selected_steps_use_full_wrong_cache:
+            required.update(int(v) for v in step.layer_obs_indices)
+            continue
+        for obs_index in step.layer_obs_indices:
+            source = classify_source(layer_obs_index=int(obs_index), trigger_obs_index=int(job.trigger_obs_index))
+            if source in source_filter:
+                required.add(int(obs_index))
+    return required
+
+
+def _infer_formal_obs_index_start(*, jobs: list[ProfileJobTrace], obs_stride_env_steps: int) -> int:
+    candidates = {
+        int(job.trigger_obs_index) - (int(job.trigger_env_step) // int(obs_stride_env_steps))
+        for job in jobs
+        if int(job.trigger_env_step) % int(obs_stride_env_steps) == 0
+    }
+    if len(candidates) != 1:
+        raise ValueError(f"Failed to infer unique formal obs start: {sorted(candidates)}")
+    return int(next(iter(candidates)))
 
 
 def _move_layer_to_device(layer_cache: dict[str, torch.Tensor], *, device: str, dtype: torch.dtype) -> dict[str, Any]:
@@ -580,13 +624,14 @@ def _build_counterfactual_snapshot(
     step_filter = None if experiment.perturb_steps is None else set(int(v) for v in experiment.perturb_steps)
     source_filter = set(str(v) for v in experiment.perturb_sources)
     use_step_perturb = step_filter is None or int(step_trace.denoise_step) in step_filter
+    use_full_wrong_cache = bool(experiment.selected_steps_use_full_wrong_cache and use_step_perturb)
 
     layer_rows: list[dict[str, Any]] = []
     layer_obs_indices = [int(v) for v in step_trace.layer_obs_indices]
     reference_entry = clean_bank[int(layer_obs_indices[0])]
     for layer_idx, obs_index in enumerate(layer_obs_indices):
         source = classify_source(layer_obs_index=int(obs_index), trigger_obs_index=int(trigger_obs_index))
-        use_wrong = bool(use_step_perturb and source in source_filter)
+        use_wrong = bool(use_full_wrong_cache or (use_step_perturb and source in source_filter))
         bank = wrong_bank if use_wrong else clean_bank
         entry = bank[int(obs_index)]
         layer_rows.append(
@@ -635,6 +680,8 @@ def replay_one_job_counterfactual(
     cfg: DictConfig,
 ) -> np.ndarray:
     action_model.reset_streaming_state()
+    if len(job.steps) <= 0:
+        raise ValueError(f"Job {job.job_id} has no profiled denoise steps.")
     with torch.no_grad():
         job_state = action_model.start_action_job(
             action_horizon=int(action_horizon),
@@ -683,6 +730,39 @@ def _compute_chunk_metrics(*, pred_chunk: np.ndarray, gt_actions: np.ndarray, tr
         "head_mae": (None if head_len == 0 else float(np.mean(np.abs(head_diff)))),
         "first_action_mse": (None if first_diff is None else float(np.mean(np.square(first_diff)))),
     }
+
+
+def _summarize_result_rows(rows: list[dict[str, Any]], *, experiments: list[ExperimentSpec]) -> list[dict[str, Any]]:
+    metric_names = [
+        "chunk_len",
+        "whole_mse",
+        "whole_mae",
+        "head_mse",
+        "head_mae",
+        "first_action_mse",
+    ]
+    summaries: list[dict[str, Any]] = []
+    experiment_names = [str(exp.name) for exp in experiments]
+    for experiment_name in experiment_names:
+        matched = [row for row in rows if str(row.get("experiment")) == experiment_name]
+        summary: dict[str, Any] = {
+            "experiment": str(experiment_name),
+            "num_rows": int(len(matched)),
+        }
+        for metric_name in metric_names:
+            values = [float(row[metric_name]) for row in matched if row.get(metric_name) is not None]
+            if len(values) == 0:
+                summary[metric_name] = None
+                continue
+            arr = np.asarray(values, dtype=np.float64)
+            summary[metric_name] = {
+                "mean": float(np.mean(arr)),
+                "std": float(np.std(arr)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+            }
+        summaries.append(summary)
+    return summaries
 
 
 def _group_jobs_by_episode(jobs: list[ProfileJobTrace]) -> dict[int, list[ProfileJobTrace]]:
@@ -775,9 +855,11 @@ def main() -> None:
         "dataset_stats_path": str(dataset_stats_path),
         "cache_device": str(cache_device),
         "action_device": str(action_device),
+        "save_job_results": bool(args.save_job_results),
         "experiments": [asdict(exp) for exp in experiments],
         "episodes": [],
     }
+    all_result_rows: list[dict[str, Any]] = []
 
     for episode_idx, episode_jobs in sorted(grouped_jobs.items(), key=lambda kv: kv[0]):
         resolved_trial_idx = int(episode_idx) % len(initial_states)
@@ -804,6 +886,10 @@ def main() -> None:
         for job in episode_jobs:
             for step in job.steps:
                 obs_indices_for_clean.update(int(v) for v in step.layer_obs_indices)
+        formal_obs_index_start = _infer_formal_obs_index_start(
+            jobs=episode_jobs,
+            obs_stride_env_steps=obs_stride_env_steps,
+        )
 
         obs_schedule = _build_profile_obs_index_schedule(
             obs_trace=obs_trace,
@@ -831,7 +917,7 @@ def main() -> None:
             )
 
             for job in episode_jobs:
-                trigger_obs = obs_trace[int(job.trigger_env_step)]
+                trigger_obs, _ = obs_schedule[int(job.trigger_obs_index)]
                 _, trigger_proprio, _ = _encode_obs_cpu(
                     trigger_obs,
                     cfg=cfg,
@@ -861,6 +947,10 @@ def main() -> None:
                     gt_actions=gt_actions_env,
                     trigger_env_step=int(job.trigger_env_step),
                 )
+                job_required_wrong_obs_indices = _get_required_wrong_obs_indices_for_job(
+                    job=job,
+                    experiment=experiment,
+                )
                 episode_results.append(
                     {
                         "episode_idx": int(episode_idx),
@@ -868,21 +958,30 @@ def main() -> None:
                         "job_id": int(job.job_id),
                         "trigger_env_step": int(job.trigger_env_step),
                         "trigger_obs_index": int(job.trigger_obs_index),
-                        "required_wrong_obs_indices": sorted(int(v) for v in obs_indices_for_wrong),
+                        "normalized_trigger_obs_index": int(job.trigger_obs_index) - int(formal_obs_index_start),
+                        "required_wrong_obs_indices": sorted(int(v) for v in job_required_wrong_obs_indices),
+                        "normalized_required_wrong_obs_indices": sorted(
+                            int(v) - int(formal_obs_index_start) for v in job_required_wrong_obs_indices
+                        ),
                         **metrics,
                     }
                 )
+                all_result_rows.append(dict(episode_results[-1]))
 
-        results["episodes"].append(
-            {
-                "episode_idx": int(episode_idx),
-                "trial_idx": int(resolved_trial_idx),
-                "gt_episode_index": int(gt_episode_index),
-                "task_description": str(task_description),
-                "num_jobs": int(len(episode_jobs)),
-                "results": episode_results,
-            }
-        )
+        episode_payload: dict[str, Any] = {
+            "episode_idx": int(episode_idx),
+            "trial_idx": int(resolved_trial_idx),
+            "gt_episode_index": int(gt_episode_index),
+            "task_description": str(task_description),
+            "formal_obs_index_start": int(formal_obs_index_start),
+            "num_jobs": int(len(episode_jobs)),
+            "experiment_summaries": _summarize_result_rows(episode_results, experiments=experiments),
+        }
+        if bool(args.save_job_results):
+            episode_payload["results"] = episode_results
+        results["episodes"].append(episode_payload)
+
+    results["experiment_summaries"] = _summarize_result_rows(all_result_rows, experiments=experiments)
 
     output_path = Path(args.output_json).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
