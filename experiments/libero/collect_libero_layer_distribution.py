@@ -155,137 +155,68 @@ def _resolve_task_ids(task_suite, cfg: DictConfig) -> list[int]:
     return task_ids
 
 
-def _summarize_int_samples(samples: list[int]) -> dict[str, float | int | None]:
-    if len(samples) == 0:
-        return {
-            "count": 0,
-            "avg": None,
-            "p10": None,
-            "p50": None,
-            "p90": None,
-            "min": None,
-            "max": None,
-        }
-    arr = np.asarray(samples, dtype=np.float64)
+def _resolve_collect_suite_names(cfg: DictConfig, benchmark_dict: dict[str, Any]) -> list[str]:
+    explicit = cfg.EVALUATION.get("collect_task_suite_names", None)
+    if explicit is None:
+        explicit = cfg.MULTIRUN.get(
+            "task_suite_names",
+            ["libero_10", "libero_goal", "libero_spatial", "libero_object"],
+        )
+    if isinstance(explicit, str):
+        raw = [token.strip() for token in explicit.split(",") if token.strip()]
+    else:
+        raw = [str(v).strip() for v in list(explicit) if str(v).strip()]
+    if len(raw) == 0:
+        raise ValueError("No suites provided for collection. Set EVALUATION.collect_task_suite_names.")
+
+    suite_names: list[str] = []
+    seen = set()
+    for name in raw:
+        if name in seen:
+            continue
+        seen.add(name)
+        if name not in benchmark_dict:
+            raise ValueError(f"Unknown LIBERO suite: {name}")
+        suite_names.append(name)
+    return suite_names
+
+
+def _new_step_aggregator() -> dict[str, Any]:
     return {
-        "count": int(arr.shape[0]),
-        "avg": float(np.mean(arr)),
-        "p10": float(np.percentile(arr, 10)),
-        "p50": float(np.percentile(arr, 50)),
-        "p90": float(np.percentile(arr, 90)),
-        "min": float(np.min(arr)),
-        "max": float(np.max(arr)),
+        "step_mode_counts": defaultdict(lambda: defaultdict(int)),
+        "step_frontier_samples": defaultdict(lambda: defaultdict(list)),
+        "step_latest_offset_counts": defaultdict(lambda: defaultdict(int)),
+        "step_older_offset_counts": defaultdict(lambda: defaultdict(int)),
+        "step_age_counts": defaultdict(lambda: defaultdict(int)),
     }
 
 
-def _safe_close_env(env) -> None:
-    if hasattr(env, "close"):
-        try:
-            env.close()
-        except Exception:
-            logging.exception("Failed to close LIBERO env cleanly.")
+def _accumulate_layer_source_rows(aggregator: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    step_mode_counts = aggregator["step_mode_counts"]
+    step_frontier_samples = aggregator["step_frontier_samples"]
+    step_latest_offset_counts = aggregator["step_latest_offset_counts"]
+    step_older_offset_counts = aggregator["step_older_offset_counts"]
+    step_age_counts = aggregator["step_age_counts"]
+    for row in rows:
+        denoise_step = int(row["denoise_step"])
+        for mode, count in dict(row.get("mode_counts", {})).items():
+            step_mode_counts[denoise_step][str(mode)] += int(count)
+        for mode, values in dict(row.get("frontier_samples_by_mode", {})).items():
+            step_frontier_samples[denoise_step][str(mode)].extend(int(v) for v in list(values))
+        for key, count in dict(row.get("latest_offset_counts", {})).items():
+            step_latest_offset_counts[denoise_step][int(key)] += int(count)
+        for key, count in dict(row.get("older_offset_counts", {})).items():
+            step_older_offset_counts[denoise_step][int(key)] += int(count)
+        for key, count in dict(row.get("age_counts", {})).items():
+            step_age_counts[denoise_step][str(key)] += int(count)
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
-def main(cfg: DictConfig):
-    start_time = time.time()
-    partial_state = PartialState()
-    partial_state.config = cfg
-    render_gpu_device_id = _configure_egl_device(cfg)
-
-    if cfg.get("seed") is not None:
-        set_global_seed(int(cfg.seed), get_worker_init_fn=False)
-
-    model_device = _resolve_eval_device(cfg)
-    model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
-    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
-    action_model: Optional[torch.nn.Module] = None
-    if async_action_device != async_video_device:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
-        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
-    else:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
-
-    dataset_stats_path = _resolve_dataset_stats_path(cfg)
-    dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
-    processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
-    processor.set_normalizer_from_stats(dataset_stats)
-
-    action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
-    action_horizon = int(cfg.data.train.num_frames) - 1 if action_horizon_cfg is None else int(action_horizon_cfg)
-    if action_horizon <= 0:
-        raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
-    video_size = cfg.data.train.get("video_size", [224, 224])
-    input_h = int(video_size[0])
-    input_w = int(video_size[1])
-
-    benchmark_dict = benchmark.get_benchmark_dict()
-    
-    ## Edit here for muti suite
-    task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
-    task_ids = _resolve_task_ids(task_suite, cfg) ## need modify
-    num_trials = int(cfg.EVALUATION.num_trials)
-    
-    mode_prob_threshold = float(cfg.EVALUATION.get("collect_mode_prob_threshold", 0.0))
-
-    step_mode_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    step_frontier_samples: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
-    step_latest_offset_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    step_older_offset_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    step_age_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-
-    total_episodes = 0
-    task_episode_counts: dict[int, int] = defaultdict(int)
-    task_successes: dict[int, int] = defaultdict(int)
-    resolved_action_model = model if action_model is None else action_model
-
-    for task_id in task_ids:
-        task = task_suite.get_task(task_id)
-        initial_states = list(task_suite.get_task_init_states(task_id))
-        while len(initial_states) < num_trials:
-            initial_states.extend(initial_states[: (num_trials - len(initial_states))])
-        env, task_description = get_libero_env(
-            task,
-            LIBERO_ENV_RESOLUTION,
-            cfg.get("seed"),
-            render_gpu_device_id=render_gpu_device_id,
-        )
-        try:
-            for episode_idx in range(num_trials):
-                success, _, runtime_summary = run_single_episode_async(
-                    env=env,
-                    initial_state=initial_states[episode_idx],
-                    task_description=task_description,
-                    video_model=model,
-                    action_model=resolved_action_model,
-                    processor=processor,
-                    cfg=cfg,
-                    episode_idx=episode_idx,
-                    action_horizon=action_horizon,
-                    input_w=input_w,
-                    input_h=input_h,
-                    collect_replay=False,
-                )
-                total_episodes += 1
-                task_episode_counts[int(task_id)] += 1
-                if success:
-                    task_successes[int(task_id)] += 1
-
-                layer_source_stats = runtime_summary.get("layer_source_stats", {})
-                for row in layer_source_stats.get("per_step", []):
-                    denoise_step = int(row["denoise_step"])
-                    for mode, count in dict(row.get("mode_counts", {})).items():
-                        step_mode_counts[denoise_step][str(mode)] += int(count)
-                    for mode, values in dict(row.get("frontier_samples_by_mode", {})).items():
-                        step_frontier_samples[denoise_step][str(mode)].extend(int(v) for v in list(values))
-                    for key, count in dict(row.get("latest_offset_counts", {})).items():
-                        step_latest_offset_counts[denoise_step][int(key)] += int(count)
-                    for key, count in dict(row.get("older_offset_counts", {})).items():
-                        step_older_offset_counts[denoise_step][int(key)] += int(count)
-                    for key, count in dict(row.get("age_counts", {})).items():
-                        step_age_counts[denoise_step][str(key)] += int(count)
-        finally:
-            _safe_close_env(env)
+def _finalize_distribution(aggregator: dict[str, Any], *, mode_prob_threshold: float) -> dict[str, Any]:
+    step_mode_counts = aggregator["step_mode_counts"]
+    step_frontier_samples = aggregator["step_frontier_samples"]
+    step_latest_offset_counts = aggregator["step_latest_offset_counts"]
+    step_older_offset_counts = aggregator["step_older_offset_counts"]
+    step_age_counts = aggregator["step_age_counts"]
 
     per_step: list[dict[str, Any]] = []
     suggested_distribution: dict[str, list[dict[str, Any]]] = {}
@@ -367,41 +298,217 @@ def main(cfg: DictConfig):
             entries.append({"mode": str(mode), "prob": float(prob)})
         suggested_distribution[str(int(denoise_step))] = entries
 
-    task_summary = {
-        str(task_id): {
-            "episodes": int(task_episode_counts[int(task_id)]),
-            "successes": int(task_successes[int(task_id)]),
-        }
-        for task_id in task_ids
-    }
-    output = {
-        "task_suite": str(cfg.EVALUATION.task_suite_name),
-        "task_ids": [int(v) for v in task_ids],
-        "num_trials_per_task": int(num_trials),
-        "total_episodes": int(total_episodes),
-        "mode_prob_threshold": float(mode_prob_threshold),
-        "task_summary": task_summary,
+    return {
         "layer_source_distribution": {
             "enabled": True,
             "per_step": per_step,
         },
         "suggested_training_distribution": suggested_distribution,
+    }
+
+
+def _summarize_int_samples(samples: list[int]) -> dict[str, float | int | None]:
+    if len(samples) == 0:
+        return {
+            "count": 0,
+            "avg": None,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "min": None,
+            "max": None,
+        }
+    arr = np.asarray(samples, dtype=np.float64)
+    return {
+        "count": int(arr.shape[0]),
+        "avg": float(np.mean(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _safe_close_env(env) -> None:
+    if hasattr(env, "close"):
+        try:
+            env.close()
+        except Exception:
+            logging.exception("Failed to close LIBERO env cleanly.")
+
+
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+def main(cfg: DictConfig):
+    start_time = time.time()
+    partial_state = PartialState()
+    partial_state.config = cfg
+    render_gpu_device_id = _configure_egl_device(cfg)
+
+    if cfg.get("seed") is not None:
+        set_global_seed(int(cfg.seed), get_worker_init_fn=False)
+
+    model_device = _resolve_eval_device(cfg)
+    model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
+    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
+    action_model: Optional[torch.nn.Module] = None
+    if async_action_device != async_video_device:
+        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
+        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
+    else:
+        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
+
+    dataset_stats_path = _resolve_dataset_stats_path(cfg)
+    dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
+    processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
+    processor.set_normalizer_from_stats(dataset_stats)
+
+    action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
+    action_horizon = int(cfg.data.train.num_frames) - 1 if action_horizon_cfg is None else int(action_horizon_cfg)
+    if action_horizon <= 0:
+        raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
+    video_size = cfg.data.train.get("video_size", [224, 224])
+    input_h = int(video_size[0])
+    input_w = int(video_size[1])
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    suite_names = _resolve_collect_suite_names(cfg, benchmark_dict)
+    num_trials_per_task = int(cfg.EVALUATION.get("collect_num_trials_per_task", 5))
+    if num_trials_per_task <= 0:
+        raise ValueError(
+            f"EVALUATION.collect_num_trials_per_task must be positive, got {num_trials_per_task}."
+        )
+    mode_prob_threshold = float(cfg.EVALUATION.get("collect_mode_prob_threshold", 0.0))
+
+    global_aggregator = _new_step_aggregator()
+    global_total_episodes = 0
+    global_task_summary: dict[str, dict[str, dict[str, int]]] = {}
+    per_suite_outputs: dict[str, dict[str, Any]] = {}
+    resolved_action_model = model if action_model is None else action_model
+
+    for suite_name in suite_names:
+        task_suite = benchmark_dict[suite_name]()
+        task_ids = _resolve_task_ids(task_suite, cfg)
+        suite_aggregator = _new_step_aggregator()
+        suite_total_episodes = 0
+        task_episode_counts: dict[int, int] = defaultdict(int)
+        task_successes: dict[int, int] = defaultdict(int)
+
+        for task_id in task_ids:
+            task = task_suite.get_task(task_id)
+            initial_states = list(task_suite.get_task_init_states(task_id))
+            while len(initial_states) < num_trials_per_task:
+                initial_states.extend(initial_states[: (num_trials_per_task - len(initial_states))])
+            env, task_description = get_libero_env(
+                task,
+                LIBERO_ENV_RESOLUTION,
+                cfg.get("seed"),
+                render_gpu_device_id=render_gpu_device_id,
+            )
+            try:
+                for episode_idx in range(num_trials_per_task):
+                    success, _, runtime_summary = run_single_episode_async(
+                        env=env,
+                        initial_state=initial_states[episode_idx],
+                        task_description=task_description,
+                        video_model=model,
+                        action_model=resolved_action_model,
+                        processor=processor,
+                        cfg=cfg,
+                        episode_idx=episode_idx,
+                        action_horizon=action_horizon,
+                        input_w=input_w,
+                        input_h=input_h,
+                        collect_replay=False,
+                    )
+                    suite_total_episodes += 1
+                    global_total_episodes += 1
+                    task_episode_counts[int(task_id)] += 1
+                    if success:
+                        task_successes[int(task_id)] += 1
+
+                    layer_source_stats = runtime_summary.get("layer_source_stats", {})
+                    rows = list(layer_source_stats.get("per_step", []))
+                    _accumulate_layer_source_rows(suite_aggregator, rows)
+                    _accumulate_layer_source_rows(global_aggregator, rows)
+            finally:
+                _safe_close_env(env)
+
+        task_summary = {
+            str(task_id): {
+                "episodes": int(task_episode_counts[int(task_id)]),
+                "successes": int(task_successes[int(task_id)]),
+            }
+            for task_id in task_ids
+        }
+        suite_distribution = _finalize_distribution(
+            suite_aggregator,
+            mode_prob_threshold=mode_prob_threshold,
+        )
+        per_suite_outputs[suite_name] = {
+            "task_ids": [int(v) for v in task_ids],
+            "total_episodes": int(suite_total_episodes),
+            "task_summary": task_summary,
+            **suite_distribution,
+        }
+        global_task_summary[suite_name] = task_summary
+
+    global_distribution = _finalize_distribution(
+        global_aggregator,
+        mode_prob_threshold=mode_prob_threshold,
+    )
+    compat_task_suite = str(suite_names[0]) if len(suite_names) == 1 else "multi_suite"
+    compat_task_ids = (
+        [int(v) for v in per_suite_outputs[suite_names[0]]["task_ids"]]
+        if len(suite_names) == 1
+        else []
+    )
+    if len(suite_names) == 1:
+        compat_task_summary = dict(per_suite_outputs[suite_names[0]]["task_summary"])
+    else:
+        compat_task_summary = {
+            f"{suite_name}:{task_id}": stats
+            for suite_name, suite_summary in global_task_summary.items()
+            for task_id, stats in suite_summary.items()
+        }
+    output = {
+        "task_suite": compat_task_suite,
+        "task_ids": compat_task_ids,
+        "task_suites": [str(v) for v in suite_names],
+        "num_trials_per_task": int(num_trials_per_task),
+        "total_episodes": int(global_total_episodes),
+        "mode_prob_threshold": float(mode_prob_threshold),
+        "task_summary": compat_task_summary,
+        "layer_source_distribution": dict(global_distribution["layer_source_distribution"]),
+        "suggested_training_distribution": dict(global_distribution["suggested_training_distribution"]),
+        "global": {
+            "total_episodes": int(global_total_episodes),
+            "task_summary": global_task_summary,
+            **global_distribution,
+        },
+        "per_suite": per_suite_outputs,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "duration_sec": float(time.time() - start_time),
     }
 
-    output_dir = Path(cfg.EVALUATION.output_dir) / str(cfg.EVALUATION.task_suite_name)
+    if len(suite_names) == 1:
+        output_dir = Path(cfg.EVALUATION.output_dir) / str(suite_names[0])
+    else:
+        output_dir = Path(cfg.EVALUATION.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_name = cfg.EVALUATION.get("collect_output_file", None)
     if output_name is None:
-        output_name = f"gpu{int(cfg.gpu_id)}_layer_distribution.json"
+        if len(suite_names) == 1:
+            output_name = f"gpu{int(cfg.gpu_id)}_layer_distribution.json"
+        else:
+            output_name = f"gpu{int(cfg.gpu_id)}_layer_distribution_multi_suite.json"
     output_path = output_dir / str(output_name)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, cls=NumpyEncoder)
 
     print(
-        f"Layer distribution collection done | suite={cfg.EVALUATION.task_suite_name} "
-        f"tasks={len(task_ids)} episodes={total_episodes} output={output_path}"
+        f"Layer distribution collection done | suites={len(suite_names)} "
+        f"episodes={global_total_episodes} output={output_path}"
     )
     return output
 
