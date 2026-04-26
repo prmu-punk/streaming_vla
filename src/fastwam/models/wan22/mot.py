@@ -71,6 +71,10 @@ class MoT(nn.Module):
         with torch.no_grad():
             center_idx = self._source_delta_to_index(0)
             self.cache_time_embedding.weight[center_idx].zero_()
+            for mlp in list(self.cache_time_k_mlps) + list(self.cache_time_v_mlps):
+                final_linear = mlp[-1]
+                final_linear.weight.zero_()
+                final_linear.bias.zero_()
 
         for name in self.expert_order[1:]:
             expert = self.mixtures[name]
@@ -104,17 +108,39 @@ class MoT(nn.Module):
         layer_idx: int,
         k_video: torch.Tensor,
         v_video: torch.Tensor,
-        source_delta: int,
+        source_delta,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if torch.is_tensor(source_delta):
+            source_delta = source_delta.to(device=k_video.device, dtype=torch.int64).reshape(-1)
+            if source_delta.numel() == 1:
+                source_delta = int(source_delta.item())
+            else:
+                if source_delta.shape[0] != k_video.shape[0]:
+                    raise ValueError(
+                        f"`source_delta` batch mismatch for layer {layer_idx}: "
+                        f"got {tuple(source_delta.shape)} vs batch {k_video.shape[0]}"
+                    )
+                if torch.all(source_delta == 0):
+                    return k_video, v_video
+                delta_idx = torch.clamp(source_delta, min=-8, max=7) + 8
+                k_mlp = self.cache_time_k_mlps[layer_idx]
+                v_mlp = self.cache_time_v_mlps[layer_idx]
+                k_dtype = next(k_mlp.parameters()).dtype
+                v_dtype = next(v_mlp.parameters()).dtype
+                delta_emb = self.cache_time_embedding.weight[delta_idx].to(device=k_video.device)
+                k_res = k_mlp(delta_emb.to(dtype=k_dtype)).view(k_video.shape[0], 1, -1).to(dtype=k_video.dtype)
+                v_res = v_mlp(delta_emb.to(dtype=v_dtype)).view(v_video.shape[0], 1, -1).to(dtype=v_video.dtype)
+                return k_video + k_res, v_video + v_res
         if int(source_delta) == 0:
             return k_video, v_video
         delta_idx = self._source_delta_to_index(int(source_delta))
-        delta_emb = self.cache_time_embedding.weight[delta_idx].to(
-            device=k_video.device,
-            dtype=k_video.dtype,
-        )
-        k_res = self.cache_time_k_mlps[layer_idx](delta_emb).view(1, 1, -1)
-        v_res = self.cache_time_v_mlps[layer_idx](delta_emb).view(1, 1, -1)
+        k_mlp = self.cache_time_k_mlps[layer_idx]
+        v_mlp = self.cache_time_v_mlps[layer_idx]
+        k_dtype = next(k_mlp.parameters()).dtype
+        v_dtype = next(v_mlp.parameters()).dtype
+        delta_emb = self.cache_time_embedding.weight[delta_idx].to(device=k_video.device)
+        k_res = k_mlp(delta_emb.to(dtype=k_dtype)).view(1, 1, -1).to(dtype=k_video.dtype)
+        v_res = v_mlp(delta_emb.to(dtype=v_dtype)).view(1, 1, -1).to(dtype=v_video.dtype)
         return k_video + k_res, v_video + v_res
 
     @staticmethod
@@ -522,7 +548,7 @@ class MoT(nn.Module):
 
             k_video = layer_cache["k"]
             v_video = layer_cache["v"]
-            source_delta = int(layer_cache.get("source_delta", 0))
+            source_delta = layer_cache.get("source_delta", 0)
             if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
                 raise ValueError(
                     f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."

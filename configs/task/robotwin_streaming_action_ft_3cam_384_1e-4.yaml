@@ -7,7 +7,7 @@ defaults:
 
 batch_size: 96
 num_workers: 8
-dataloader_disable_shared_memory: true
+dataloader_disable_shared_memory: false
 dataloader_pin_memory: false
 dataloader_persistent_workers: true
 dataloader_prefetch_factor: 2

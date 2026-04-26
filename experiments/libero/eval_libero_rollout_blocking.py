@@ -10,11 +10,11 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime import StreamingRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_dummy_action, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.async_streaming_runtime import StreamingRuntime
 
 
 def _get_max_steps(task_suite_name: str) -> int:

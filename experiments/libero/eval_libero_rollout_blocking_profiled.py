@@ -10,11 +10,11 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime_profiled import ProfiledRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_dummy_action, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.async_streaming_runtime import StreamingRuntime
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -123,7 +123,7 @@ def run_single_episode_async(
     action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
 
     action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
-    runtime = ProfiledRuntime(
+    runtime = StreamingRuntime(
         video_model=video_model,
         action_model=action_model,
         video_context=video_context,
@@ -139,6 +139,7 @@ def run_single_episode_async(
         action_trigger_every_n_obs=trigger_every_n_obs,
         video_layers_per_chunk=video_layers_per_chunk,
         seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+        profile=True,
     )
 
     replay_images = []

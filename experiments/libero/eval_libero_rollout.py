@@ -10,11 +10,11 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime import StreamingRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.async_streaming_runtime import StreamingRuntime
 from fastwam.utils.async_streaming_runner import AsyncStreamingRunner
 
 
@@ -172,12 +172,11 @@ def run_single_episode_async(
             control_dt_ms=control_dt_ms,
             force_first_job=force_first_job,
         )
-        obs_counter = 0
-
+        formal_obs_index_start = 0
         if warmup_action_jobs > 0:
             warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
             warmup_start = -int(warmup_span)
-            obs_counter = runner.run_warmup(
+            formal_obs_index_start = runner.run_warmup(
                 input_image=image,
                 proprio=proprio,
                 warmup_action_jobs=warmup_action_jobs,
@@ -185,7 +184,7 @@ def run_single_episode_async(
                 start_obs_index=warmup_start,
             )
             runtime.reset_for_formal_phase(env_step=0)
-        runner.start_formal_phase(obs_index_start=obs_counter)
+        runner.start_formal_phase(obs_index_start=formal_obs_index_start)
 
         t = 0
         executed_env_steps = 0

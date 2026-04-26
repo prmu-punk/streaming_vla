@@ -337,11 +337,11 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
             control_dt_ms=self._async_control_dt_ms,
             force_first_job=self._async_force_first_job,
         )
-        obs_counter = 0
+        formal_obs_index_start = 0
         if self._async_warmup_action_jobs > 0:
             warmup_span = max(1, self._async_warmup_action_jobs) * max(1, self.action_horizon)
             warmup_start = -int(warmup_span)
-            obs_counter = self._runner.run_warmup(
+            formal_obs_index_start = self._runner.run_warmup(
                 input_image=image_cpu,
                 proprio=proprio,
                 warmup_action_jobs=self._async_warmup_action_jobs,
@@ -349,7 +349,7 @@ class StreamingWorldActionRobotWinPolicy(WorldActionRobotWinPolicy):
                 start_obs_index=warmup_start,
             )
         self._runtime.reset_for_formal_phase(env_step=0)
-        self._runner.start_formal_phase(obs_index_start=obs_counter)
+        self._runner.start_formal_phase(obs_index_start=formal_obs_index_start)
         self._episode_physical_elapsed_ms = 0.0
         self._next_obs_due_ms = 0.0
 

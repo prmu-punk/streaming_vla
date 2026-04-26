@@ -10,11 +10,11 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from experiments.libero.async_streaming_runtime_profiled import ProfiledRuntime
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
 from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.async_streaming_runtime import StreamingRuntime
 from fastwam.utils.async_streaming_runner import AsyncStreamingRunner
 
 
@@ -144,7 +144,7 @@ def run_single_episode_async(
     action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
 
     action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
-    runtime = ProfiledRuntime(
+    runtime = StreamingRuntime(
         video_model=video_model,
         action_model=action_model,
         video_context=video_context,
@@ -160,6 +160,7 @@ def run_single_episode_async(
         action_trigger_every_n_obs=trigger_every_n_obs,
         video_layers_per_chunk=video_layers_per_chunk,
         seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+        profile=True,
     )
 
     replay_images = []
@@ -194,12 +195,11 @@ def run_single_episode_async(
             control_dt_ms=control_dt_ms,
             force_first_job=force_first_job,
         )
-        obs_counter = 0
-
+        formal_obs_index_start = 0
         if warmup_action_jobs > 0:
             warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
             warmup_start = -int(warmup_span)
-            obs_counter = runner.run_warmup(
+            formal_obs_index_start = runner.run_warmup(
                 input_image=image,
                 proprio=proprio,
                 warmup_action_jobs=warmup_action_jobs,
@@ -207,7 +207,7 @@ def run_single_episode_async(
                 start_obs_index=warmup_start,
             )
             runtime.reset_for_formal_phase(env_step=0)
-        runner.start_formal_phase(obs_index_start=obs_counter)
+        runner.start_formal_phase(obs_index_start=formal_obs_index_start)
 
         t = 0
         executed_env_steps = 0
@@ -296,6 +296,7 @@ def run_single_task(
     }
     try:
         for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+            save_video = bool(cfg.EVALUATION.get("save_video", True))
             success, replay_images, runtime_summary = run_single_episode_async(
                 env=env,
                 initial_state=initial_states[trial_idx],
@@ -308,6 +309,7 @@ def run_single_task(
                 action_horizon=action_horizon,
                 input_w=input_w,
                 input_h=input_h,
+                collect_replay=save_video,
             )
             if success:
                 results["successes"] += 1
@@ -318,17 +320,19 @@ def run_single_task(
             results["async_runtime_episodes"].append(
                 {
                     "episode_idx": int(trial_idx),
+                    "success": bool(success),
                     **runtime_summary,
                 }
             )
 
-            save_rollout_video(
-                video_dir,
-                replay_images,
-                f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                success=success,
-                task_description=task_description,
-            )
+            if save_video:
+                save_rollout_video(
+                    video_dir,
+                    replay_images,
+                    f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                    success=success,
+                    task_description=task_description,
+                )
     finally:
         if hasattr(env, "close"):
             try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import re
 from typing import Any, Optional
 
 import torch
@@ -10,30 +11,6 @@ from .streaming_cache import stitch_prefix_cache
 
 
 class StreamingBackbone:
-    def _sample_split_point(self, timestep_action: torch.Tensor) -> int:
-        frontier_cfg = dict(self.streaming_train_cfg.get("frontier", {}))
-        min_layers = int(frontier_cfg.get("min_layers", 0))
-        max_layers = int(frontier_cfg.get("max_layers", self.mot.num_layers))
-        jitter = int(frontier_cfg.get("random_jitter", 0))
-        max_train_t = float(self.train_action_scheduler.num_train_timesteps)
-        progress = 1.0 - float(timestep_action.detach().float().mean().item()) / max(max_train_t, 1.0)
-        progress = max(0.0, min(1.0, progress))
-        split = min_layers + int(round(progress * max(0, max_layers - min_layers)))
-        if jitter > 0:
-            split = split + int(torch.randint(-jitter, jitter + 1, (1,)).item())
-        return max(0, min(self.mot.num_layers, split))
-
-    def _sample_noisy_triplet(
-        self,
-        target_action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = target_action.shape[0]
-        noise_action = torch.randn_like(target_action)
-        timestep_action = self._sample_batchwise_training_t(batch_size=batch_size, dtype=target_action.dtype)
-        noisy_action = self.train_action_scheduler.add_noise(target_action, noise_action, timestep_action)
-        target_noise = self.train_action_scheduler.training_target(target_action, noise_action, timestep_action)
-        return timestep_action, noisy_action, target_noise
-
     def _predict_stream_noise(
         self,
         *,
@@ -70,7 +47,8 @@ class StreamingBackbone:
         target_noise: torch.Tensor,
         timestep_action: torch.Tensor,
         action_is_pad: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_per_sample: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         action_loss_token = F.mse_loss(pred_action.float(), target_noise.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:
             valid = (~action_is_pad.to(device=action_loss_token.device, dtype=torch.bool)).to(
@@ -85,8 +63,69 @@ class StreamingBackbone:
             loss_stream.device,
             dtype=loss_stream.dtype,
         )
-        loss_stream = (loss_stream * action_weight).mean()
+        loss_stream_per_sample = loss_stream * action_weight
+        loss_stream = loss_stream_per_sample.mean()
+        if return_per_sample:
+            return loss_stream, loss_stream_per_sample
         return loss_stream
+
+    @staticmethod
+    def _metric_mode_name(mode: str) -> str:
+        mode = str(mode).strip()
+        if not mode:
+            mode = "unknown"
+        return re.sub(r"[^0-9A-Za-z_]+", "_", mode)
+
+    def _configured_replay_modes(self) -> list[str]:
+        cfg_dist = self.streaming_train_cfg.get("distribution", None)
+        modes: set[str] = set()
+        if cfg_dist is not None and hasattr(cfg_dist, "values"):
+            for entries in cfg_dist.values():
+                if entries is None:
+                    continue
+                for entry in entries:
+                    if hasattr(entry, "get") and entry.get("mode", None) is not None:
+                        modes.add(str(entry.get("mode")))
+        modes.add("other")
+        return sorted(modes)
+
+    def _replay_mode_loss_metrics(
+        self,
+        *,
+        loss_per_sample: torch.Tensor,
+        replay_modes: Any,
+    ) -> dict[str, float]:
+        if isinstance(replay_modes, str):
+            replay_modes = [replay_modes]
+        else:
+            replay_modes = [str(mode) for mode in list(replay_modes)]
+        if len(replay_modes) != int(loss_per_sample.shape[0]):
+            raise ValueError(
+                "`replay_mode` batch size mismatch: "
+                f"got {len(replay_modes)} modes for loss shape {tuple(loss_per_sample.shape)}."
+            )
+
+        configured_modes = self._configured_replay_modes()
+        configured_set = set(configured_modes)
+        mode_to_indices: dict[str, list[int]] = {mode: [] for mode in configured_modes}
+        for idx, mode in enumerate(replay_modes):
+            mode_to_indices[mode if mode in configured_set else "other"].append(idx)
+
+        metrics: dict[str, float] = {}
+        detached_loss = loss_per_sample.detach().float()
+        for mode in configured_modes:
+            metric_mode = self._metric_mode_name(mode)
+            indices = mode_to_indices[mode]
+            if indices:
+                index_tensor = torch.as_tensor(indices, device=detached_loss.device, dtype=torch.long)
+                mode_loss_sum = detached_loss.index_select(0, index_tensor).sum()
+                mode_count = float(len(indices))
+            else:
+                mode_loss_sum = torch.zeros((), device=detached_loss.device, dtype=detached_loss.dtype)
+                mode_count = 0.0
+            metrics[f"replay_mode/{metric_mode}_loss_sum"] = float(mode_loss_sum.item())
+            metrics[f"replay_mode/{metric_mode}_count"] = mode_count
+        return metrics
 
     def _extract_streaming_episode_batch(self, sample) -> Optional[dict[str, torch.Tensor]]:
         required_keys = {
@@ -125,6 +164,17 @@ class StreamingBackbone:
             "proprio_t": sample["proprio_t"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
             "context": context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
             "context_mask": context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True),
+            "replay_x_t": sample.get("replay_x_t", None).to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            if sample.get("replay_x_t", None) is not None
+            else None,
+            "replay_timestep": sample.get("replay_timestep", None).to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            if sample.get("replay_timestep", None) is not None
+            else None,
+            "replay_layer_cache_keys": sample.get("replay_layer_cache_keys", None),
+            "replay_denoise_step": sample.get("replay_denoise_step", None).to(device=self.device, dtype=torch.float32, non_blocking=True)
+            if sample.get("replay_denoise_step", None) is not None
+            else None,
+            "replay_mode": sample.get("replay_mode", None),
         }
 
     @staticmethod
@@ -135,11 +185,16 @@ class StreamingBackbone:
     ) -> list[dict[str, torch.Tensor]]:
         sliced: list[dict[str, torch.Tensor]] = []
         for layer in cache_layers:
+            source_delta = layer.get("source_delta", 0)
+            if torch.is_tensor(source_delta):
+                source_delta = source_delta[start:end]
+            else:
+                source_delta = int(source_delta)
             sliced.append(
                 {
                     "k": layer["k"][start:end],
                     "v": layer["v"][start:end],
-                    "source_delta": int(layer.get("source_delta", 0)),
+                    "source_delta": source_delta,
                 }
             )
         return sliced
@@ -301,21 +356,60 @@ class StreamingBackbone:
             )
         raise ValueError(f"Unsupported streaming cache mode: {normalized_mode}")
 
-    @staticmethod
-    def _distribution_mode_to_id(mode: str) -> float:
-        mode = StreamingBackbone._normalize_streaming_cache_mode(mode)
-        mapping = {
-            "full_prev": 0.0,
-            "prev_to_cur": 1.0,
-            "full_cur": 2.0,
-            "cur_to_next": 3.0,
-            "full_next": 4.0,
-            "next_to_next2": 5.0,
-            "full_next2": 6.0,
+    def _compose_replay_layer_cache(
+        self,
+        caches: dict[str, Any],
+        layer_cache_keys: list[str],
+    ) -> list[dict[str, torch.Tensor]]:
+        rows = [str(row).split(",") for row in layer_cache_keys]
+        if any(len(row) != self.mot.num_layers for row in rows):
+            raise ValueError(
+                f"Each replay layer-cache row must contain {self.mot.num_layers} comma-separated keys."
+            )
+        merged: list[dict[str, torch.Tensor]] = []
+        for layer_idx in range(self.mot.num_layers):
+            k_rows = []
+            v_rows = []
+            source_deltas = []
+            for sample_idx, row in enumerate(rows):
+                key = row[layer_idx]
+                if key not in caches:
+                    raise ValueError(f"Replay cache key `{key}` unavailable. Available: {sorted(caches)}")
+                layer = caches[key][layer_idx]
+                k_rows.append(layer["k"][sample_idx : sample_idx + 1])
+                v_rows.append(layer["v"][sample_idx : sample_idx + 1])
+                source_deltas.append(self._cache_key_to_source_delta(key))
+            merged.append(
+                {
+                    "k": torch.cat(k_rows, dim=0),
+                    "v": torch.cat(v_rows, dim=0),
+                    "source_delta": torch.as_tensor(
+                        source_deltas,
+                        device=k_rows[0].device,
+                        dtype=torch.int64,
+                    ),
+                }
+            )
+        return merged
+
+    def _summarize_replay_layer_cache_keys(self, layer_cache_keys: list[str]) -> dict[str, float]:
+        counts = {"prev": 0, "cur": 0, "next": 0, "next2": 0}
+        total = 0
+        offset_sum = 0.0
+        for row in layer_cache_keys:
+            for key in str(row).split(","):
+                key = key.strip()
+                counts[key] = counts.get(key, 0) + 1
+                total += 1
+                offset_sum += float(self._cache_key_to_source_delta(key))
+        denom = float(max(total, 1))
+        return {
+            "replay_source_offset": offset_sum / denom,
+            "replay_prev_ratio": float(counts.get("prev", 0)) / denom,
+            "replay_cur_ratio": float(counts.get("cur", 0)) / denom,
+            "replay_next_ratio": float(counts.get("next", 0)) / denom,
+            "replay_next2_ratio": float(counts.get("next2", 0)) / denom,
         }
-        if mode not in mapping:
-            raise ValueError(f"Unsupported streaming cache mode: {mode}")
-        return mapping[mode]
 
     @staticmethod
     def _streaming_cache_label_to_offset(label: str) -> int:
@@ -417,21 +511,54 @@ class StreamingBackbone:
             )
 
         target_action = episode_batch["target_action"]
-        timestep_action, noisy_action, target_noise = self._sample_noisy_triplet(target_action)
+        has_replay_xt = (
+            episode_batch.get("replay_x_t", None) is not None
+            and episode_batch.get("replay_timestep", None) is not None
+            and episode_batch.get("replay_layer_cache_keys", None) is not None
+        )
+        if not has_replay_xt:
+            present_keys = sorted(str(key) for key in sample.keys())
+            raise ValueError(
+                "Streaming action FT now only supports replay x_t training. "
+                "Expected `replay_x_t`, `replay_timestep`, and `replay_layer_cache_keys`. "
+                f"Present keys: {present_keys}"
+            )
 
-        bucket = self._map_training_timestep_to_bucket(timestep_action)
-        mode, frontier = self._sample_cache_distribution(bucket)
-        required_cache_keys = self._required_cache_keys_for_mode(mode)
+        timestep_action = episode_batch["replay_timestep"]
+        if timestep_action.ndim == 0:
+            timestep_action = timestep_action.expand(target_action.shape[0])
+        noisy_action = episode_batch["replay_x_t"]
+        sigma = (timestep_action / float(self.train_action_scheduler.num_train_timesteps)).to(
+            device=target_action.device,
+            dtype=target_action.dtype,
+        )
+        sigma = sigma.clamp(min=float(self.train_action_scheduler.eps))
+        target_noise = (noisy_action - target_action) / sigma.view(-1, *([1] * (target_action.ndim - 1)))
+        jitter = float(self.streaming_train_cfg.get("xt_timestep_jitter", 0.0))
+        if jitter > 0.0:
+            sigma_delta = torch.empty_like(sigma).uniform_(-jitter, jitter) / float(
+                int(self.streaming_train_cfg.get("infer_num_inference_steps", 10))
+            )
+            sigma = (sigma + sigma_delta).clamp(
+                min=float(self.train_action_scheduler.eps),
+                max=1.0,
+            )
+            timestep_action = sigma * float(self.train_action_scheduler.num_train_timesteps)
+            noisy_action = target_action + sigma.view(-1, *([1] * (target_action.ndim - 1))) * target_noise
+        required_cache_keys = ["prev", "cur", "next", "next2"]
         video_ctx = nullcontext() if not self.freeze_video_expert else torch.no_grad()
         with video_ctx:
             selected_caches = self._build_selected_video_cache_payload(
                 episode_batch,
                 required_cache_keys=required_cache_keys,
             )
-        stitched_cache = self._compose_distribution_cache(
+        layer_cache_keys = episode_batch["replay_layer_cache_keys"]
+        if isinstance(layer_cache_keys, str):
+            layer_cache_keys = [layer_cache_keys]
+        layer_cache_keys = [str(v) for v in layer_cache_keys]
+        stitched_cache = self._compose_replay_layer_cache(
             caches=selected_caches,
-            mode=mode,
-            frontier=frontier,
+            layer_cache_keys=layer_cache_keys,
         )
         pred_action = self._predict_stream_noise(
             noisy_action=noisy_action,
@@ -443,19 +570,28 @@ class StreamingBackbone:
             video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
             proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
         )
-        loss_stream = self._loss_stream_full_chunk(
+        loss_stream, loss_per_sample = self._loss_stream_full_chunk(
             pred_action=pred_action,
             target_noise=target_noise,
             timestep_action=timestep_action,
             action_is_pad=episode_batch["action_is_pad"],
+            return_per_sample=True,
         )
 
         if bool(self.streaming_train_cfg.get("mix_with_base_loss", False)):
             raise ValueError("`mix_with_base_loss=true` is unsupported for episode-based streaming dataset.")
 
-        return loss_stream, {
-            "loss_streaming_action": float(loss_stream.detach().item()),
-            "bucket": float(bucket),
-            "mode_id": self._distribution_mode_to_id(mode),
-            "frontier": -1.0 if frontier is None else float(frontier),
-        }
+        metrics = {}
+        replay_denoise_step = episode_batch.get("replay_denoise_step", None)
+        if replay_denoise_step is not None:
+            replay_denoise_step_f = replay_denoise_step.detach().float()
+            metrics["replay_denoise_step_std"] = float(replay_denoise_step_f.std(unbiased=False).item())
+        replay_modes = episode_batch.get("replay_mode", None)
+        if replay_modes is not None:
+            metrics.update(
+                self._replay_mode_loss_metrics(
+                    loss_per_sample=loss_per_sample,
+                    replay_modes=replay_modes,
+                )
+            )
+        return loss_stream, metrics

@@ -64,6 +64,7 @@ class StreamingRuntime:
         action_trigger_every_n_obs: int,
         video_layers_per_chunk: int,
         seed: Optional[int] = None,
+        profile: bool = False,
     ) -> None:
         if int(action_trigger_every_n_obs) <= 0:
             raise ValueError("`action_trigger_every_n_obs` must be positive.")
@@ -85,6 +86,7 @@ class StreamingRuntime:
         self.action_trigger_every_n_obs = int(action_trigger_every_n_obs)
         self.video_layers_per_chunk = int(video_layers_per_chunk)
         self.seed = seed
+        self.profile = bool(profile)
 
         self._ctx = mp.get_context("spawn")
         self._obs_queue = None
@@ -119,6 +121,7 @@ class StreamingRuntime:
         self._snapshot_copy_samples_ms: list[float] = []
         self._action_job_samples_raw_ms: list[float] = []
         self._job_records: list[dict[str, Any]] = []
+        self._reset_layer_source_stats()
 
     @staticmethod
     def _close_mp_queue(q) -> None:
@@ -201,6 +204,8 @@ class StreamingRuntime:
                 msg = self._result_queue.get_nowait()
             except queue.Empty:
                 break
+            except (FileNotFoundError, EOFError, OSError, ConnectionError):
+                break
             if str(msg.get("type")) != "job_done":
                 continue
             if not self._should_accept_job_result(msg):
@@ -213,6 +218,8 @@ class StreamingRuntime:
             self._action_job_samples_raw_ms.append(job_duration_ms)
             self._action_step_samples_ms.extend([float(v) for v in msg["job_step_samples_ms"]])
             self._snapshot_copy_samples_ms.extend([float(v) for v in msg["job_snapshot_copy_samples_ms"]])
+            if self.profile:
+                self._accumulate_layer_source_steps(msg.get("job_layer_source_steps", []))
             self._job_records.append(self._build_job_record(msg))
             action_chunk = self.action_postprocess(msg["latents_action_cpu"])
             self._publish_action_chunk(
@@ -248,8 +255,9 @@ class StreamingRuntime:
             },
             daemon=True,
         )
+        action_worker = _action_worker_loop_profiled if self.profile else _action_worker_loop
         self._action_process = self._ctx.Process(
-            target=_action_worker_loop,
+            target=action_worker,
             kwargs={
                 "action_model": self.action_model,
                 "action_context": self.action_context,
@@ -359,6 +367,7 @@ class StreamingRuntime:
         self._snapshot_copy_samples_ms = []
         self._action_job_samples_raw_ms = []
         self._job_records = []
+        self._reset_layer_source_stats()
 
     def submit_observation(
         self,
@@ -480,36 +489,6 @@ class StreamingRuntime:
             record["job_layer_source_steps"] = layer_source_steps
         return record
 
-    def stats(self) -> dict[str, object]:
-        self._sync_main_state()
-        return {
-            "phase_id": int(self._phase_id),
-            "submitted_obs": int(self._submitted_obs),
-            "submitted_jobs": int(self._submitted_jobs),
-            "completed_jobs": int(self._completed_jobs),
-            "actions_served": int(self._actions_served),
-            "actions_missed": int(self._actions_missed),
-            "dropped_prefix_actions": int(self._dropped_prefix_actions),
-            "timing_ms": {
-                "video_refresh": _summarize_ms(self._video_refresh_samples_ms),
-                "action_job": _summarize_ms(self._action_job_samples_ms),
-                "action_job_wall": _summarize_ms(self._action_job_wall_samples_ms),
-                "action_step": _summarize_ms(self._action_step_samples_ms),
-                "snapshot_copy": _summarize_ms(self._snapshot_copy_samples_ms),
-            },
-            "timing_samples_ms": {
-                "action_job": [float(v) for v in self._action_job_samples_raw_ms],
-                "action_job_wall": [float(v) for v in self._action_job_wall_samples_ms],
-            },
-            "job_records": list(self._job_records),
-        }
-
-
-class ProfiledRuntime(StreamingRuntime):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._reset_layer_source_stats()
-
     def _reset_layer_source_stats(self) -> None:
         self._layer_source_step_samples: dict[int, int] = defaultdict(int)
         self._layer_source_mode_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -519,113 +498,6 @@ class ProfiledRuntime(StreamingRuntime):
         self._layer_source_age_counts: dict[int, dict[str, int]] = defaultdict(
             lambda: {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}
         )
-
-    def start(self) -> None:
-        if self._started:
-            return
-        self._obs_queue = self._ctx.Queue(maxsize=1)
-        self._job_queue = self._ctx.Queue(maxsize=1)
-        self._layer_queue = self._ctx.Queue(maxsize=128)
-        self._result_queue = self._ctx.Queue(maxsize=16)
-        self._control_queue = self._ctx.Queue(maxsize=32)
-        self._video_process = self._ctx.Process(
-            target=_video_worker_loop,
-            kwargs={
-                "video_model": self.video_model,
-                "video_context": self.video_context,
-                "video_context_mask": self.video_context_mask,
-                "tiled": self.tiled,
-                "video_layers_per_chunk": self.video_layers_per_chunk,
-                "obs_queue": self._obs_queue,
-                "layer_queue": self._layer_queue,
-                "control_queue": self._control_queue,
-            },
-            daemon=True,
-        )
-        self._action_process = self._ctx.Process(
-            target=_action_worker_loop_profiled,
-            kwargs={
-                "action_model": self.action_model,
-                "action_context": self.action_context,
-                "action_context_mask": self.action_context_mask,
-                "action_horizon": self.action_horizon,
-                "num_inference_steps": self.num_inference_steps,
-                "sigma_shift": self.sigma_shift,
-                "rand_device": self.rand_device,
-                "seed": self.seed,
-                "layer_queue": self._layer_queue,
-                "job_queue": self._job_queue,
-                "result_queue": self._result_queue,
-                "control_queue": self._control_queue,
-            },
-            daemon=True,
-        )
-        self._video_process.start()
-        self._action_process.start()
-        self._started = True
-
-    def submit_observation(
-        self,
-        *,
-        input_image: torch.Tensor,
-        proprio: Optional[torch.Tensor],
-        env_step: int,
-        obs_index: int,
-        obs_timestamp_ms: float,
-        trigger_job: bool,
-    ) -> None:
-        self._poll_control_queue()
-        self._raise_if_error()
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        image_cpu = input_image.detach().to(device="cpu", dtype=torch.float32)
-        self._put_queue(
-            self._obs_queue,
-            {
-                "type": "obs",
-                "obs_index": int(obs_index),
-                "obs_timestamp_ms": float(obs_timestamp_ms),
-                "input_image": image_cpu,
-            },
-        )
-        self._submitted_obs += 1
-        self._obs_count += 1
-        if trigger_job:
-            self.submit_action_job(env_step=env_step, proprio=proprio, obs_index=obs_index)
-
-    def reset_for_formal_phase(self, *, env_step: int = 0) -> None:
-        super().reset_for_formal_phase(env_step=env_step)
-        self._reset_layer_source_stats()
-
-    def _drain_action_results(self) -> None:
-        if self._result_queue is None:
-            return
-        while True:
-            try:
-                msg = self._result_queue.get_nowait()
-            except queue.Empty:
-                break
-            except (FileNotFoundError, EOFError, OSError, ConnectionError):
-                break
-            if str(msg.get("type")) != "job_done":
-                continue
-            if not self._should_accept_job_result(msg):
-                continue
-            self._completed_jobs += 1
-            job_duration_ms = float(msg["job_duration_ms"])
-            job_wall_ms = float(msg["job_wall_ms"])
-            self._action_job_samples_ms.append(job_duration_ms)
-            self._action_job_wall_samples_ms.append(job_wall_ms)
-            self._action_job_samples_raw_ms.append(job_duration_ms)
-            self._action_step_samples_ms.extend([float(v) for v in msg["job_step_samples_ms"]])
-            self._snapshot_copy_samples_ms.extend([float(v) for v in msg["job_snapshot_copy_samples_ms"]])
-            self._accumulate_layer_source_steps(msg.get("job_layer_source_steps", []))
-            self._job_records.append(self._build_job_record(msg))
-            action_chunk = self.action_postprocess(msg["latents_action_cpu"])
-            self._publish_action_chunk(
-                action_chunk=np.asarray(action_chunk, dtype=np.float32),
-                trigger_env_step=int(msg["trigger_env_step"]),
-            )
 
     def _accumulate_layer_source_steps(self, layer_source_steps: list[dict[str, Any]]) -> None:
         for step in layer_source_steps:
@@ -706,15 +578,43 @@ class ProfiledRuntime(StreamingRuntime):
                 else {key: 0.0 for key in age_counts.keys()}
             )
         return {
-            "enabled": True,
+            "enabled": bool(self.profile),
             "num_layers": int(self.action_model.mot.num_layers),
             "per_step": per_step,
         }
 
     def stats(self) -> dict[str, object]:
-        payload = super().stats()
-        payload["layer_source_stats"] = self._build_layer_source_stats()
+        self._sync_main_state()
+        payload: dict[str, object] = {
+            "phase_id": int(self._phase_id),
+            "submitted_obs": int(self._submitted_obs),
+            "submitted_jobs": int(self._submitted_jobs),
+            "completed_jobs": int(self._completed_jobs),
+            "actions_served": int(self._actions_served),
+            "actions_missed": int(self._actions_missed),
+            "dropped_prefix_actions": int(self._dropped_prefix_actions),
+            "timing_ms": {
+                "video_refresh": _summarize_ms(self._video_refresh_samples_ms),
+                "action_job": _summarize_ms(self._action_job_samples_ms),
+                "action_job_wall": _summarize_ms(self._action_job_wall_samples_ms),
+                "action_step": _summarize_ms(self._action_step_samples_ms),
+                "snapshot_copy": _summarize_ms(self._snapshot_copy_samples_ms),
+            },
+            "timing_samples_ms": {
+                "action_job": [float(v) for v in self._action_job_samples_raw_ms],
+                "action_job_wall": [float(v) for v in self._action_job_wall_samples_ms],
+            },
+            "job_records": list(self._job_records),
+        }
+        if self.profile:
+            payload["layer_source_stats"] = self._build_layer_source_stats()
         return payload
+
+
+class ProfiledRuntime(StreamingRuntime):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["profile"] = True
+        super().__init__(*args, **kwargs)
 
 
 class SpawnInitRuntime(ProfiledRuntime):

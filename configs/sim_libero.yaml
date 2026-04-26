@@ -43,6 +43,20 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cuda
   tiled: false
+  save_video: true
+  schedule_output_path: ./data/trajectory_replay/libero_async_schedule/schedule.pt
+  schedule_shard_id: 0
+  schedule_num_shards: 1
+  collect_all_tasks: true
+  collect_task_ids: null
+  collect_task_suite_names:
+    - libero_10
+    - libero_goal
+    - libero_spatial
+    - libero_object
+  collect_num_trials_per_task: 5
+  collect_mode_prob_threshold: 0.0
+  collect_output_file: null
 
   # Optional external inputs
   dataset_stats_path: null
