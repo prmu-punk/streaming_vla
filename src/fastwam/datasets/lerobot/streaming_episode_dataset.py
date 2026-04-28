@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
 from .robot_video_dataset import DEFAULT_PROMPT, RobotVideoDataset
-
-
-_TRAJECTORY_REPLAY_REGISTRY: dict[str, list[dict[str, Any]]] = {}
-
-
-def register_trajectory_replay_records(key: str, records: list[dict[str, Any]]) -> None:
-    _TRAJECTORY_REPLAY_REGISTRY[str(key)] = records
 
 
 class StreamingRobotEpisodeDataset(RobotVideoDataset):
@@ -26,7 +19,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         keep_trigger_phase: bool = True,
         action_horizon: int = 32,
         episode_cache_size: int = 8,
-        trajectory_replay_key: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -48,7 +40,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         self.keep_trigger_phase = bool(keep_trigger_phase)
         self.action_horizon = int(action_horizon)
         self.episode_cache_size = max(int(episode_cache_size), 0)
-        self.trajectory_replay_key = None if trajectory_replay_key is None else str(trajectory_replay_key)
         self._episode_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
 
         # We query exact frames ourselves from the underlying LeRobot datasets.
@@ -56,16 +47,8 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         self.sample_index = self._build_sample_index()
         if not self.sample_index:
             raise ValueError("No valid streaming episode samples were constructed. Check stride/horizon settings.")
-        self.trajectory_replay_records = self._load_trajectory_replay_records()
-
-    def _load_trajectory_replay_records(self) -> list[dict[str, Any]]:
-        if self.trajectory_replay_key is not None:
-            return _TRAJECTORY_REPLAY_REGISTRY[self.trajectory_replay_key]
-        return []
 
     def __len__(self):
-        if self.trajectory_replay_records:
-            return len(self.trajectory_replay_records)
         return len(self.sample_index)
 
     def _build_sample_index(self) -> list[tuple[int, int, int]]:
@@ -207,10 +190,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         return batch["action"], batch["state"]
 
     def __getitem__(self, idx):
-        replay_record = None
-        if self.trajectory_replay_records:
-            replay_record = self.trajectory_replay_records[int(idx)]
-            idx = int(replay_record["dataset_index"])
         episode_idx, trigger_obs_idx, raw_action_start = self.sample_index[idx]
         payload = self._load_episode_cache(episode_idx)
 
@@ -262,14 +241,4 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             "raw_action_start": int(raw_action_start),
             "episode_idx": int(episode_idx),
         }
-        if replay_record is not None:
-            sample.update(
-                {
-                    "replay_x_t": replay_record["x_t"].float(),
-                    "replay_timestep": torch.as_tensor(float(replay_record["timestep"]), dtype=torch.float32),
-                    "replay_layer_cache_keys": ",".join(str(v) for v in replay_record["layer_cache_keys"]),
-                    "replay_denoise_step": torch.as_tensor(int(replay_record["denoise_step"]), dtype=torch.long),
-                    "replay_mode": str(replay_record.get("mode", "unknown")),
-                }
-            )
         return sample

@@ -84,11 +84,6 @@ class Wan22Trainer:
         auto_action_only = auto_action_only and bool(streaming_cfg.get("freeze_video_expert", False))
         auto_action_only = auto_action_only and bool(streaming_train_cfg.get("enabled", False))
         self.train_action_expert_only = bool(cfg.get("train_action_expert_only", auto_action_only))
-        self.rank_local_replay = bool(
-            cfg.get("data", None) is not None
-            and cfg.data.get("train", None) is not None
-            and cfg.data.train.get("trajectory_replay_key", None) is not None
-        )
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -170,14 +165,9 @@ class Wan22Trainer:
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
-        if self.rank_local_replay:
-            self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-                self.model, self.optimizer, self.scheduler
-            )
-        else:
-            self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
-                self.model, self.optimizer, self.train_loader, self.scheduler
-            )
+        self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, self.train_loader, self.scheduler
+        )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
@@ -187,24 +177,7 @@ class Wan22Trainer:
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
 
     def _configure_rank_local_deepspeed_batch_size(self):
-        if not self.rank_local_replay:
-            return
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        if deepspeed_plugin is None:
-            return
-        deepspeed_config = deepspeed_plugin.deepspeed_config
-        micro_batch_size = int(self.batch_size)
-        grad_accum = int(self.gradient_accumulation_steps)
-        global_batch_size = micro_batch_size * grad_accum * int(self.accelerator.num_processes)
-        deepspeed_config["train_micro_batch_size_per_gpu"] = micro_batch_size
-        deepspeed_config["gradient_accumulation_steps"] = grad_accum
-        deepspeed_config["train_batch_size"] = global_batch_size
-        logger.info(
-            "Rank-local replay sets DeepSpeed batch sizes: micro_batch=%d grad_accum=%d train_batch=%d",
-            micro_batch_size,
-            grad_accum,
-            global_batch_size,
-        )
+        return
 
     def _init_wandb(self):
         if not self.wandb_enabled or not self.accelerator.is_main_process:
@@ -247,7 +220,7 @@ class Wan22Trainer:
             dataset=dataset,
             seed=self.seed,
             batch_size=self.batch_size,
-            num_processes=1 if self.rank_local_replay else self.accelerator.num_processes,
+            num_processes=self.accelerator.num_processes,
         )
         loader_kwargs = dict(
             dataset=dataset,
@@ -270,18 +243,6 @@ class Wan22Trainer:
         return DataLoader(
             **loader_kwargs,
         )
-
-    def _build_replay_eval_loader(self):
-        loader_kwargs = dict(
-            dataset=self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-        )
-        if self.dataloader_disable_shared_memory:
-            loader_kwargs["collate_fn"] = _non_shared_collate
-        return DataLoader(**loader_kwargs)
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         if not hasattr(dataset, "__len__"):
@@ -311,10 +272,7 @@ class Wan22Trainer:
             raise TypeError("`train_dataset` must implement __len__ when `max_steps` is None.")
 
         num_processes = max(int(self.accelerator.num_processes), 1)
-        if self.rank_local_replay:
-            global_batch_size = max(self.batch_size, 1)
-        else:
-            global_batch_size = max(self.batch_size * num_processes, 1)
+        global_batch_size = max(self.batch_size * num_processes, 1)
         micro_steps_per_epoch = max(ceil(len(self.train_dataset) / global_batch_size), 1)
         opt_steps_per_epoch = max(
             ceil(micro_steps_per_epoch / self.gradient_accumulation_steps),
@@ -492,8 +450,6 @@ class Wan22Trainer:
     def evaluate(self):
         if self.val_dataset is None:
             return None
-        if self.rank_local_replay:
-            return self._evaluate_replay_loss()
 
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
@@ -694,40 +650,6 @@ class Wan22Trainer:
             result["action_l1"] = float(action_l1_mean)
         return result
 
-    @torch.no_grad()
-    def _evaluate_replay_loss(self):
-        model = self.accelerator.unwrap_model(self.model)
-        was_dit_training = model.dit.training
-        model.eval()
-
-        loss_sum = 0.0
-        sample_count = 0
-        for sample in self._build_replay_eval_loader():
-            with self.accelerator.autocast():
-                loss, _ = model.training_loss(sample)
-            if not torch.is_tensor(loss):
-                loss = torch.as_tensor(loss, device=self.accelerator.device)
-            loss = loss.detach().float().reshape(())
-            batch_size = 1
-            target_action = sample.get("target_action", None)
-            if isinstance(target_action, torch.Tensor) and target_action.ndim > 0:
-                batch_size = int(target_action.shape[0])
-            loss_sum += float(loss.item()) * batch_size
-            sample_count += batch_size
-
-        local_metrics = torch.tensor(
-            [loss_sum, float(sample_count)],
-            device=self.accelerator.device,
-            dtype=torch.float32,
-        ).unsqueeze(0)
-        gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
-        total_loss = float(gathered_metrics[:, 0].sum().item())
-        total_count = max(float(gathered_metrics[:, 1].sum().item()), 1.0)
-
-        if was_dit_training:
-            self._set_dit_only_train_mode()
-        return {"eval_replay_loss": total_loss / total_count}
-
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
@@ -779,9 +701,7 @@ class Wan22Trainer:
                     "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
                     self.epoch,
                     self.batch_in_epoch,
-                    self.batch_in_epoch
-                    * self.batch_size
-                    * (1 if self.rank_local_replay else self.accelerator.num_processes),
+                    self.batch_in_epoch * self.batch_size * self.accelerator.num_processes,
                 )
             else:
                 self.epoch = 0
@@ -811,12 +731,9 @@ class Wan22Trainer:
 
     def train(self):
         self._set_dit_only_train_mode()
-
         unwrapped_model = self.accelerator.unwrap_model(self.model)
-
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
-
         logger.info("Starting training with max_steps=%d.", self.max_steps)
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
@@ -874,24 +791,8 @@ class Wan22Trainer:
                     for key, value in loss_dict.items():
                         metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
                         gathered_metric = self.accelerator.gather(metric_tensor)
-                        if key.endswith("_loss_sum") or key.endswith("_count"):
-                            raw_global_loss_metrics[key] = float(gathered_metric.sum().item())
-                        else:
-                            raw_global_loss_metrics[key] = float(gathered_metric.mean().item())
-                    global_loss_metrics = {}
-                    replay_mode_loss_sums = {}
-                    for key, value in raw_global_loss_metrics.items():
-                        if key.startswith("replay_mode/") and key.endswith("_loss_sum"):
-                            replay_mode_loss_sums[key[: -len("_loss_sum")]] = value
-                        elif key.startswith("replay_mode/") and key.endswith("_count"):
-                            continue
-                        else:
-                            global_loss_metrics[key] = value
-                    for mode_key, loss_sum in sorted(replay_mode_loss_sums.items()):
-                        count = raw_global_loss_metrics.get(f"{mode_key}_count", 0.0)
-                        if count > 0.0:
-                            global_loss_metrics[f"{mode_key}_loss"] = loss_sum / count
-                            global_loss_metrics[f"{mode_key}_count"] = count
+                        raw_global_loss_metrics[key] = float(gathered_metric.mean().item())
+                    global_loss_metrics = raw_global_loss_metrics
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 

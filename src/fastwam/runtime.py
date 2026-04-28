@@ -454,61 +454,16 @@ def _run_training_once(cfg: DictConfig):
 
 def run_training(cfg: DictConfig):
     xt_cfg = cfg.get("xt_replay", None)
-    if xt_cfg is None:
-        raise ValueError("Replay x_t training requires an `xt_replay` config block.")
-
-    from fastwam.datasets.lerobot.streaming_episode_dataset import register_trajectory_replay_records
-
-    ckpt_cfg = cfg.get("resume", None)
-    if ckpt_cfg is None:
-        raise ValueError("Replay x_t training requires global `resume` to point at weights or a training state directory.")
-    schedule_path = xt_cfg.get("schedule_path", None)
-    if schedule_path is None:
-        raise ValueError("Replay x_t training requires `xt_replay.schedule_path`.")
-
-    from experiments.libero.build_xt_replay import collect_xt_replay_from_schedule
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-    base_records_total = int(xt_cfg.get("max_records", 1024))
-    replay_multiplier = max(int(xt_cfg.get("replay_multiplier", 4)), 1)
-    max_records_total = int(base_records_total * replay_multiplier)
-    max_records_per_rank = max((max_records_total + max(world_size, 1) - 1) // max(world_size, 1), 1)
-    eval_records_per_rank = min(64, max(max_records_per_rank // 32, 1))
-    replay_seed = int(cfg.seed) + max(int(cfg.get("max_steps", 0) or 0), 0) * 1009
-    records = collect_xt_replay_from_schedule(
-        cfg,
-        ckpt=str(ckpt_cfg),
-        schedule_path=str(schedule_path),
-        output_dir=Path(str(cfg.output_dir)) / "xt_replay_local" / f"rank_{rank}",
-        max_samples=max_records_per_rank + eval_records_per_rank,
-        max_records=max_records_per_rank + eval_records_per_rank,
-        seed=replay_seed,
-        device=_resolve_train_device(),
-        rand_device=str(xt_cfg.get("rand_device", "cpu")),
-        sample_start=rank,
-        sample_stride=max(world_size, 1),
-        save_to_disk=False,
-    )
-    if not isinstance(records, list) or len(records) == 0:
-        raise ValueError("No replay records were available for training.")
-
-    train_records = records[:max_records_per_rank]
-    eval_records = records[max_records_per_rank:]
-    if len(train_records) == 0 or len(eval_records) == 0:
-        raise ValueError(
-            f"Replay split produced empty train/eval records: train={len(train_records)} eval={len(eval_records)}."
-        )
-
-    replay_key = "xt_replay_offline"
-    eval_replay_key = "xt_replay_offline_eval"
-    register_trajectory_replay_records(replay_key, train_records)
-    register_trajectory_replay_records(eval_replay_key, eval_records)
     round_cfg = copy.deepcopy(cfg)
-    OmegaConf.update(round_cfg, "data.train.trajectory_replay_key", replay_key, force_add=True)
-    val_cfg = copy.deepcopy(round_cfg.data.train)
-    OmegaConf.update(val_cfg, "trajectory_replay_key", eval_replay_key, force_add=True)
-    OmegaConf.update(round_cfg, "data.val", val_cfg, force_add=True)
+    if xt_cfg is not None:
+        schedule_path = xt_cfg.get("schedule_path", None)
+        if schedule_path is not None:
+            OmegaConf.update(
+                round_cfg,
+                "model.streaming.streaming_train.schedule_path",
+                str(schedule_path),
+                force_add=True,
+            )
     _run_training_once(round_cfg)
 
 def run_inference(cfg: DictConfig):

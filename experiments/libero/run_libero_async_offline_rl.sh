@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Offline RL loop:
-#   rollout async schedules -> replay schedules into x_t -> train -> repeat
+# Streaming training loop:
+#   rollout async schedules -> train with real schedule pool -> repeat
 
 TASK="${TASK:-libero_streaming_action_ft_2cam224_1e-4}"
 SUITES="${SUITES:-libero_spatial libero_object libero_goal libero_10}"
@@ -14,8 +14,8 @@ INITIAL_CKPT="${INITIAL_CKPT:-/inspire/qb-ilm/project/robot-reasoning/xiangyushu
 RUN_ROOT="${RUN_ROOT:-./runs/libero_async_offline_rl/$(date +%Y-%m-%d_%H-%M-%S)}"
 REPLAY_ROOT="${REPLAY_ROOT:-./data/trajectory_replay/libero_async_offline_rl}"
 
-ROUNDS="${ROUNDS:-3}"
-SAVE_EVERY="${SAVE_EVERY:-250}"
+ROUNDS="${ROUNDS:-5}"
+SAVE_EVERY="${SAVE_EVERY:-400}"
 SEED="${SEED:-42}"
 RENDER_GPU="${RENDER_GPU:-}"
 
@@ -216,10 +216,10 @@ for ROUND in $(seq 0 $((ROUNDS - 1))); do
     BATCH=$((BATCH + 1))
   done
 
-  echo "[round ${ROUND}] collected $(schedule_count "${MERGED_SCHEDULE}") schedules, $(schedule_records "${MERGED_SCHEDULE}") replay steps -> ${MERGED_SCHEDULE}"
+  echo "[round ${ROUND}] collected $(schedule_count "${MERGED_SCHEDULE}") schedules, $(schedule_records "${MERGED_SCHEDULE}") schedule steps -> ${MERGED_SCHEDULE}"
 
   TARGET_STEP=$(((ROUND + 1) * SAVE_EVERY))
-  echo "[round ${ROUND}] train to step ${TARGET_STEP}; each rank samples x_t from schedule pool"
+  echo "[round ${ROUND}] train to step ${TARGET_STEP}; training samples real schedules online"
   CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" accelerate launch \
     --config_file "${ACCELERATE_CONFIG}" \
     --num_processes "${NPROC}" \
@@ -230,8 +230,7 @@ for ROUND in $(seq 0 $((ROUNDS - 1))); do
     "output_dir=${RUN_ROOT}/train" \
     "max_steps=${TARGET_STEP}" \
     "save_every=${SAVE_EVERY}" \
-    "xt_replay.schedule_path=${MERGED_SCHEDULE}" \
-    "xt_replay.max_records=${REPLAY}"
+    "xt_replay.schedule_path=${MERGED_SCHEDULE}"
 
   NEXT_STATE="${RUN_ROOT}/train/checkpoints/state/step_$(printf "%06d" "${TARGET_STEP}")"
   NEXT_WEIGHTS="${RUN_ROOT}/train/checkpoints/weights/step_$(printf "%06d" "${TARGET_STEP}").pt"
@@ -254,4 +253,4 @@ for ROUND in $(seq 0 $((ROUNDS - 1))); do
   echo "[round ${ROUND}] next train_resume=${CURRENT_TRAIN_RESUME}"
 done
 
-echo "[done] async offline RL finished. run_root=${RUN_ROOT}"
+echo "[done] streaming schedule training loop finished. run_root=${RUN_ROOT}"
