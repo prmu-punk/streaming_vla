@@ -120,8 +120,6 @@ class MoT(nn.Module):
                         f"`source_delta` batch mismatch for layer {layer_idx}: "
                         f"got {tuple(source_delta.shape)} vs batch {k_video.shape[0]}"
                     )
-                if torch.all(source_delta == 0):
-                    return k_video, v_video
                 delta_idx = torch.clamp(source_delta, min=-8, max=7) + 8
                 k_mlp = self.cache_time_k_mlps[layer_idx]
                 v_mlp = self.cache_time_v_mlps[layer_idx]
@@ -131,8 +129,6 @@ class MoT(nn.Module):
                 k_res = k_mlp(delta_emb.to(dtype=k_dtype)).view(k_video.shape[0], 1, -1).to(dtype=k_video.dtype)
                 v_res = v_mlp(delta_emb.to(dtype=v_dtype)).view(v_video.shape[0], 1, -1).to(dtype=v_video.dtype)
                 return k_video + k_res, v_video + v_res
-        if int(source_delta) == 0:
-            return k_video, v_video
         delta_idx = self._source_delta_to_index(int(source_delta))
         k_mlp = self.cache_time_k_mlps[layer_idx]
         v_mlp = self.cache_time_v_mlps[layer_idx]

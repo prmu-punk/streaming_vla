@@ -5,7 +5,7 @@ defaults:
   - override /model: fastwam_streaming
   - _self_
 
-batch_size: 64
+batch_size: 96
 num_workers: 8
 dataloader_disable_shared_memory: false
 dataloader_pin_memory: false
@@ -17,13 +17,17 @@ model:
   streaming:
     freeze_video_expert: true
     proprio_to_action_only: true
+    obs_stride: ${STREAMING.obs_stride}
     streaming_train:
       enabled: true
+      schedule_path: ${STREAMING.schedule_path}
       mix_with_base_loss: false
       lambda_streaming_action: 1.0
       lambda_base: 1.0
-      infer_num_inference_steps: 10
+      infer_num_inference_steps: 8
       xt_timestep_jitter: 0.0
+      position_decay_tau: 12.0
+      position_decay_power: 2.0
       distribution:
         0:
           - mode: full_prev

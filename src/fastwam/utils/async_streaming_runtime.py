@@ -302,21 +302,20 @@ class StreamingRuntime:
             self.wait_until_idle()
         except Exception:
             pass
-        if self._obs_queue is not None:
-            self._put_queue(self._obs_queue, {"type": "stop"})
         if self._job_queue is not None:
             self._put_queue(self._job_queue, {"type": "stop"})
-
-        if self._video_process is not None:
-            self._video_process.join(timeout=30.0)
-            if self._video_process.is_alive():
-                self._video_process.terminate()
-                self._video_process.join(timeout=5.0)
         if self._action_process is not None:
             self._action_process.join(timeout=30.0)
             if self._action_process.is_alive():
                 self._action_process.terminate()
                 self._action_process.join(timeout=5.0)
+        if self._obs_queue is not None:
+            self._put_queue(self._obs_queue, {"type": "stop"})
+        if self._video_process is not None:
+            self._video_process.join(timeout=30.0)
+            if self._video_process.is_alive():
+                self._video_process.terminate()
+                self._video_process.join(timeout=5.0)
 
         self._poll_control_queue()
         self._drain_action_results()

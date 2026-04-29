@@ -25,7 +25,7 @@ class ActionEnsembler:
             raise ValueError(f"No actions cached for timestamp {timestamp}")
         preds = self.action_cache[timestamp]
         stacked_preds = np.stack(preds, axis=0)
-        return np.mean(stacked_preds, axis=0)
+        return stacked_preds[-1]
 
     def _cleanup(self, current_timestamp: int):
         keys_to_delete = [ts for ts in self.action_cache.keys() if ts < current_timestamp]

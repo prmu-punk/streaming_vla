@@ -453,10 +453,10 @@ def _run_training_once(cfg: DictConfig):
 
 
 def run_training(cfg: DictConfig):
-    xt_cfg = cfg.get("xt_replay", None)
     round_cfg = copy.deepcopy(cfg)
-    if xt_cfg is not None:
-        schedule_path = xt_cfg.get("schedule_path", None)
+    streaming_cfg = cfg.get("STREAMING", None)
+    if streaming_cfg is not None:
+        schedule_path = streaming_cfg.get("schedule_path", None)
         if schedule_path is not None:
             OmegaConf.update(
                 round_cfg,

@@ -459,10 +459,13 @@ class Wan22Trainer:
         eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
-        # 1. training loss
+        # 1. validation loss
         with self.accelerator.autocast():
-            val_loss, _ = model.training_loss(sample)
-            val_loss = val_loss.float().item()
+            if hasattr(model, "evaluate_streaming_action_mse") and bool(getattr(model, "streaming_train_cfg", {}).get("enabled", False)):
+                val_loss = float(model.evaluate_streaming_action_mse(sample)["val_loss"])
+            else:
+                val_loss, _ = model.training_loss(sample)
+                val_loss = val_loss.float().item()
 
         if "video" not in sample:
             local_metrics = torch.tensor(
@@ -732,6 +735,8 @@ class Wan22Trainer:
     def train(self):
         self._set_dit_only_train_mode()
         unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_model._load_real_schedule_pool()
+        self.accelerator.wait_for_everyone()
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
         logger.info("Starting training with max_steps=%d.", self.max_steps)
@@ -842,7 +847,7 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            primary_metric = "eval_replay_loss" if "eval_replay_loss" in metrics else "val_loss"
+                            primary_metric = "val_loss"
                             description = "[eval] step=%d %s=%.4f" % (
                                 self.global_step,
                                 primary_metric,
@@ -859,7 +864,7 @@ class Wan22Trainer:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
                             logger.info(description)
                             eval_payload = {}
-                            for key in ("eval_replay_loss", "val_loss", "psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"):
+                            for key in ("val_loss", "psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"):
                                 if key in metrics:
                                     eval_payload[f"eval/{key}"] = float(metrics[key])
                             if "action_l2" in metrics:

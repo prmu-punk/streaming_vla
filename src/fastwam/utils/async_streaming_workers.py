@@ -44,6 +44,16 @@ def _video_worker_loop(
     control_queue,
 ) -> None:
     video_refresh_samples_ms: list[float] = []
+
+    def _export_layer_cache(layer_cache: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # Do not queue the live cache storage directly across processes; clone onto
+        # independent GPU storage before handing it to the action worker.
+        return {
+            "k": layer_cache["k"].detach().clone(),
+            "v": layer_cache["v"].detach().clone(),
+            "source_delta": int(layer_cache.get("source_delta", 0)),
+        }
+
     try:
         video_model = video_model.to(video_model.device).eval()
         if video_model.device.type == "cuda":
@@ -96,6 +106,7 @@ def _video_worker_loop(
                 for layer_idx, layer_cache in enumerate(version.cache_layers):
                     if layer_cache is None:
                         raise RuntimeError(f"Bootstrap layer {layer_idx} is None.")
+                    exported = _export_layer_cache(layer_cache)
                     layer_queue.put(
                         {
                             "type": "layer_update",
@@ -105,9 +116,9 @@ def _video_worker_loop(
                             "obs_timestamp_ms": float(version.obs_timestamp_ms),
                             "video_seq_len": int(version.video_seq_len),
                             "tokens_per_frame": int(version.tokens_per_frame),
-                            "k": layer_cache["k"].detach(),
-                            "v": layer_cache["v"].detach(),
-                            "source_delta": int(layer_cache.get("source_delta", 0)),
+                            "k": exported["k"],
+                            "v": exported["v"],
+                            "source_delta": exported["source_delta"],
                         }
                     )
                 video_refresh_samples_ms.append((time.perf_counter() - t0) * 1000.0)
@@ -129,6 +140,7 @@ def _video_worker_loop(
                     "source_delta": int(layer_cache.get("source_delta", 0)),
                 }
                 video_model.streaming_cache_state.apply_layer_update(version, layer_idx, ready_event=None)
+                exported = _export_layer_cache(layer_cache)
                 layer_queue.put(
                     {
                         "type": "layer_update",
@@ -138,9 +150,9 @@ def _video_worker_loop(
                         "obs_timestamp_ms": float(version.obs_timestamp_ms),
                         "video_seq_len": int(version.video_seq_len),
                         "tokens_per_frame": int(version.tokens_per_frame),
-                        "k": layer_cache["k"].detach(),
-                        "v": layer_cache["v"].detach(),
-                        "source_delta": int(layer_cache.get("source_delta", 0)),
+                        "k": exported["k"],
+                        "v": exported["v"],
+                        "source_delta": exported["source_delta"],
                     }
                 )
 

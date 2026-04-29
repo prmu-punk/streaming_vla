@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -12,6 +12,7 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
     def __init__(
         self,
         *args,
+        obs_stride: Optional[int] = None,
         effective_obs_stride: int = 3,
         history_obs: int = 1,
         future_obs: int = 2,
@@ -21,6 +22,8 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         episode_cache_size: int = 8,
         **kwargs,
     ):
+        if obs_stride is not None:
+            effective_obs_stride = int(obs_stride)
         super().__init__(*args, **kwargs)
         if effective_obs_stride <= 0:
             raise ValueError(f"`effective_obs_stride` must be positive, got {effective_obs_stride}.")

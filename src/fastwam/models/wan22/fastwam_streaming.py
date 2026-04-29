@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -54,6 +55,78 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         if bool(self.streaming_train_cfg.get("enabled", False)):
             return self.training_loss_streaming_action_ft(sample, tiled=tiled)
         return super().training_loss(sample, tiled=tiled)
+
+    @torch.no_grad()
+    def evaluate_streaming_action_mse(self, sample) -> dict[str, float]:
+        schedule_path = self.streaming_train_cfg.get("schedule_path", None)
+        if schedule_path is None:
+            raise ValueError("Streaming eval requires `model.streaming.streaming_train.schedule_path`.")
+
+        payload = torch.load(str(Path(str(schedule_path)).expanduser().resolve()), map_location="cpu")
+        schedules = payload.get("schedules", payload) if isinstance(payload, dict) else payload
+        if not isinstance(schedules, list) or len(schedules) == 0:
+            raise ValueError(f"Schedule file has no schedule traces: {schedule_path}")
+
+        episode_batch = self._extract_streaming_episode_batch(sample)
+        schedule_index = int(torch.randint(len(schedules), (1,), device=self.device).item())
+        schedule = dict(schedules[schedule_index])
+        schedule_steps = sorted(list(schedule.get("steps", [])), key=lambda row: int(row["denoise_step"]))
+        target_action = episode_batch["target_action"]
+        action_is_pad = episode_batch.get("action_is_pad", None)
+        caches = self._build_selected_video_cache_payload(
+            episode_batch,
+            required_cache_keys=["prev", "cur", "next", "next2"],
+        )
+        job = self.start_action_job(
+            action_horizon=int(target_action.shape[1]),
+            context=episode_batch["context"],
+            context_mask=episode_batch["context_mask"],
+            proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
+            trigger_obs_index=int(schedule.get("trigger_obs_index", 0)),
+            num_inference_steps=len(schedule_steps),
+            rand_device=str(self.device),
+        )
+
+        trigger_obs_index = int(schedule.get("trigger_obs_index", 0))
+        for step_idx, step in enumerate(schedule_steps):
+            if int(step["denoise_step"]) != step_idx:
+                raise ValueError(
+                    f"Schedule {schedule_index} denoise step mismatch: expected {step_idx}, got {step['denoise_step']}."
+                )
+            layer_obs_indices = [int(v) for v in list(step["layer_obs_indices"])]
+            layer_cache_keys = [
+                self._cache_key_from_offset(layer_obs_index - trigger_obs_index)
+                for layer_obs_index in layer_obs_indices
+            ]
+            cache_layers = self._compose_replay_layer_cache(
+                caches=caches,
+                layer_cache_keys=[",".join(layer_cache_keys)],
+            )
+            snapshot = CacheSnapshot(
+                version=step_idx,
+                obs_timestamp_ms=0.0,
+                frontier=int(step.get("frontier", self.mot.num_layers)),
+                video_seq_len=int(caches["video_seq_len"]),
+                tokens_per_frame=int(caches["tokens_per_frame"]),
+                cache_layers=cache_layers,
+                context=episode_batch["context"],
+                context_mask=episode_batch["context_mask"],
+                obs_index=int(max(layer_obs_indices)),
+                layer_version_ids=[step_idx] * int(self.mot.num_layers),
+                layer_obs_indices=layer_obs_indices,
+                layer_obs_timestamps_ms=[0.0] * int(self.mot.num_layers),
+                layer_ready_events=[None] * int(self.mot.num_layers),
+            )
+            self.step_action_job(job, snapshot=snapshot)
+
+        diff = (job.latents_action.detach().float() - target_action.detach().float()).pow(2).mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad.to(device=diff.device, dtype=torch.bool)).to(dtype=diff.dtype)
+            diff = (diff * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        else:
+            diff = diff.mean(dim=1)
+        action_mse = diff.mean()
+        return {"val_loss": float(action_mse.item())}
 
     def _resolve_streaming_condition_inputs(
         self,
@@ -354,6 +427,26 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             video_seq_len=snapshot.video_seq_len,
             proprio=job.proprio,
         )
+        if int(job.trigger_obs_index) >= 0:
+            current_offsets = torch.as_tensor(
+                [
+                    int(layer_obs_index) - int(job.trigger_obs_index)
+                    for layer_obs_index in snapshot.layer_obs_indices
+                ],
+                device=job.latents_action.device,
+                dtype=job.latents_action.dtype,
+            )
+            position_anchor = self._offset_to_chunk_anchor(
+                current_offsets.mean().unsqueeze(0),
+                action_horizon=int(job.latents_action.shape[1]),
+            )
+            position_weight = self._build_position_decay_weight(
+                anchor=position_anchor,
+                action_horizon=int(job.latents_action.shape[1]),
+                device=job.latents_action.device,
+                dtype=job.latents_action.dtype,
+            ).unsqueeze(-1)
+            pred_action = pred_action * position_weight
         job.latents_action = self.infer_action_scheduler.step(pred_action, step_delta, job.latents_action)
         job.snapshot_history.append(snapshot)
         job.current_step_idx += 1

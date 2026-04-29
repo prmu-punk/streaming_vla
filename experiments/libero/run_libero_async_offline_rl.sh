@@ -10,7 +10,7 @@ TASKS_PER_SUITE="${TASKS_PER_SUITE:-10}"
 TRIALS="${TRIALS:-2}"
 REPLAY="${REPLAY:-4096}"
 
-INITIAL_CKPT="${INITIAL_CKPT:-/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/FastWAM/checkpoints/fastwam_release/libero_uncond_2cam224.pt}"
+INITIAL_CKPT="${INITIAL_CKPT:-/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/FastWAM/runs/libero_async_offline_rl/2026-04-28_12-21-23/train/checkpoints/weights/step_000400.pt}"
 RUN_ROOT="${RUN_ROOT:-./runs/libero_async_offline_rl/$(date +%Y-%m-%d_%H-%M-%S)}"
 REPLAY_ROOT="${REPLAY_ROOT:-./data/trajectory_replay/libero_async_offline_rl}"
 
@@ -230,7 +230,7 @@ for ROUND in $(seq 0 $((ROUNDS - 1))); do
     "output_dir=${RUN_ROOT}/train" \
     "max_steps=${TARGET_STEP}" \
     "save_every=${SAVE_EVERY}" \
-    "xt_replay.schedule_path=${MERGED_SCHEDULE}"
+    "STREAMING.schedule_path=${MERGED_SCHEDULE}"
 
   NEXT_STATE="${RUN_ROOT}/train/checkpoints/state/step_$(printf "%06d" "${TARGET_STEP}")"
   NEXT_WEIGHTS="${RUN_ROOT}/train/checkpoints/weights/step_$(printf "%06d" "${TARGET_STEP}").pt"

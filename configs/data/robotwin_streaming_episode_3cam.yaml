@@ -33,10 +33,10 @@ train:
   pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
-  effective_obs_stride: 3
+  obs_stride: ${STREAMING.obs_stride}
   history_obs: 1
   future_obs: 2
-  trigger_every_n_obs: 3
+  trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
   keep_trigger_phase: true
   action_horizon: 32
   episode_cache_size: 16
