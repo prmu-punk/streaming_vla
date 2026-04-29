@@ -46,6 +46,8 @@ class StreamingActionJob:
     context_mask: torch.Tensor
     proprio: Optional[torch.Tensor] = None
     trigger_obs_index: int = -1
+    action_is_pad: Optional[torch.Tensor] = None
+    applied_prefix_steps: int = 0
     current_step_idx: int = 0
     snapshot_history: list[CacheSnapshot] = field(default_factory=list)
 

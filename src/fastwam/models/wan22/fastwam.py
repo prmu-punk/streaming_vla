@@ -1131,13 +1131,21 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        action_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self._build_mot_attention_mask(
+        mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=action_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
         )
+        if action_is_pad is not None:
+            valid_action = ~action_is_pad[0].to(device=device, dtype=torch.bool)
+            action_mask = valid_action.unsqueeze(0) & valid_action.unsqueeze(1)
+            mask[video_seq_len:, video_seq_len:] = action_mask
+            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+            mask[video_seq_len:, :first_frame_tokens] = valid_action.unsqueeze(1)
+        return mask
 
     @torch.no_grad()
     def build_streaming_video_cache_from_latents(

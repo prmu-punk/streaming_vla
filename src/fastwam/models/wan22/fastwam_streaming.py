@@ -382,6 +382,11 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             context_mask=resolved_context_mask,
             proprio=action_proprio,
             trigger_obs_index=int(trigger_obs_index),
+            action_is_pad=torch.zeros(
+                (resolved_context.shape[0], action_horizon),
+                device=self.device,
+                dtype=torch.bool,
+            ),
         )
 
     @torch.no_grad()
@@ -405,7 +410,43 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             action_seq_len=int(job.latents_action.shape[1]),
             video_tokens_per_frame=int(snapshot.tokens_per_frame),
             device=job.latents_action.device,
+            action_is_pad=job.action_is_pad,
         )
+        if int(job.trigger_obs_index) >= 0:
+            current_offsets = torch.as_tensor(
+                [
+                    int(layer_obs_index) - int(job.trigger_obs_index)
+                    for layer_obs_index in snapshot.layer_obs_indices
+                ],
+                device=job.latents_action.device,
+                dtype=job.latents_action.dtype,
+            )
+            desired_prefix = int(
+                self._offset_to_prefix_steps_tensor(
+                    current_offsets.mean().unsqueeze(0),
+                    action_horizon=int(job.latents_action.shape[1]),
+                )[0].item()
+            )
+            if desired_prefix > int(job.applied_prefix_steps):
+                delta_prefix = desired_prefix - int(job.applied_prefix_steps)
+                job.latents_action, job.action_is_pad = self._shift_action_window_by_prefix(
+                    job.latents_action,
+                    torch.full(
+                        (int(job.latents_action.shape[0]),),
+                        fill_value=delta_prefix,
+                        device=job.latents_action.device,
+                        dtype=torch.int64,
+                    ),
+                    pad_value=0.0,
+                )
+                job.applied_prefix_steps = desired_prefix
+                attention_mask = self._get_action_attn_mask(
+                    video_seq_len=int(snapshot.video_seq_len),
+                    action_seq_len=int(job.latents_action.shape[1]),
+                    video_tokens_per_frame=int(snapshot.tokens_per_frame),
+                    device=job.latents_action.device,
+                    action_is_pad=job.action_is_pad,
+                )
         pred_action = self._predict_action_noise_with_cache(
             latents_action=job.latents_action,
             timestep_action=step_t,
@@ -428,17 +469,11 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             proprio=job.proprio,
         )
         if int(job.trigger_obs_index) >= 0:
-            current_offsets = torch.as_tensor(
-                [
-                    int(layer_obs_index) - int(job.trigger_obs_index)
-                    for layer_obs_index in snapshot.layer_obs_indices
-                ],
+            position_anchor = torch.full(
+                (1,),
+                fill_value=float(job.applied_prefix_steps),
                 device=job.latents_action.device,
                 dtype=job.latents_action.dtype,
-            )
-            position_anchor = self._offset_to_chunk_anchor(
-                current_offsets.mean().unsqueeze(0),
-                action_horizon=int(job.latents_action.shape[1]),
             )
             position_weight = self._build_position_decay_weight(
                 anchor=position_anchor,
@@ -447,6 +482,8 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
                 dtype=job.latents_action.dtype,
             ).unsqueeze(-1)
             pred_action = pred_action * position_weight
+        if job.action_is_pad is not None:
+            pred_action = pred_action.masked_fill(job.action_is_pad.unsqueeze(-1), 0.0)
         job.latents_action = self.infer_action_scheduler.step(pred_action, step_delta, job.latents_action)
         job.snapshot_history.append(snapshot)
         job.current_step_idx += 1
@@ -459,7 +496,16 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        action_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if action_is_pad is not None:
+            return self.build_joint_attention_mask(
+                video_seq_len=int(video_seq_len),
+                action_seq_len=int(action_seq_len),
+                video_tokens_per_frame=int(video_tokens_per_frame),
+                device=device,
+                action_is_pad=action_is_pad,
+            )
         key = (
             int(video_seq_len),
             int(action_seq_len),

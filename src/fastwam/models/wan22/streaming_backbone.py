@@ -30,6 +30,36 @@ class StreamingBackbone:
         target_noise = self.train_action_scheduler.training_target(target_action, noise_action, timestep_action)
         return timestep_action, noisy_action, target_noise
 
+    def _offset_to_prefix_steps_tensor(self, offset: torch.Tensor, *, action_horizon: int) -> torch.Tensor:
+        if offset.ndim != 1:
+            raise ValueError(f"`offset` must be [B], got shape {tuple(offset.shape)}.")
+        stride = float(self._get_obs_stride())
+        prefix_steps = torch.round(torch.clamp(offset, min=0.0) * stride).to(dtype=torch.int64)
+        return prefix_steps.clamp(min=0, max=int(action_horizon))
+
+    def _shift_action_window_by_prefix(
+        self,
+        action_tensor: torch.Tensor,
+        prefix_steps: torch.Tensor,
+        *,
+        pad_value: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, action_horizon, action_dim = action_tensor.shape
+        shifted = torch.full_like(action_tensor, fill_value=pad_value)
+        action_is_pad = torch.ones(
+            (batch_size, action_horizon),
+            device=action_tensor.device,
+            dtype=torch.bool,
+        )
+        for batch_idx in range(batch_size):
+            prefix = int(prefix_steps[batch_idx].item())
+            valid_len = max(0, action_horizon - prefix)
+            if valid_len <= 0:
+                continue
+            shifted[batch_idx, :valid_len] = action_tensor[batch_idx, prefix : prefix + valid_len]
+            action_is_pad[batch_idx, :valid_len] = False
+        return shifted, action_is_pad
+
     def _predict_stream_noise(
         self,
         *,
@@ -41,12 +71,14 @@ class StreamingBackbone:
         video_seq_len: int,
         video_tokens_per_frame: int,
         proprio: Optional[torch.Tensor],
+        action_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attention_mask = self.build_joint_attention_mask(
             video_seq_len=int(video_seq_len),
             action_seq_len=noisy_action.shape[1],
             video_tokens_per_frame=int(video_tokens_per_frame),
             device=noisy_action.device,
+            action_is_pad=action_is_pad,
         )
         return self._predict_action_noise_with_cache(
             latents_action=noisy_action,
@@ -548,8 +580,7 @@ class StreamingBackbone:
             raise ValueError(f"`position_decay_power` must be positive, got {power}.")
         positions = torch.arange(action_horizon, device=device, dtype=dtype).unsqueeze(0)
         delta = positions - anchor.to(device=device, dtype=dtype).unsqueeze(1)
-        decay = torch.exp(-torch.pow(torch.clamp(delta, min=0.0) / tau, power))
-        return decay * (delta >= 0.0).to(dtype=dtype)
+        return torch.exp(-torch.pow(torch.clamp(delta, min=0.0) / tau, power))
 
     def training_loss_streaming_action_ft(self, sample, tiled: bool = False):
         del tiled
@@ -610,15 +641,19 @@ class StreamingBackbone:
                 device=target_action.device,
                 dtype=target_action.dtype,
             )
-        position_anchor = self._offset_to_chunk_anchor(
+        prefix_steps = self._offset_to_prefix_steps_tensor(
             mean_offset,
             action_horizon=int(target_action.shape[1]),
         )
-        position_weight = self._build_position_decay_weight(
-            anchor=position_anchor,
-            action_horizon=int(target_action.shape[1]),
-            device=target_action.device,
-            dtype=target_action.dtype,
+        noisy_action, action_is_pad = self._shift_action_window_by_prefix(
+            noisy_action,
+            prefix_steps,
+            pad_value=0.0,
+        )
+        target_noise, _ = self._shift_action_window_by_prefix(
+            target_noise,
+            prefix_steps,
+            pad_value=0.0,
         )
         pred_action = self._predict_stream_noise(
             noisy_action=noisy_action,
@@ -629,13 +664,13 @@ class StreamingBackbone:
             video_seq_len=int(selected_caches["video_seq_len"]),
             video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
             proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
+            action_is_pad=action_is_pad,
         )
         loss_stream = self._loss_stream_full_chunk(
             pred_action=pred_action,
             target_noise=target_noise,
             timestep_action=timestep_action,
-            action_is_pad=episode_batch["action_is_pad"],
-            position_weight=position_weight,
+            action_is_pad=action_is_pad,
         )
 
         if bool(self.streaming_train_cfg.get("mix_with_base_loss", False)):
@@ -646,5 +681,5 @@ class StreamingBackbone:
             "bucket": float(bucket),
             "mode_id": self._distribution_mode_to_id_safe(sampled_mode),
             "frontier": -1.0 if sampled_frontier is None else float(sampled_frontier),
-            "position_anchor_mean": float(position_anchor.detach().float().mean().item()),
+            "prefix_steps_mean": float(prefix_steps.detach().float().mean().item()),
         }
