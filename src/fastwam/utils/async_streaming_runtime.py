@@ -387,6 +387,7 @@ class StreamingRuntime:
             self._obs_queue,
             {
                 "type": "obs",
+                "env_step": int(env_step),
                 "obs_index": int(obs_index),
                 "obs_timestamp_ms": float(obs_timestamp_ms),
                 "input_image": image_cpu,

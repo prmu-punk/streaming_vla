@@ -18,6 +18,7 @@ class VideoCacheVersion:
     context: torch.Tensor
     context_mask: torch.Tensor
     obs_index: int = -1
+    env_step: int = -1
 
 
 @dataclass
@@ -31,8 +32,10 @@ class CacheSnapshot:
     context: torch.Tensor
     context_mask: torch.Tensor
     obs_index: int = -1
+    env_step: int = -1
     layer_version_ids: list[int] = field(default_factory=list)
     layer_obs_indices: list[int] = field(default_factory=list)
+    layer_env_steps: list[int] = field(default_factory=list)
     layer_obs_timestamps_ms: list[float] = field(default_factory=list)
     layer_ready_events: list[Optional[Any]] = field(default_factory=list)
 
@@ -46,8 +49,9 @@ class StreamingActionJob:
     context_mask: torch.Tensor
     proprio: Optional[torch.Tensor] = None
     trigger_obs_index: int = -1
+    trigger_env_step: int = -1
     action_is_pad: Optional[torch.Tensor] = None
-    applied_prefix_steps: int = 0
+    applied_shift_steps: int = 0
     current_step_idx: int = 0
     snapshot_history: list[CacheSnapshot] = field(default_factory=list)
 
@@ -80,6 +84,7 @@ class StreamingCacheState:
         self.live_tokens_per_frame: Optional[int] = None
         self.live_layer_version_ids: list[int] = []
         self.live_layer_obs_indices: list[int] = []
+        self.live_layer_env_steps: list[int] = []
         self.live_layer_obs_timestamps_ms: list[float] = []
         self.live_layer_ready_events: list[Optional[Any]] = []
         self.pending_versions: deque[VideoCacheVersion] = deque()
@@ -103,6 +108,7 @@ class StreamingCacheState:
             self.live_tokens_per_frame = int(version.tokens_per_frame)
             self.live_layer_version_ids = [int(version.version)] * self.num_layers
             self.live_layer_obs_indices = [int(version.obs_index)] * self.num_layers
+            self.live_layer_env_steps = [int(version.env_step)] * self.num_layers
             self.live_layer_obs_timestamps_ms = [float(version.obs_timestamp_ms)] * self.num_layers
             if layer_ready_events is None:
                 self.live_layer_ready_events = [None] * self.num_layers
@@ -154,6 +160,7 @@ class StreamingCacheState:
             self.live_tokens_per_frame = int(version.tokens_per_frame)
             self.live_layer_version_ids[layer_idx] = int(version.version)
             self.live_layer_obs_indices[layer_idx] = int(version.obs_index)
+            self.live_layer_env_steps[layer_idx] = int(version.env_step)
             self.live_layer_obs_timestamps_ms[layer_idx] = float(version.obs_timestamp_ms)
             self.live_layer_ready_events[layer_idx] = ready_event
 
@@ -195,7 +202,7 @@ class StreamingCacheState:
                     self.current_frontier = 0
         return advanced
 
-    def _snapshot_header(self) -> tuple[int, int, float, int]:
+    def _snapshot_header(self) -> tuple[int, int, int, float, int]:
         if not self.live_layer_version_ids:
             raise ValueError("No live video cache version is available for snapshot.")
         latest_version = max(self.live_layer_version_ids)
@@ -206,6 +213,7 @@ class StreamingCacheState:
         return (
             int(self.live_layer_version_ids[max_idx]),
             int(self.live_layer_obs_indices[max_idx]),
+            int(self.live_layer_env_steps[max_idx]),
             float(self.live_layer_obs_timestamps_ms[max_idx]),
             int(self.num_layers if frontier == 0 else frontier),
         )
@@ -220,10 +228,11 @@ class StreamingCacheState:
                 or self.live_tokens_per_frame is None
             ):
                 raise ValueError("No live video cache version is available for snapshot.")
-            version, obs_index, obs_timestamp_ms, frontier = self._snapshot_header()
+            version, obs_index, env_step, obs_timestamp_ms, frontier = self._snapshot_header()
             return CacheSnapshot(
                 version=version,
                 obs_index=obs_index,
+                env_step=env_step,
                 obs_timestamp_ms=obs_timestamp_ms,
                 frontier=int(frontier),
                 video_seq_len=int(self.live_video_seq_len),
@@ -233,6 +242,7 @@ class StreamingCacheState:
                 context_mask=self.live_context_mask,
                 layer_version_ids=list(self.live_layer_version_ids),
                 layer_obs_indices=list(self.live_layer_obs_indices),
+                layer_env_steps=list(self.live_layer_env_steps),
                 layer_obs_timestamps_ms=list(self.live_layer_obs_timestamps_ms),
                 layer_ready_events=list(self.live_layer_ready_events),
             )

@@ -15,8 +15,9 @@ from fastwam.models.wan22.streaming_cache import CacheSnapshot
 def _snapshot_header(
     layer_version_ids: list[int],
     layer_obs_indices: list[int],
+    layer_env_steps: list[int],
     layer_obs_timestamps_ms: list[float],
-) -> tuple[int, int, float, int]:
+) -> tuple[int, int, int, float, int]:
     if len(layer_version_ids) == 0:
         raise ValueError("No mirrored cache layers are available for snapshot.")
     latest_version = max(layer_version_ids)
@@ -27,6 +28,7 @@ def _snapshot_header(
     return (
         int(layer_version_ids[max_idx]),
         int(layer_obs_indices[max_idx]),
+        int(layer_env_steps[max_idx]),
         float(layer_obs_timestamps_ms[max_idx]),
         int(len(layer_version_ids) if frontier == 0 else frontier),
     )
@@ -83,6 +85,7 @@ def _video_worker_loop(
                 continue
 
             obs_index = int(msg["obs_index"])
+            env_step = int(msg.get("env_step", obs_index))
             obs_timestamp_ms = float(msg["obs_timestamp_ms"])
             input_image_cpu = msg["input_image"]
             if input_image_cpu.ndim == 3:
@@ -100,6 +103,7 @@ def _video_worker_loop(
                     context=video_context,
                     context_mask=video_context_mask,
                     obs_index=obs_index,
+                    env_step=env_step,
                     obs_timestamp_ms=obs_timestamp_ms,
                     tiled=tiled,
                 )
@@ -113,6 +117,7 @@ def _video_worker_loop(
                             "layer_idx": int(layer_idx),
                             "version": int(version.version),
                             "obs_index": int(version.obs_index),
+                            "env_step": int(version.env_step),
                             "obs_timestamp_ms": float(version.obs_timestamp_ms),
                             "video_seq_len": int(version.video_seq_len),
                             "tokens_per_frame": int(version.tokens_per_frame),
@@ -129,6 +134,7 @@ def _video_worker_loop(
                 context=video_context,
                 context_mask=video_context_mask,
                 obs_index=obs_index,
+                env_step=env_step,
                 obs_timestamp_ms=obs_timestamp_ms,
                 tiled=tiled,
             )
@@ -147,6 +153,7 @@ def _video_worker_loop(
                         "layer_idx": int(layer_idx),
                         "version": int(version.version),
                         "obs_index": int(version.obs_index),
+                        "env_step": int(version.env_step),
                         "obs_timestamp_ms": float(version.obs_timestamp_ms),
                         "video_seq_len": int(version.video_seq_len),
                         "tokens_per_frame": int(version.tokens_per_frame),
@@ -234,6 +241,7 @@ def _run_action_worker_loop(
             copy_ms += (time.perf_counter() - t_copy0) * 1000.0
             layer_version_ids[layer_idx] = int(msg["version"])
             layer_obs_indices[layer_idx] = int(msg["obs_index"])
+            layer_env_steps[layer_idx] = int(msg.get("env_step", msg["obs_index"]))
             layer_obs_timestamps_ms[layer_idx] = float(msg["obs_timestamp_ms"])
             live_video_seq_len[0] = int(msg["video_seq_len"])
             live_tokens_per_frame[0] = int(msg["tokens_per_frame"])
@@ -262,6 +270,7 @@ def _run_action_worker_loop(
         layer_cache_on_action: list[Optional[dict[str, torch.Tensor]]] = [None] * num_layers
         layer_version_ids: list[int] = [-1] * num_layers
         layer_obs_indices: list[int] = [-1] * num_layers
+        layer_env_steps: list[int] = [-1] * num_layers
         layer_obs_timestamps_ms: list[float] = [0.0] * num_layers
         live_video_seq_len = [-1]
         live_tokens_per_frame = [-1]
@@ -308,6 +317,7 @@ def _run_action_worker_loop(
                 context_mask=action_context_mask,
                 proprio=proprio,
                 trigger_obs_index=int(trigger_obs_index),
+                trigger_env_step=int(trigger_env_step),
                 num_inference_steps=int(num_inference_steps),
                 sigma_shift=sigma_shift,
                 seed=job_seed,
@@ -332,14 +342,16 @@ def _run_action_worker_loop(
                     _, drained_copy_ms = _drain_layer_updates(block=True, timeout_s=0.01)
                     copy_ms_step += drained_copy_ms
 
-                version, obs_index, obs_timestamp_ms, frontier = _snapshot_header(
+                version, obs_index, env_step, obs_timestamp_ms, frontier = _snapshot_header(
                     layer_version_ids=layer_version_ids,
                     layer_obs_indices=layer_obs_indices,
+                    layer_env_steps=layer_env_steps,
                     layer_obs_timestamps_ms=layer_obs_timestamps_ms,
                 )
                 snapshot = CacheSnapshot(
                     version=version,
                     obs_index=obs_index,
+                    env_step=env_step,
                     obs_timestamp_ms=obs_timestamp_ms,
                     frontier=frontier,
                     video_seq_len=int(live_video_seq_len[0]),
@@ -350,8 +362,8 @@ def _run_action_worker_loop(
                             "v": layer["v"],
                             "source_delta": (
                                 0
-                                if int(trigger_obs_index) < 0
-                                else int(layer_obs_indices[layer_idx]) - int(trigger_obs_index)
+                                if int(trigger_env_step) < 0
+                                else int(layer_env_steps[layer_idx]) - int(trigger_env_step)
                             ),
                         }  # type: ignore[index]
                         for layer_idx, layer in enumerate(layer_cache_on_action)
@@ -360,13 +372,14 @@ def _run_action_worker_loop(
                     context_mask=action_context_mask,
                     layer_version_ids=list(layer_version_ids),
                     layer_obs_indices=list(layer_obs_indices),
+                    layer_env_steps=list(layer_env_steps),
                     layer_obs_timestamps_ms=list(layer_obs_timestamps_ms),
                     layer_ready_events=[None] * num_layers,
                 )
                 if profiled:
                     mode, mode_frontier, age_hist, latest_offset, older_offset = _classify_layer_sources(
-                        layer_obs_indices=snapshot.layer_obs_indices,
-                        trigger_obs_index=trigger_obs_index,
+                        layer_env_steps=snapshot.layer_env_steps,
+                        trigger_env_step=trigger_env_step,
                     )
                     job_layer_source_steps.append(
                         {
@@ -457,35 +470,35 @@ def _offset_to_full_mode(offset: int) -> str:
 
 def _classify_layer_sources(
     *,
-    layer_obs_indices: list[int],
-    trigger_obs_index: int,
+    layer_env_steps: list[int],
+    trigger_env_step: int,
 ) -> tuple[str, int, dict[str, int], int, Optional[int]]:
-    if len(layer_obs_indices) == 0:
+    if len(layer_env_steps) == 0:
         return "full_cur", 0, {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}, 0, None
 
-    latest_obs_index = max(int(v) for v in layer_obs_indices)
+    latest_env_step = max(int(v) for v in layer_env_steps)
     latest_frontier = 0
-    while latest_frontier < len(layer_obs_indices) and int(layer_obs_indices[latest_frontier]) == latest_obs_index:
+    while latest_frontier < len(layer_env_steps) and int(layer_env_steps[latest_frontier]) == latest_env_step:
         latest_frontier += 1
     if latest_frontier == 0:
-        latest_frontier = len(layer_obs_indices)
+        latest_frontier = len(layer_env_steps)
 
-    older_obs_index = None
-    for obs_idx in layer_obs_indices[latest_frontier:]:
-        if int(obs_idx) != latest_obs_index:
-            older_obs_index = int(obs_idx)
+    older_env_step = None
+    for env_step in layer_env_steps[latest_frontier:]:
+        if int(env_step) != latest_env_step:
+            older_env_step = int(env_step)
             break
 
-    latest_offset = int(latest_obs_index - int(trigger_obs_index))
+    latest_offset = int(latest_env_step - int(trigger_env_step))
     mode = _offset_to_full_mode(latest_offset)
     older_offset: Optional[int] = None
-    if older_obs_index is not None:
-        older_offset = int(older_obs_index - int(trigger_obs_index))
+    if older_env_step is not None:
+        older_offset = int(older_env_step - int(trigger_env_step))
         mode = f"{_offset_to_label(older_offset)}_to_{_offset_to_label(latest_offset)}"
 
     age_hist = {"age0": 0, "age1": 0, "age2": 0, "age3p": 0}
-    for obs_idx in layer_obs_indices:
-        age = int(latest_obs_index - int(obs_idx))
+    for env_step in layer_env_steps:
+        age = int(latest_env_step - int(env_step))
         if age <= 0:
             age_hist["age0"] += 1
         elif age == 1:

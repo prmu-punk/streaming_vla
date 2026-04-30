@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from pathlib import Path
 import re
 from typing import Any, Optional
 
@@ -30,17 +29,17 @@ class StreamingBackbone:
         target_noise = self.train_action_scheduler.training_target(target_action, noise_action, timestep_action)
         return timestep_action, noisy_action, target_noise
 
-    def _offset_to_prefix_steps_tensor(self, offset: torch.Tensor, *, action_horizon: int) -> torch.Tensor:
+    def _offset_to_shift_steps_tensor(self, offset: torch.Tensor, *, action_horizon: int) -> torch.Tensor:
         if offset.ndim != 1:
             raise ValueError(f"`offset` must be [B], got shape {tuple(offset.shape)}.")
         stride = float(self._get_obs_stride())
-        prefix_steps = torch.round(torch.clamp(offset, min=0.0) * stride).to(dtype=torch.int64)
-        return prefix_steps.clamp(min=0, max=int(action_horizon))
+        shift_steps = torch.round(offset * stride).to(dtype=torch.int64)
+        return shift_steps.clamp(min=-int(action_horizon), max=int(action_horizon))
 
-    def _shift_action_window_by_prefix(
+    def _shift_action_window_by_steps(
         self,
         action_tensor: torch.Tensor,
-        prefix_steps: torch.Tensor,
+        shift_steps: torch.Tensor,
         *,
         pad_value: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -52,12 +51,21 @@ class StreamingBackbone:
             dtype=torch.bool,
         )
         for batch_idx in range(batch_size):
-            prefix = int(prefix_steps[batch_idx].item())
-            valid_len = max(0, action_horizon - prefix)
+            shift = int(shift_steps[batch_idx].item())
+            if shift >= 0:
+                src_start = shift
+                dst_start = 0
+                valid_len = max(0, action_horizon - shift)
+            else:
+                src_start = 0
+                dst_start = -shift
+                valid_len = max(0, action_horizon + shift)
             if valid_len <= 0:
                 continue
-            shifted[batch_idx, :valid_len] = action_tensor[batch_idx, prefix : prefix + valid_len]
-            action_is_pad[batch_idx, :valid_len] = False
+            shifted[batch_idx, dst_start : dst_start + valid_len] = action_tensor[
+                batch_idx, src_start : src_start + valid_len
+            ]
+            action_is_pad[batch_idx, dst_start : dst_start + valid_len] = False
         return shifted, action_is_pad
 
     def _predict_stream_noise(
@@ -285,69 +293,6 @@ class StreamingBackbone:
             entries = cfg_dist.get(str(bucket))
         return [dict(entry) for entry in entries]
 
-    def _load_real_schedule_pool(self) -> Optional[dict[int, list[dict[str, Any]]]]:
-        schedule_path = self.streaming_train_cfg.get("schedule_path", None)
-        if schedule_path is None:
-            return None
-        resolved_path = str(Path(str(schedule_path)).expanduser().resolve())
-        cached_path = getattr(self, "_streaming_schedule_pool_path", None)
-        cached_pool = getattr(self, "_streaming_schedule_pool", None)
-        if cached_pool is not None and cached_path == resolved_path:
-            return cached_pool
-
-        payload = torch.load(resolved_path, map_location="cpu")
-        schedules = payload.get("schedules", payload) if isinstance(payload, dict) else payload
-        if not isinstance(schedules, list) or len(schedules) == 0:
-            raise ValueError(f"Schedule file has no schedule traces: {resolved_path}")
-
-        pool: dict[int, list[dict[str, Any]]] = {}
-        for schedule in schedules:
-            trigger_obs_index = int(schedule.get("trigger_obs_index", 0))
-            steps = sorted(list(schedule.get("steps", [])), key=lambda row: int(row["denoise_step"]))
-            for step in steps:
-                layer_obs_indices = [int(v) for v in list(step.get("layer_obs_indices", []))]
-                if len(layer_obs_indices) != int(self.mot.num_layers):
-                    continue
-                raw_source_offsets = [int(v) - int(trigger_obs_index) for v in layer_obs_indices]
-                layer_cache_keys = [self._cache_key_from_offset(offset) for offset in raw_source_offsets]
-                bucket = int(step["denoise_step"])
-                pool.setdefault(bucket, []).append(
-                    {
-                        "mode": str(step.get("mode", "")),
-                        "frontier": int(step.get("frontier", self.mot.num_layers)),
-                        "layer_cache_keys": layer_cache_keys,
-                    }
-                )
-        if len(pool) == 0:
-            raise ValueError(f"Schedule file has no valid per-step entries: {resolved_path}")
-        self._streaming_schedule_pool_path = resolved_path
-        self._streaming_schedule_pool = pool
-        return pool
-
-
-    def _sample_cache_from_real_schedule(
-        self,
-        bucket: int,
-        *,
-        batch_size: int,
-    ) -> Optional[tuple[list[str], str, Optional[int]]]:
-        pool = self._load_real_schedule_pool()
-        if pool is None:
-            return None
-        entries = pool.get(int(bucket), None)
-        if not entries:
-            available = sorted(int(key) for key, value in pool.items() if value)
-            schedule_path = self.streaming_train_cfg.get("schedule_path", None)
-            raise ValueError(
-                f"Streaming schedule `{schedule_path}` has no entries for bucket {bucket}. "
-                f"Available buckets: {available}. "
-                "Please regenerate the schedule file with matching inference-step settings."
-            )
-        choice = int(torch.randint(len(entries), (1,), device=self.device).item())
-        entry = entries[choice]
-        row = ",".join(str(v) for v in entry["layer_cache_keys"])
-        return [row] * int(batch_size), str(entry.get("mode", "")), int(entry.get("frontier", self.mot.num_layers))
-
     def _sample_cache_distribution(self, bucket: int) -> tuple[str, Optional[int]]:
         entries = self._get_streaming_distribution_entries(bucket)
         weights = torch.tensor(
@@ -412,55 +357,6 @@ class StreamingBackbone:
             return StreamingBackbone._distribution_mode_to_id(mode)
         except Exception:
             return -1.0
-
-    def _compose_replay_layer_cache(
-        self,
-        caches: dict[str, Any],
-        layer_cache_keys: list[str],
-    ) -> list[dict[str, torch.Tensor]]:
-        rows = [str(row).split(",") for row in layer_cache_keys]
-        if any(len(row) != self.mot.num_layers for row in rows):
-            raise ValueError(
-                f"Each replay layer-cache row must contain {self.mot.num_layers} comma-separated keys."
-            )
-        merged: list[dict[str, torch.Tensor]] = []
-        for layer_idx in range(self.mot.num_layers):
-            k_rows = []
-            v_rows = []
-            source_deltas = []
-            for sample_idx, row in enumerate(rows):
-                key = row[layer_idx]
-                if key not in caches:
-                    raise ValueError(f"Replay cache key `{key}` unavailable. Available: {sorted(caches)}")
-                layer = caches[key][layer_idx]
-                k_rows.append(layer["k"][sample_idx : sample_idx + 1])
-                v_rows.append(layer["v"][sample_idx : sample_idx + 1])
-                source_deltas.append(self._cache_key_to_source_delta(key))
-            merged.append(
-                {
-                    "k": torch.cat(k_rows, dim=0),
-                    "v": torch.cat(v_rows, dim=0),
-                    "source_delta": torch.as_tensor(
-                        source_deltas,
-                        device=k_rows[0].device,
-                        dtype=torch.int64,
-                    ),
-                }
-            )
-        return merged
-
-    def _layer_cache_keys_to_mean_offset(
-        self,
-        layer_cache_keys: list[str],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        offsets = []
-        for row in layer_cache_keys:
-            row_offsets = [float(self._cache_key_to_source_delta(key.strip())) for key in str(row).split(",")]
-            offsets.append(sum(row_offsets) / float(max(len(row_offsets), 1)))
-        return torch.as_tensor(offsets, device=device, dtype=dtype)
 
     @staticmethod
     def _streaming_cache_label_to_offset(label: str) -> int:
@@ -613,46 +509,30 @@ class StreamingBackbone:
                 episode_batch,
                 required_cache_keys=required_cache_keys,
             )
-        sampled_real_schedule = self._sample_cache_from_real_schedule(
-            bucket,
-            batch_size=int(target_action.shape[0]),
+        sampled_mode, sampled_frontier = self._sample_cache_distribution(bucket)
+        stitched_cache = self._compose_distribution_cache(
+            caches=selected_caches,
+            mode=sampled_mode,
+            frontier=sampled_frontier,
         )
-        if sampled_real_schedule is not None:
-            layer_cache_keys, sampled_mode, sampled_frontier = sampled_real_schedule
-            stitched_cache = self._compose_replay_layer_cache(
-                caches=selected_caches,
-                layer_cache_keys=layer_cache_keys,
-            )
-            mean_offset = self._layer_cache_keys_to_mean_offset(
-                layer_cache_keys,
-                device=target_action.device,
-                dtype=target_action.dtype,
-            )
-        else:
-            sampled_mode, sampled_frontier = self._sample_cache_distribution(bucket)
-            stitched_cache = self._compose_distribution_cache(
-                caches=selected_caches,
-                mode=sampled_mode,
-                frontier=sampled_frontier,
-            )
-            mean_offset = torch.full(
-                (int(target_action.shape[0]),),
-                fill_value=float(self._mode_to_mean_offset(sampled_mode)),
-                device=target_action.device,
-                dtype=target_action.dtype,
-            )
-        prefix_steps = self._offset_to_prefix_steps_tensor(
+        mean_offset = torch.full(
+            (int(target_action.shape[0]),),
+            fill_value=float(self._mode_to_mean_offset(sampled_mode)),
+            device=target_action.device,
+            dtype=target_action.dtype,
+        )
+        shift_steps = self._offset_to_shift_steps_tensor(
             mean_offset,
             action_horizon=int(target_action.shape[1]),
         )
-        noisy_action, action_is_pad = self._shift_action_window_by_prefix(
+        noisy_action, action_is_pad = self._shift_action_window_by_steps(
             noisy_action,
-            prefix_steps,
+            shift_steps,
             pad_value=0.0,
         )
-        target_noise, _ = self._shift_action_window_by_prefix(
+        target_noise, _ = self._shift_action_window_by_steps(
             target_noise,
-            prefix_steps,
+            shift_steps,
             pad_value=0.0,
         )
         pred_action = self._predict_stream_noise(
@@ -681,5 +561,5 @@ class StreamingBackbone:
             "bucket": float(bucket),
             "mode_id": self._distribution_mode_to_id_safe(sampled_mode),
             "frontier": -1.0 if sampled_frontier is None else float(sampled_frontier),
-            "prefix_steps_mean": float(prefix_steps.detach().float().mean().item()),
+            "shift_steps_mean": float(shift_steps.detach().float().mean().item()),
         }
