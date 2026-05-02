@@ -38,6 +38,7 @@ class MoT(nn.Module):
         self.mixtures = nn.ModuleDict(mixtures)
         self.expert_order = list(self.mixtures.keys())
         self.mot_checkpoint_mixed_attn = mot_checkpoint_mixed_attn
+        self.use_cache_time_embedding = True
         if mot_checkpoint_mixed_attn:
             logger.info("Using gradient checkpointing for mixture attention. This will save memory but use more computation.")
 
@@ -110,6 +111,8 @@ class MoT(nn.Module):
         v_video: torch.Tensor,
         source_delta,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not bool(getattr(self, "use_cache_time_embedding", True)):
+            return k_video, v_video
         if torch.is_tensor(source_delta):
             source_delta = source_delta.to(device=k_video.device, dtype=torch.int64).reshape(-1)
             if source_delta.numel() == 1:

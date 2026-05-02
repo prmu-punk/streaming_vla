@@ -26,7 +26,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         self.streaming_cfg: dict[str, Any] = {}
         self.streaming_train_cfg: dict[str, Any] = {"enabled": False}
         self.freeze_video_expert = True
-        self.streaming_proprio_to_action_only = True
         self._streaming_infer_timestep_cache: dict[int, torch.Tensor] = {}
         self._action_attn_mask: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
 
@@ -35,7 +34,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         self.streaming_cfg = cfg
         self.streaming_train_cfg = dict(cfg.get("streaming_train", {}))
         self.freeze_video_expert = bool(cfg.get("freeze_video_expert", True))
-        self.streaming_proprio_to_action_only = bool(cfg.get("proprio_to_action_only", True))
         self.mot.use_cache_time_embedding = bool(cfg.get("use_cache_time_embedding", True))
         if self.freeze_video_expert:
             for module in (self.video_expert, self.vae):
@@ -59,6 +57,15 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
     @torch.no_grad()
     def evaluate_streaming_action_mse(self, sample) -> dict[str, float]:
         episode_batch = self._extract_streaming_episode_batch(sample)
+        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
+            prompt=None,
+            context=episode_batch["context"],
+            context_mask=episode_batch["context_mask"],
+            proprio=episode_batch["proprio_t"],
+        )
+        episode_batch = dict(episode_batch)
+        episode_batch["context"] = resolved_context
+        episode_batch["context_mask"] = resolved_context_mask
         target_action = episode_batch["target_action"]
         action_is_pad = episode_batch.get("action_is_pad", None)
         timestep_action, _, _ = self._sample_noisy_triplet(target_action)
@@ -92,7 +99,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             action_horizon=int(target_action.shape[1]),
             context=episode_batch["context"],
             context_mask=episode_batch["context_mask"],
-            proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
             trigger_obs_index=-1,
             num_inference_steps=int(self.streaming_train_cfg.get("infer_num_inference_steps", 10)),
             rand_device=str(self.device),
@@ -142,7 +148,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor],
         proprio: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -166,7 +172,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        action_proprio = None
         if proprio is not None:
             if self.proprio_dim is None:
                 raise ValueError("`proprio` was provided but `proprio_dim=None`.")
@@ -177,15 +182,12 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             if proprio.shape[1] != self.proprio_dim:
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
-            if self.streaming_proprio_to_action_only:
-                action_proprio = proprio
-            else:
-                context, context_mask = self._append_proprio_to_context(
-                    context=context,
-                    context_mask=context_mask,
-                    proprio=proprio,
-                )
-        return context, context_mask, action_proprio
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+        return context, context_mask
 
     @torch.no_grad()
     def _build_cache_version(
@@ -281,16 +283,17 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         prompt: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
         obs_index: int = -1,
         env_step: int = -1,
         obs_timestamp_ms: float = 0.0,
         tiled: bool = False,
     ) -> VideoCacheVersion:
-        resolved_context, resolved_context_mask, _ = self._resolve_streaming_condition_inputs(
+        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
             prompt=prompt,
             context=context,
             context_mask=context_mask,
-            proprio=None,
+            proprio=proprio,
         )
         version = self._build_cache_version(
             input_image=input_image,
@@ -312,16 +315,17 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         prompt: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
         obs_index: int = -1,
         env_step: int = -1,
         obs_timestamp_ms: float = 0.0,
         tiled: bool = False,
     ) -> VideoCacheVersion:
-        resolved_context, resolved_context_mask, _ = self._resolve_streaming_condition_inputs(
+        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
             prompt=prompt,
             context=context,
             context_mask=context_mask,
-            proprio=None,
+            proprio=proprio,
         )
         version = self._build_cache_version(
             input_image=input_image,
@@ -364,7 +368,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         prompt: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
-        proprio: Optional[torch.Tensor] = None,
         trigger_obs_index: int = -1,
         trigger_env_step: int = -1,
         num_inference_steps: int = 20,
@@ -372,11 +375,10 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
     ) -> StreamingActionJob:
-        resolved_context, resolved_context_mask, action_proprio = self._resolve_streaming_condition_inputs(
+        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
             prompt=prompt,
             context=context,
             context_mask=context_mask,
-            proprio=proprio,
         )
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_action = torch.randn(
@@ -395,9 +397,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             timesteps=timesteps,
             deltas=deltas,
             latents_action=latents_action,
-            context=resolved_context,
-            context_mask=resolved_context_mask,
-            proprio=action_proprio,
             trigger_obs_index=int(trigger_obs_index),
             trigger_env_step=int(trigger_env_step),
             action_is_pad=torch.zeros(
@@ -467,8 +466,8 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         pred_action = self._predict_action_noise_with_cache(
             latents_action=job.latents_action,
             timestep_action=step_t,
-            context=job.context,
-            context_mask=job.context_mask,
+            context=snapshot.context,
+            context_mask=snapshot.context_mask,
             video_kv_cache=[
                 {
                     "k": layer["k"],
@@ -483,22 +482,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             ],
             attention_mask=attention_mask,
             video_seq_len=snapshot.video_seq_len,
-            proprio=job.proprio,
         )
-        if int(job.trigger_env_step) >= 0:
-            position_anchor = torch.full(
-                (1,),
-                fill_value=float(max(int(job.applied_shift_steps), 0)),
-                device=job.latents_action.device,
-                dtype=job.latents_action.dtype,
-            )
-            position_weight = self._build_position_decay_weight(
-                anchor=position_anchor,
-                action_horizon=int(job.latents_action.shape[1]),
-                device=job.latents_action.device,
-                dtype=job.latents_action.dtype,
-            ).unsqueeze(-1)
-            pred_action = pred_action * position_weight
         if job.action_is_pad is not None:
             pred_action = pred_action.masked_fill(job.action_is_pad.unsqueeze(-1), 0.0)
         job.latents_action = self.infer_action_scheduler.step(pred_action, step_delta, job.latents_action)
@@ -557,7 +541,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        frontier_schedule: Optional[list[int]] = None,
         obs_timestamp_ms: float = 0.0,
     ) -> dict[str, Any]:
         self.eval()
@@ -566,27 +549,20 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             prompt=prompt,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
             obs_timestamp_ms=obs_timestamp_ms,
             tiled=tiled,
         )
-        if frontier_schedule is None:
-            frontier_schedule = [self.mot.num_layers] * num_inference_steps
         job = self.start_action_job(
             action_horizon=action_horizon,
             prompt=prompt,
             context=context,
             context_mask=context_mask,
-            proprio=proprio,
             num_inference_steps=num_inference_steps,
             sigma_shift=sigma_shift,
             seed=seed,
             rand_device=rand_device,
         )
-        for max_layers in frontier_schedule:
-            self.advance_video_cache_frontier(max_layers=max_layers)
-            self.step_action_job(job)
-            if job.done:
-                break
         while not job.done:
             self.step_action_job(job)
         return {
@@ -612,7 +588,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         tiled: bool = False,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale
-        frontier_schedule = self.streaming_cfg.get("infer_frontier_schedule")
         return self.infer_action_streaming(
             prompt=prompt,
             input_image=input_image,
@@ -625,5 +600,4 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             seed=seed,
             rand_device=rand_device,
             tiled=tiled,
-            frontier_schedule=frontier_schedule,
         )

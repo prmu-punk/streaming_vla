@@ -384,7 +384,6 @@ def run_native_async_anchor_chunk(
         )
         runtime.submit_action_job(
             env_step=int(anchor_step),
-            proprio=trigger_proprio,
             obs_index=int(last_submitted_obs_index),
         )
         print(

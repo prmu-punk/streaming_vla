@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Hardcoded run config (no CLI args needed).
-CKPT="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/FastWAM/runs/libero_streaming_action_ft_2cam224_1e-4/2026-04-15_09-25-18/checkpoints/weights/step_009000.pt"
-VIDEO_DEVICE="cuda:6"
-ACTION_DEVICE="cuda:7"
+CKPT="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/FastWAM/checkpoints/fastwam_release/libero_uncond_2cam224.pt"
+VIDEO_DEVICE="cuda:2"
+ACTION_DEVICE="cuda:3"
 
 LIBERO_ROOT="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/LIBERO"
 if [[ ! -d "${LIBERO_ROOT}" ]]; then

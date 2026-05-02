@@ -120,12 +120,20 @@ def _sample_one(
     xt_dtype: torch.dtype,
 ) -> list[dict[str, Any]]:
     batch = model._extract_streaming_episode_batch(_batched(sample))
+    resolved_context, resolved_context_mask = model._resolve_streaming_condition_inputs(
+        prompt=None,
+        context=batch["context"],
+        context_mask=batch["context_mask"],
+        proprio=batch["proprio_t"],
+    )
+    batch = dict(batch)
+    batch["context"] = resolved_context
+    batch["context_mask"] = resolved_context_mask
     action_horizon = int(batch["target_action"].shape[1])
     job = model.start_action_job(
         action_horizon=action_horizon,
         context=batch["context"],
         context_mask=batch["context_mask"],
-        proprio=batch["proprio_t"] if model.streaming_proprio_to_action_only else None,
         trigger_obs_index=0,
         num_inference_steps=int(num_inference_steps),
         seed=int(seed),

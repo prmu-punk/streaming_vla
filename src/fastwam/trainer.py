@@ -734,8 +734,6 @@ class Wan22Trainer:
 
     def train(self):
         self._set_dit_only_train_mode()
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        unwrapped_model._load_real_schedule_pool()
         self.accelerator.wait_for_everyone()
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")

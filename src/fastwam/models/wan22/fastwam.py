@@ -720,14 +720,12 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
-        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
-            proprio=proprio,
         )
         action_tokens = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
@@ -1112,14 +1110,12 @@ class FastWAM(torch.nn.Module):
         timestep_action: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
-        proprio: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         return self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
-            proprio=proprio,
         )
 
     def postprocess_action_tokens(self, action_tokens: torch.Tensor, action_pre: dict[str, Any]) -> torch.Tensor:

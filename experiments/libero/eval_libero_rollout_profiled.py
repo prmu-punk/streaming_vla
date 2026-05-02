@@ -208,6 +208,11 @@ def run_single_episode_async(
             )
             runtime.reset_for_formal_phase(env_step=0)
         runner.start_formal_phase(obs_index_start=formal_obs_index_start)
+        runner.prime_formal_observation(
+            input_image=image,
+            proprio=proprio,
+            env_step=0,
+        )
 
         t = 0
         executed_env_steps = 0

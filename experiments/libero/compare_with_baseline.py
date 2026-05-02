@@ -57,6 +57,30 @@ def _masked_mse(pred: torch.Tensor, target: torch.Tensor, action_is_pad: torch.T
     return float((err * valid).sum().div(denom).item())
 
 
+def _masked_mse_per_position(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    action_is_pad: torch.Tensor | None = None,
+) -> list[float | None]:
+    pred_f = pred.detach().float()
+    target_f = target.detach().float()
+    err = (pred_f - target_f).pow(2).mean(dim=-1)  # [B, T]
+    if action_is_pad is None:
+        return [float(v) for v in err.mean(dim=0).tolist()]
+    pad = action_is_pad.detach().to(device=err.device)
+    if pad.ndim == 1:
+        pad = pad.unsqueeze(0)
+    valid = (~pad.bool()).to(dtype=err.dtype)
+    per_pos: list[float | None] = []
+    for pos in range(int(err.shape[1])):
+        denom = float(valid[:, pos].sum().item())
+        if denom <= 0.0:
+            per_pos.append(None)
+        else:
+            per_pos.append(float((err[:, pos] * valid[:, pos]).sum().div(valid[:, pos].sum()).item()))
+    return per_pos
+
+
 def _array_mse(pred: np.ndarray, target: np.ndarray) -> float:
     pred_f = np.asarray(pred, dtype=np.float32)
     target_f = np.asarray(target, dtype=np.float32)
@@ -120,6 +144,73 @@ def _summarize_schedule_pattern(per_step: list[dict[str, Any]]) -> dict[str, Any
         "frontier_min": None if len(frontier_values) == 0 else int(min(frontier_values)),
         "frontier_max": None if len(frontier_values) == 0 else int(max(frontier_values)),
     }
+
+
+def _mean_per_position(rows: list[dict[str, Any]], key: str) -> list[float | None] | None:
+    values = [row.get(key) for row in rows if row.get(key) is not None]
+    if not values:
+        return None
+    length = len(values[0])
+    out: list[float | None] = []
+    for idx in range(length):
+        bucket = [float(v[idx]) for v in values if v[idx] is not None]
+        out.append(None if len(bucket) == 0 else float(sum(bucket) / float(len(bucket))))
+    return out
+
+
+@torch.no_grad()
+def _run_sync_baseline_for_loaded_sample(
+    model,
+    batch: dict[str, Any],
+    *,
+    seed: int,
+    rand_device: str,
+    infer_steps: int,
+    processor=None,
+    binarize_gripper: bool = False,
+) -> dict[str, Any]:
+    target_action = batch["target_action"]
+    action_is_pad = batch.get("action_is_pad", None)
+    infer_out = model.infer_action(
+        prompt=None,
+        input_image=batch["obs_cur"],
+        action_horizon=int(target_action.shape[1]),
+        proprio=batch.get("proprio_t", None),
+        context=batch["context"],
+        context_mask=batch["context_mask"],
+        num_inference_steps=int(infer_steps),
+        seed=int(seed),
+        rand_device=str(rand_device),
+        tiled=False,
+    )
+    pred_action = infer_out["action"].detach().float()
+    target_action_eval = target_action.detach().to(device=pred_action.device, dtype=torch.float32)
+    action_is_pad_eval = (
+        None
+        if action_is_pad is None
+        else action_is_pad.detach().to(device=pred_action.device)
+    )
+    result = {
+        "final_mse": _masked_mse(pred_action, target_action_eval, action_is_pad_eval),
+        "final_mse_per_position": _masked_mse_per_position(pred_action, target_action_eval, action_is_pad_eval),
+    }
+    if processor is not None:
+        pred_env_action = _normalized_action_to_env_action(
+            pred_action,
+            processor=processor,
+            binarize_gripper=bool(binarize_gripper),
+        )
+        target_env_action = _normalized_action_to_env_action(
+            target_action_eval,
+            processor=processor,
+            binarize_gripper=bool(binarize_gripper),
+        )
+        env_mse = _array_mse(pred_env_action, target_env_action)
+        result["final_env_action_mse"] = float(env_mse)
+        result["final_env_action_mse_per_position"] = (
+            np.mean(np.square(pred_env_action - target_env_action), axis=-1).astype(float).tolist()
+        )
+    return result
 
 
 @torch.no_grad()
@@ -241,6 +332,7 @@ def _run_schedule_for_loaded_sample(
         "action_shape": list(final_action.shape),
         "initial_mse": float(initial_mse),
         "final_mse": float(final_mse),
+        "final_mse_per_position": _masked_mse_per_position(final_action, target_action_f, action_is_pad),
         "final_rmse": float(final_mse ** 0.5),
         "final_unmasked_mse": float((final_action - target_action_f).pow(2).mean().item()),
         "schedule_pattern": _summarize_schedule_pattern(per_step),
@@ -260,6 +352,10 @@ def _run_schedule_for_loaded_sample(
         result.update(
             {
                 "final_env_action_mse": float(env_mse),
+                "final_env_action_mse_per_position": np.mean(
+                    np.square(pred_env_action - target_env_action),
+                    axis=-1,
+                ).astype(float).tolist(),
                 "final_env_action_rmse": float(env_mse ** 0.5),
                 "final_env_action_per_dim_mse": np.mean(
                     np.square(pred_env_action - target_env_action),
@@ -277,6 +373,8 @@ def run_one_schedule_denoise_mse(
     cfg,
     *,
     ckpt: str,
+    baseline_cfg=None,
+    baseline_ckpt: str | None = None,
     schedule_path: str | Path,
     schedule_index: int,
     dataset_index: int,
@@ -306,6 +404,14 @@ def run_one_schedule_denoise_mse(
     weight_ckpt = resolve_weight_checkpoint(ckpt)
     model.load_checkpoint(str(weight_ckpt))
     model.eval()
+    baseline_model = None
+    baseline_weight_ckpt = None
+    if baseline_ckpt is not None:
+        baseline_cfg = cfg if baseline_cfg is None else baseline_cfg
+        baseline_model = instantiate(baseline_cfg.model, model_dtype=model_dtype, device=model_device)
+        baseline_weight_ckpt = resolve_weight_checkpoint(baseline_ckpt)
+        baseline_model.load_checkpoint(str(baseline_weight_ckpt))
+        baseline_model.eval()
 
     batch = model._extract_streaming_episode_batch(_batched(sample))
     processor = getattr(getattr(dataset, "lerobot_dataset", None), "processor", None)
@@ -337,7 +443,18 @@ def run_one_schedule_denoise_mse(
             "num_schedules": int(len(schedules)),
         }
     )
-    del model, dataset
+    if baseline_model is not None and baseline_weight_ckpt is not None:
+        result["sync_baseline"] = _run_sync_baseline_for_loaded_sample(
+            baseline_model,
+            batch,
+            seed=int(seed),
+            rand_device=str(rand_device),
+            infer_steps=int(infer_steps),
+            processor=processor,
+            binarize_gripper=binarize_gripper,
+        )
+        result["sync_baseline"]["ckpt"] = str(baseline_weight_ckpt)
+    del model, baseline_model, dataset
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return result
@@ -348,6 +465,8 @@ def scan_schedule_denoise_mse(
     cfg,
     *,
     ckpt: str,
+    baseline_cfg=None,
+    baseline_ckpt: str | None = None,
     schedule_path: str | Path,
     dataset_index: int,
     seed: int,
@@ -384,6 +503,14 @@ def scan_schedule_denoise_mse(
     weight_ckpt = resolve_weight_checkpoint(ckpt)
     model.load_checkpoint(str(weight_ckpt))
     model.eval()
+    baseline_model = None
+    baseline_weight_ckpt = None
+    if baseline_ckpt is not None:
+        baseline_cfg = cfg if baseline_cfg is None else baseline_cfg
+        baseline_model = instantiate(baseline_cfg.model, model_dtype=model_dtype, device=model_device)
+        baseline_weight_ckpt = resolve_weight_checkpoint(baseline_ckpt)
+        baseline_model.load_checkpoint(str(baseline_weight_ckpt))
+        baseline_model.eval()
     batch = model._extract_streaming_episode_batch(_batched(sample))
     processor = getattr(getattr(dataset, "lerobot_dataset", None), "processor", None)
     binarize_gripper = bool(cfg.get("EVALUATION", {}).get("binarize_gripper", False))
@@ -408,6 +535,16 @@ def scan_schedule_denoise_mse(
             processor=processor,
             binarize_gripper=binarize_gripper,
         )
+        if baseline_model is not None:
+            row["sync_baseline"] = _run_sync_baseline_for_loaded_sample(
+                baseline_model,
+                batch,
+                seed=int(seed),
+                rand_device=str(rand_device),
+                infer_steps=int(infer_steps),
+                processor=processor,
+                binarize_gripper=binarize_gripper,
+            )
         rows.append(row)
 
     rows_sorted = sorted(rows, key=lambda item: float(item["final_mse"]), reverse=True)
@@ -437,6 +574,7 @@ def scan_schedule_denoise_mse(
             "final_mse_mean": float(sum(final_mses) / float(len(final_mses))),
             "final_mse_min": float(min(final_mses)),
             "final_mse_max": float(max(final_mses)),
+            "final_mse_per_position_mean": _mean_per_position(rows, "final_mse_per_position"),
             "final_env_action_mse_mean": _mean(final_env_mses),
             "final_env_action_mse_min": None if not final_env_mses else float(min(final_env_mses)),
             "final_env_action_mse_max": None if not final_env_mses else float(max(final_env_mses)),
@@ -445,7 +583,25 @@ def scan_schedule_denoise_mse(
         "worst": top,
         "best": sorted(rows, key=lambda item: float(item["final_mse"]))[: max(int(top_k), 0)],
     }
-    del model, dataset
+    if baseline_model is not None and baseline_weight_ckpt is not None:
+        baseline_rows = [row["sync_baseline"] for row in rows]
+        baseline_mses = [float(row["final_mse"]) for row in baseline_rows]
+        result["sync_baseline"] = {
+            "ckpt": str(baseline_weight_ckpt),
+            "summary": {
+                "final_mse_mean": float(sum(baseline_mses) / float(len(baseline_mses))),
+                "final_mse_min": float(min(baseline_mses)),
+                "final_mse_max": float(max(baseline_mses)),
+                "final_mse_per_position_mean": _mean_per_position(baseline_rows, "final_mse_per_position"),
+                "final_env_action_mse_mean": _mean(
+                    [float(row["final_env_action_mse"]) for row in baseline_rows if row.get("final_env_action_mse") is not None]
+                ),
+                "final_env_action_mse_per_position_mean": _mean_per_position(
+                    baseline_rows, "final_env_action_mse_per_position"
+                ),
+            },
+        }
+    del model, baseline_model, dataset
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return result
@@ -456,6 +612,8 @@ def scan_random_schedule_sample_pairs(
     cfg,
     *,
     ckpt: str,
+    baseline_cfg=None,
+    baseline_ckpt: str | None = None,
     schedule_path: str | Path,
     seed: int,
     device: str | None,
@@ -483,6 +641,14 @@ def scan_random_schedule_sample_pairs(
     weight_ckpt = resolve_weight_checkpoint(ckpt)
     model.load_checkpoint(str(weight_ckpt))
     model.eval()
+    baseline_model = None
+    baseline_weight_ckpt = None
+    if baseline_ckpt is not None:
+        baseline_cfg = cfg if baseline_cfg is None else baseline_cfg
+        baseline_model = instantiate(baseline_cfg.model, model_dtype=model_dtype, device=model_device)
+        baseline_weight_ckpt = resolve_weight_checkpoint(baseline_ckpt)
+        baseline_model.load_checkpoint(str(baseline_weight_ckpt))
+        baseline_model.eval()
     processor = getattr(getattr(dataset, "lerobot_dataset", None), "processor", None)
     binarize_gripper = bool(cfg.get("EVALUATION", {}).get("binarize_gripper", False))
     infer_steps = (
@@ -512,6 +678,16 @@ def scan_random_schedule_sample_pairs(
             processor=processor,
             binarize_gripper=binarize_gripper,
         )
+        if baseline_model is not None:
+            row["sync_baseline"] = _run_sync_baseline_for_loaded_sample(
+                baseline_model,
+                batch,
+                seed=int(seed) + int(pair_idx) * 1009 + int(dataset_index),
+                rand_device=str(rand_device),
+                infer_steps=int(infer_steps),
+                processor=processor,
+                binarize_gripper=binarize_gripper,
+            )
         row.update(
             {
                 "pair_index": int(pair_idx),
@@ -544,6 +720,7 @@ def scan_random_schedule_sample_pairs(
             "final_mse_mean": _mean(final_mses),
             "final_mse_min": float(min(final_mses)),
             "final_mse_max": float(max(final_mses)),
+            "final_mse_per_position_mean": _mean_per_position(rows, "final_mse_per_position"),
             "final_env_action_mse_mean": _mean(final_env_mses),
             "final_env_action_mse_min": None if not final_env_mses else float(min(final_env_mses)),
             "final_env_action_mse_max": None if not final_env_mses else float(max(final_env_mses)),
@@ -552,7 +729,25 @@ def scan_random_schedule_sample_pairs(
         "worst": sorted(rows, key=lambda item: float(item["final_mse"]), reverse=True)[: max(int(top_k), 0)],
         "best": sorted(rows, key=lambda item: float(item["final_mse"]))[: max(int(top_k), 0)],
     }
-    del model, dataset
+    if baseline_model is not None and baseline_weight_ckpt is not None:
+        baseline_rows = [row["sync_baseline"] for row in rows]
+        baseline_mses = [float(row["final_mse"]) for row in baseline_rows]
+        result["sync_baseline"] = {
+            "ckpt": str(baseline_weight_ckpt),
+            "summary": {
+                "final_mse_mean": _mean(baseline_mses),
+                "final_mse_min": float(min(baseline_mses)),
+                "final_mse_max": float(max(baseline_mses)),
+                "final_mse_per_position_mean": _mean_per_position(baseline_rows, "final_mse_per_position"),
+                "final_env_action_mse_mean": _mean(
+                    [float(row["final_env_action_mse"]) for row in baseline_rows if row.get("final_env_action_mse") is not None]
+                ),
+                "final_env_action_mse_per_position_mean": _mean_per_position(
+                    baseline_rows, "final_env_action_mse_per_position"
+                ),
+            },
+        }
+    del model, baseline_model, dataset
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return result
@@ -608,6 +803,8 @@ def scan_episode_denoise_mse(
     cfg,
     *,
     ckpt: str,
+    baseline_cfg=None,
+    baseline_ckpt: str | None = None,
     schedule_path: str | Path,
     episode_index: int,
     seed: int,
@@ -650,6 +847,14 @@ def scan_episode_denoise_mse(
     weight_ckpt = resolve_weight_checkpoint(ckpt)
     model.load_checkpoint(str(weight_ckpt))
     model.eval()
+    baseline_model = None
+    baseline_weight_ckpt = None
+    if baseline_ckpt is not None:
+        baseline_cfg = cfg if baseline_cfg is None else baseline_cfg
+        baseline_model = instantiate(baseline_cfg.model, model_dtype=model_dtype, device=model_device)
+        baseline_weight_ckpt = resolve_weight_checkpoint(baseline_ckpt)
+        baseline_model.load_checkpoint(str(baseline_weight_ckpt))
+        baseline_model.eval()
     processor = getattr(getattr(dataset, "lerobot_dataset", None), "processor", None)
     binarize_gripper = bool(cfg.get("EVALUATION", {}).get("binarize_gripper", False))
     infer_steps = (
@@ -689,6 +894,16 @@ def scan_episode_denoise_mse(
             processor=processor,
             binarize_gripper=binarize_gripper,
         )
+        if baseline_model is not None:
+            row["sync_baseline"] = _run_sync_baseline_for_loaded_sample(
+                baseline_model,
+                batch,
+                seed=int(seed) + int(dataset_index),
+                rand_device=str(rand_device),
+                infer_steps=int(infer_steps),
+                processor=processor,
+                binarize_gripper=binarize_gripper,
+            )
         row.update(
             {
                 "dataset_index": int(dataset_index),
@@ -730,6 +945,7 @@ def scan_episode_denoise_mse(
             "final_mse_min": float(min(final_mses)),
             "final_mse_max": float(max(final_mses)),
             "final_rmse_mean": _mean(final_rmses),
+            "final_mse_per_position_mean": _mean_per_position(rows, "final_mse_per_position"),
             "final_env_action_mse_mean": _mean(final_env_mses),
             "final_env_action_mse_min": None if not final_env_mses else float(min(final_env_mses)),
             "final_env_action_mse_max": None if not final_env_mses else float(max(final_env_mses)),
@@ -738,7 +954,25 @@ def scan_episode_denoise_mse(
         "worst": rows_worst[: max(int(top_k), 0)],
         "best": rows_best[: max(int(top_k), 0)],
     }
-    del model, dataset
+    if baseline_model is not None and baseline_weight_ckpt is not None:
+        baseline_rows = [row["sync_baseline"] for row in rows]
+        baseline_mses = [float(row["final_mse"]) for row in baseline_rows]
+        result["sync_baseline"] = {
+            "ckpt": str(baseline_weight_ckpt),
+            "summary": {
+                "final_mse_mean": _mean(baseline_mses),
+                "final_mse_min": float(min(baseline_mses)),
+                "final_mse_max": float(max(baseline_mses)),
+                "final_mse_per_position_mean": _mean_per_position(baseline_rows, "final_mse_per_position"),
+                "final_env_action_mse_mean": _mean(
+                    [float(row["final_env_action_mse"]) for row in baseline_rows if row.get("final_env_action_mse") is not None]
+                ),
+                "final_env_action_mse_per_position_mean": _mean_per_position(
+                    baseline_rows, "final_env_action_mse_per_position"
+                ),
+            },
+        }
+    del model, baseline_model, dataset
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return result
@@ -750,6 +984,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task-config", default="libero_streaming_action_ft_2cam224_1e-4")
     parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--baseline-task-config", default=None)
+    parser.add_argument("--baseline-ckpt", default=None)
     parser.add_argument("--schedule-path", required=True)
     parser.add_argument("--schedule-index", type=int, default=0)
     parser.add_argument("--dataset-index", type=int, default=0)
@@ -787,10 +1023,21 @@ def main() -> None:
                 f"task={args.task_config}",
             ],
         )
+        baseline_cfg = None
+        if args.baseline_ckpt is not None:
+            baseline_task_config = args.task_config if args.baseline_task_config is None else args.baseline_task_config
+            baseline_cfg = compose(
+                config_name="train",
+                overrides=[
+                    f"task={baseline_task_config}",
+                ],
+            )
     if args.random_pairs:
         result = scan_random_schedule_sample_pairs(
             cfg,
             ckpt=str(args.ckpt),
+            baseline_cfg=baseline_cfg,
+            baseline_ckpt=args.baseline_ckpt,
             schedule_path=args.schedule_path,
             seed=int(args.seed),
             device=args.device,
@@ -803,6 +1050,8 @@ def main() -> None:
         result = scan_episode_denoise_mse(
             cfg,
             ckpt=str(args.ckpt),
+            baseline_cfg=baseline_cfg,
+            baseline_ckpt=args.baseline_ckpt,
             schedule_path=args.schedule_path,
             episode_index=int(args.episode_index),
             seed=int(args.seed),
@@ -820,6 +1069,8 @@ def main() -> None:
         result = scan_schedule_denoise_mse(
             cfg,
             ckpt=str(args.ckpt),
+            baseline_cfg=baseline_cfg,
+            baseline_ckpt=args.baseline_ckpt,
             schedule_path=args.schedule_path,
             dataset_index=int(args.dataset_index),
             seed=int(args.seed),
@@ -835,6 +1086,8 @@ def main() -> None:
         result = run_one_schedule_denoise_mse(
             cfg,
             ckpt=str(args.ckpt),
+            baseline_cfg=baseline_cfg,
+            baseline_ckpt=args.baseline_ckpt,
             schedule_path=args.schedule_path,
             schedule_index=int(args.schedule_index),
             dataset_index=int(args.dataset_index),

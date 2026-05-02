@@ -30,7 +30,7 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.", "proprio_embedding.")
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "ffn_dim",
@@ -64,8 +64,6 @@ class ActionDiT(nn.Module):
         self.freq_dim = freq_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
-        self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
-
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
         if attn_head_dim <= 0:
@@ -84,13 +82,6 @@ class ActionDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.proprio_embedding = None
-        if self.proprio_dim is not None:
-            self.proprio_embedding = nn.Sequential(
-                nn.Linear(self.proprio_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.blocks = nn.ModuleList(
             [
@@ -247,7 +238,6 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
-        proprio: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -296,24 +286,7 @@ class ActionDiT(nn.Module):
                 f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
             )
 
-        if proprio is not None:
-            if self.proprio_embedding is None or self.proprio_dim is None:
-                raise ValueError("`proprio` was provided but `ActionDiT` was initialized without `proprio_dim`.")
-            if proprio.ndim != 2:
-                raise ValueError(f"`proprio` must be 2D [B, D], got shape {tuple(proprio.shape)}")
-            if proprio.shape[0] != batch_size:
-                raise ValueError(
-                    f"Batch mismatch between action tokens and proprio: {batch_size} vs {proprio.shape[0]}"
-                )
-            if proprio.shape[1] != self.proprio_dim:
-                raise ValueError(
-                    f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}"
-                )
-
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        if proprio is not None:
-            # Inject proprio into AdaLN modulation without polluting the shared text/video context.
-            t = t + self.proprio_embedding(proprio.to(device=t.device, dtype=t.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
         tokens = self.action_encoder(action_tokens)
@@ -343,14 +316,12 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
-        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pre_state = self.pre_dit(
             action_tokens=action_tokens,
             timestep=timestep,
             context=context,
             context_mask=context_mask,
-            proprio=proprio,
         )
         x = pre_state["tokens"]
         context = pre_state["context"]

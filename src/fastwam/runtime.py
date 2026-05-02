@@ -453,18 +453,7 @@ def _run_training_once(cfg: DictConfig):
 
 
 def run_training(cfg: DictConfig):
-    round_cfg = copy.deepcopy(cfg)
-    streaming_cfg = cfg.get("STREAMING", None)
-    if streaming_cfg is not None:
-        schedule_path = streaming_cfg.get("schedule_path", None)
-        if schedule_path is not None:
-            OmegaConf.update(
-                round_cfg,
-                "model.streaming.streaming_train.schedule_path",
-                str(schedule_path),
-                force_add=True,
-            )
-    _run_training_once(round_cfg)
+    _run_training_once(copy.deepcopy(cfg))
 
 def run_inference(cfg: DictConfig):
     setup_logging(log_level=logging.INFO)

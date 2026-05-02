@@ -220,6 +220,18 @@ def run_single_episode_async(
                 runtime.wait_until_idle()
                 runtime.reset_for_formal_phase(env_step=num_steps_wait)
 
+            if num_steps_wait % obs_stride_env_steps == 0:
+                runtime.submit_observation(
+                    input_image=image,
+                    proprio=proprio,
+                    env_step=num_steps_wait,
+                    obs_index=obs_counter,
+                    obs_timestamp_ms=float(obs_counter) * control_dt_ms * float(obs_stride_env_steps),
+                    trigger_job=False,
+                )
+                obs_counter += 1
+                runtime.wait_until_idle()
+
             t = num_steps_wait
             executed_env_steps = 0
             pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (blocking-hf-video)")

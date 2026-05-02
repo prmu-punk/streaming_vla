@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,58 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+
+class ChunkOffsetRuntime(ProfiledRuntime):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._action_source_cache: dict[int, list[int]] = defaultdict(list)
+        self.last_served_action_trigger_env_step: int | None = None
+
+    def reset_for_formal_phase(self, *, env_step: int = 0) -> None:
+        super().reset_for_formal_phase(env_step=env_step)
+        self._action_source_cache.clear()
+        self.last_served_action_trigger_env_step = None
+
+    def _publish_action_chunk(
+        self,
+        action_chunk: np.ndarray,
+        *,
+        trigger_env_step: int,
+        applied_shift_steps: int = 0,
+        action_is_pad=None,
+    ) -> int:
+        dropped = 0
+        current_env_step = int(self._current_env_step)
+        action_is_pad_np = None
+        if action_is_pad is not None:
+            if torch.is_tensor(action_is_pad):
+                action_is_pad_np = action_is_pad.detach().to(device="cpu", dtype=torch.bool).numpy()
+            else:
+                action_is_pad_np = np.asarray(action_is_pad, dtype=bool)
+            if action_is_pad_np.ndim == 2:
+                action_is_pad_np = action_is_pad_np[0]
+        for i in range(int(action_chunk.shape[0])):
+            if action_is_pad_np is not None and bool(action_is_pad_np[i]):
+                continue
+            target_step = int(trigger_env_step) + int(applied_shift_steps) + i
+            if target_step < current_env_step:
+                dropped += 1
+                continue
+            self._ensembler.action_cache[target_step].append(np.asarray(action_chunk[i], dtype=np.float32))
+            self._action_source_cache[target_step].append(int(trigger_env_step))
+        self._dropped_prefix_actions += dropped
+        return dropped
+
+    def get_action(self, env_step: int, *, count_miss: bool = True) -> np.ndarray | None:
+        action = super().get_action(env_step, count_miss=count_miss)
+        if action is None:
+            return None
+        trigger_sources = self._action_source_cache.get(int(env_step), [])
+        self.last_served_action_trigger_env_step = None if len(trigger_sources) == 0 else int(trigger_sources[-1])
+        if int(env_step) in self._action_source_cache:
+            del self._action_source_cache[int(env_step)]
+        return action
 
 
 def _parse_args() -> argparse.Namespace:
@@ -168,6 +221,39 @@ def _array_stats(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def _slice_rows(rows: list[dict[str, Any]], start: int, end: int | None = None) -> list[dict[str, Any]]:
+    start = max(0, int(start))
+    if end is None:
+        return rows[start:]
+    return rows[start : max(start, int(end))]
+
+
+def _rows_stat(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
+    return _array_stats([float(row[key]) for row in rows])
+
+
+def _chunk_offset_stats(
+    rows: list[dict[str, Any]],
+    *,
+    action_horizon: int,
+    key: str,
+) -> list[dict[str, float | int | None]]:
+    buckets: list[list[float]] = [[] for _ in range(int(action_horizon))]
+    for row in rows:
+        chunk_offset = row.get("chunk_offset", None)
+        if chunk_offset is None:
+            continue
+        idx = int(chunk_offset)
+        if 0 <= idx < int(action_horizon):
+            buckets[idx].append(float(row[key]))
+    stats: list[dict[str, float | int | None]] = []
+    for idx, values in enumerate(buckets):
+        entry = {"chunk_offset": int(idx)}
+        entry.update(_array_stats(values))
+        stats.append(entry)
+    return stats
+
+
 def _episode_index_from_dataset_index(dataset, dataset_index: int) -> int:
     if not hasattr(dataset, "sample_index"):
         raise ValueError("Expected StreamingRobotEpisodeDataset with sample_index.")
@@ -247,7 +333,12 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
     action_context = action_context.to(device="cpu", dtype=action_model.torch_dtype)
     action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
 
-    obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", cfg.data.train.effective_obs_stride))
+    obs_stride_env_steps = int(
+        cfg.EVALUATION.get(
+            "async_obs_stride_env_steps",
+            cfg.data.train.get("obs_stride", 3),
+        )
+    )
     trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", cfg.data.train.trigger_every_n_obs))
     video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
     force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
@@ -261,7 +352,7 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
     binarize_gripper = bool(cfg.EVALUATION.get("binarize_gripper", False))
 
     action_postprocess = lambda x: _postprocess_libero_action_chunk(x, processor=processor, cfg=cfg)
-    runtime = ProfiledRuntime(
+    runtime = ChunkOffsetRuntime(
         video_model=video_model,
         action_model=action_model,
         video_context=video_context,
@@ -310,6 +401,11 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
             )
             runtime.reset_for_formal_phase(env_step=0)
         runner.start_formal_phase(obs_index_start=formal_obs_index_start)
+        runner.prime_formal_observation(
+            input_image=image0,
+            proprio=proprio0,
+            env_step=0,
+        )
 
         for env_step in range(max_steps):
             step_start = time.perf_counter()
@@ -331,9 +427,13 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
                 binarize_gripper=binarize_gripper,
             )
             diff = pred - target
+            trigger_env_step = runtime.last_served_action_trigger_env_step
+            chunk_offset = None if trigger_env_step is None else int(env_step) - int(trigger_env_step)
             rows.append(
                 {
                     "env_step": int(env_step),
+                    "trigger_env_step": None if trigger_env_step is None else int(trigger_env_step),
+                    "chunk_offset": chunk_offset,
                     "submitted_obs": bool(submitted_obs),
                     "had_initial_miss": bool(had_initial_miss),
                     "mse": float(np.mean(np.square(diff))),
@@ -358,7 +458,8 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
     mses = [float(row["mse"]) for row in rows]
     maes = [float(row["mae"]) for row in rows]
     head = rows[: min(8, len(rows))]
-    head_mses = [float(row["mse"]) for row in head]
+    next8 = _slice_rows(rows, 8, 16)
+    tail = _slice_rows(rows, 16, None)
     pred_arr = np.asarray([row["pred_action"] for row in rows], dtype=np.float32)
     target_arr = np.asarray([row["target_action"] for row in rows], dtype=np.float32)
     result = {
@@ -383,7 +484,14 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         "summary": {
             "env_action_mse": _array_stats(mses),
             "env_action_mae": _array_stats(maes),
-            "head8_env_action_mse": _array_stats(head_mses),
+            "head8_env_action_mse": _rows_stat(head, "mse"),
+            "next8_env_action_mse": _rows_stat(next8, "mse"),
+            "tail_env_action_mse": _rows_stat(tail, "mse"),
+            "chunk_offset_env_action_mse": _chunk_offset_stats(
+                rows,
+                action_horizon=action_horizon,
+                key="mse",
+            ),
             "per_dim_mse": (
                 []
                 if len(rows) == 0

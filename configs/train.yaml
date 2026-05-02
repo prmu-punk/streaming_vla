@@ -36,9 +36,9 @@ weight_decay: 0.0
 resume: null
 
 STREAMING:
-  obs_stride: 3
-  action_trigger_every_n_obs: 3
-  video_layers_per_chunk: 4
+  obs_stride: 2
+  action_trigger_every_n_obs: 4
+  video_layers_per_chunk: 30
   force_first_job: true
   control_dt_ms: 50.0
   warmup_action_jobs: 20

@@ -18,6 +18,7 @@ class AsyncStreamingRunner:
     formal_obs_count: int = 0
     first_formal_triggered: bool = False
     last_formal_obs_index: Optional[int] = None
+    last_formal_submit_env_step: Optional[int] = None
 
     def __post_init__(self) -> None:
         if int(self.obs_stride_env_steps) <= 0:
@@ -31,6 +32,33 @@ class AsyncStreamingRunner:
         self.formal_obs_count = 0
         self.first_formal_triggered = False
         self.last_formal_obs_index = None
+        self.last_formal_submit_env_step = None
+
+    def prime_formal_observation(
+        self,
+        *,
+        input_image: torch.Tensor,
+        proprio: Optional[torch.Tensor],
+        env_step: int,
+    ) -> bool:
+        t = int(env_step)
+        if t % self.obs_stride_env_steps != 0:
+            return False
+        obs_index = int(self.obs_counter)
+        self.runtime.submit_observation(
+            input_image=input_image,
+            proprio=proprio,
+            env_step=t,
+            obs_index=obs_index,
+            obs_timestamp_ms=self._obs_timestamp_ms(obs_index),
+            trigger_job=False,
+        )
+        self.runtime.wait_until_idle()
+        self.last_formal_obs_index = int(obs_index)
+        self.last_formal_submit_env_step = int(t)
+        self.obs_counter += 1
+        self.formal_obs_count += 1
+        return True
 
     def _obs_timestamp_ms(self, obs_index: int) -> float:
         return float(obs_index) * self.control_dt_ms * float(self.obs_stride_env_steps)
@@ -83,6 +111,8 @@ class AsyncStreamingRunner:
         env_step: int,
     ) -> bool:
         t = int(env_step)
+        if self.last_formal_submit_env_step is not None and t == int(self.last_formal_submit_env_step):
+            return False
         if t % self.obs_stride_env_steps != 0:
             return False
 
@@ -99,6 +129,7 @@ class AsyncStreamingRunner:
             trigger_job=should_trigger,
         )
         self.last_formal_obs_index = int(obs_index)
+        self.last_formal_submit_env_step = int(t)
         self.obs_counter += 1
         self.formal_obs_count += 1
         if should_trigger:
@@ -116,7 +147,7 @@ class AsyncStreamingRunner:
         while action is None:
             if int(self.runtime.pending_jobs()) <= 0:
                 fallback_obs_index = -1 if self.last_formal_obs_index is None else int(self.last_formal_obs_index)
-                self.runtime.submit_action_job(env_step=t, proprio=proprio, obs_index=fallback_obs_index)
+                self.runtime.submit_action_job(env_step=t, obs_index=fallback_obs_index)
             self.runtime.wait_until_idle()
             action = self.runtime.get_action(t, count_miss=False)
         return action

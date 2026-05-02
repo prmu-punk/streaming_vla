@@ -63,13 +63,10 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             raw_num_obs = int(ep_to[episode_idx].item() - ep_from[episode_idx].item())
             if raw_num_obs <= 1:
                 continue
-            effective_obs_count = ((raw_num_obs - 1) // self.effective_obs_stride) + 1
-            trigger_start = self.history_obs
-            trigger_end = effective_obs_count - self.future_obs
+            trigger_start = int(self.history_obs) * int(self.effective_obs_stride)
+            trigger_end = raw_num_obs - int(self.future_obs) * int(self.effective_obs_stride)
             for trigger_obs_idx in range(trigger_start, trigger_end):
-                if self.keep_trigger_phase and ((trigger_obs_idx + 1) % self.trigger_every_n_obs != 0):
-                    continue
-                raw_action_start = trigger_obs_idx * self.effective_obs_stride
+                raw_action_start = int(trigger_obs_idx)
                 if raw_action_start + self.action_horizon > raw_num_obs - 1:
                     continue
                 sample_index.append((episode_idx, trigger_obs_idx, raw_action_start))
@@ -197,10 +194,10 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         payload = self._load_episode_cache(episode_idx)
 
         raw_frame_indices = [
-            (trigger_obs_idx - 1) * self.effective_obs_stride,
-            trigger_obs_idx * self.effective_obs_stride,
-            (trigger_obs_idx + 1) * self.effective_obs_stride,
-            (trigger_obs_idx + 2) * self.effective_obs_stride,
+            trigger_obs_idx - self.effective_obs_stride,
+            trigger_obs_idx,
+            trigger_obs_idx + self.effective_obs_stride,
+            trigger_obs_idx + 2 * self.effective_obs_stride,
         ]
         video = self._query_episode_images(
             dataset=payload["dataset"],

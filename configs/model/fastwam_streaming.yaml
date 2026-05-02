@@ -60,7 +60,7 @@ loss:
 
 streaming:
   freeze_video_expert: true
-  proprio_to_action_only: true
+  use_cache_time_embedding: false
   infer_frontier_schedule: null
   streaming_train:
     enabled: false

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 import threading
 from typing import Any, Optional
@@ -45,9 +44,6 @@ class StreamingActionJob:
     timesteps: torch.Tensor
     deltas: torch.Tensor
     latents_action: torch.Tensor
-    context: torch.Tensor
-    context_mask: torch.Tensor
-    proprio: Optional[torch.Tensor] = None
     trigger_obs_index: int = -1
     trigger_env_step: int = -1
     action_is_pad: Optional[torch.Tensor] = None
@@ -87,9 +83,6 @@ class StreamingCacheState:
         self.live_layer_env_steps: list[int] = []
         self.live_layer_obs_timestamps_ms: list[float] = []
         self.live_layer_ready_events: list[Optional[Any]] = []
-        self.pending_versions: deque[VideoCacheVersion] = deque()
-        self.current_update: Optional[VideoCacheVersion] = None
-        self.current_frontier: int = 0
         self.latest_version_id: int = -1
 
     def bootstrap(
@@ -118,17 +111,14 @@ class StreamingCacheState:
                         f"`layer_ready_events` must contain {self.num_layers} entries, got {len(layer_ready_events)}."
                     )
                 self.live_layer_ready_events = list(layer_ready_events)
-            self.pending_versions.clear()
-            self.current_update = None
-            self.current_frontier = 0
+            return
 
     def has_live_cache(self) -> bool:
         with self._lock:
             return self.live_cache_layers is not None
 
     def has_pending_update(self) -> bool:
-        with self._lock:
-            return self.current_update is not None or bool(self.pending_versions)
+        return False
 
     def apply_layer_update(
         self,
@@ -164,43 +154,14 @@ class StreamingCacheState:
             self.live_layer_obs_timestamps_ms[layer_idx] = float(version.obs_timestamp_ms)
             self.live_layer_ready_events[layer_idx] = ready_event
 
-    def _activate_next_pending(self) -> None:
-        with self._lock:
-            if self.current_update is None and self.pending_versions:
-                self.current_update = self.pending_versions.popleft()
-                self.current_frontier = 0
-
     def register_pending(self, version: VideoCacheVersion) -> None:
-        if self.live_cache_layers is None:
-            self.bootstrap(version)
-            return
-        with self._lock:
-            self.latest_version_id = max(self.latest_version_id, int(version.version))
-            self.pending_versions.append(version)
-        self._activate_next_pending()
+        self.bootstrap(version)
 
     def advance_frontier(self, max_layers: int = 1) -> int:
         if not self.has_live_cache():
             raise ValueError("No live video cache is available. Submit or bootstrap an observation first.")
-        requested = max(0, int(max_layers))
-        advanced = 0
-        while advanced < requested:
-            self._activate_next_pending()
-            with self._lock:
-                if self.current_update is None:
-                    break
-                current_update = self.current_update
-                current_frontier = self.current_frontier
-            self.apply_layer_update(current_update, current_frontier)
-            with self._lock:
-                self.current_frontier += 1
-                current_frontier = self.current_frontier
-            advanced += 1
-            with self._lock:
-                if current_frontier >= self.num_layers:
-                    self.current_update = None
-                    self.current_frontier = 0
-        return advanced
+        del max_layers
+        return int(self.num_layers)
 
     def _snapshot_header(self) -> tuple[int, int, int, float, int]:
         if not self.live_layer_version_ids:

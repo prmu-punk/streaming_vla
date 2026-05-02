@@ -16,11 +16,9 @@ model:
   mot_checkpoint_mixed_attn: false
   streaming:
     freeze_video_expert: true
-    proprio_to_action_only: true
     obs_stride: ${STREAMING.obs_stride}
     streaming_train:
       enabled: true
-      schedule_path: ${STREAMING.schedule_path}
       mix_with_base_loss: false
       lambda_streaming_action: 1.0
       lambda_base: 1.0

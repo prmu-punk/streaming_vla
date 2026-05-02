@@ -78,7 +78,6 @@ class StreamingBackbone:
         video_kv_cache: list[dict[str, torch.Tensor]],
         video_seq_len: int,
         video_tokens_per_frame: int,
-        proprio: Optional[torch.Tensor],
         action_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attention_mask = self.build_joint_attention_mask(
@@ -96,7 +95,6 @@ class StreamingBackbone:
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=int(video_seq_len),
-            proprio=proprio,
         )
 
     def _loss_stream_full_chunk(
@@ -500,6 +498,15 @@ class StreamingBackbone:
             )
 
         target_action = episode_batch["target_action"]
+        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
+            prompt=None,
+            context=episode_batch["context"],
+            context_mask=episode_batch["context_mask"],
+            proprio=episode_batch["proprio_t"],
+        )
+        episode_batch = dict(episode_batch)
+        episode_batch["context"] = resolved_context
+        episode_batch["context_mask"] = resolved_context_mask
         timestep_action, noisy_action, target_noise = self._sample_noisy_triplet(target_action)
         bucket = self._map_training_timestep_to_bucket(timestep_action)
         required_cache_keys = ["prev", "cur", "next", "next2"]
@@ -543,7 +550,6 @@ class StreamingBackbone:
             video_kv_cache=stitched_cache,
             video_seq_len=int(selected_caches["video_seq_len"]),
             video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
-            proprio=episode_batch["proprio_t"] if self.streaming_proprio_to_action_only else None,
             action_is_pad=action_is_pad,
         )
         loss_stream = self._loss_stream_full_chunk(

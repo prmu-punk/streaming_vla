@@ -45,6 +45,7 @@ def _video_worker_loop(
     layer_queue,
     control_queue,
 ) -> None:
+    del video_layers_per_chunk
     video_refresh_samples_ms: list[float] = []
 
     def _export_layer_cache(layer_cache: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -55,6 +56,27 @@ def _video_worker_loop(
             "v": layer_cache["v"].detach().clone(),
             "source_delta": int(layer_cache.get("source_delta", 0)),
         }
+
+    def _publish_full_cache(version) -> None:
+        exported_layers = []
+        for layer_idx, layer_cache in enumerate(version.cache_layers):
+            if layer_cache is None:
+                raise RuntimeError(f"Version {version.version} layer {layer_idx} is None.")
+            exported_layers.append(_export_layer_cache(layer_cache))
+        layer_queue.put(
+            {
+                "type": "cache_update",
+                "version": int(version.version),
+                "obs_index": int(version.obs_index),
+                "env_step": int(version.env_step),
+                "obs_timestamp_ms": float(version.obs_timestamp_ms),
+                "video_seq_len": int(version.video_seq_len),
+                "tokens_per_frame": int(version.tokens_per_frame),
+                "cache_layers": exported_layers,
+                "context": version.context.detach().to(device="cpu", dtype=torch.float32),
+                "context_mask": version.context_mask.detach().to(device="cpu", dtype=torch.bool),
+            }
+        )
 
     try:
         video_model = video_model.to(video_model.device).eval()
@@ -87,6 +109,14 @@ def _video_worker_loop(
             obs_index = int(msg["obs_index"])
             env_step = int(msg.get("env_step", obs_index))
             obs_timestamp_ms = float(msg["obs_timestamp_ms"])
+            proprio_cpu = msg.get("proprio")
+            proprio = None
+            if proprio_cpu is not None:
+                proprio = proprio_cpu.to(
+                    device=video_model.device,
+                    dtype=video_model.torch_dtype,
+                    non_blocking=True,
+                )
             input_image_cpu = msg["input_image"]
             if input_image_cpu.ndim == 3:
                 input_image_cpu = input_image_cpu.unsqueeze(0)
@@ -102,80 +132,27 @@ def _video_worker_loop(
                     input_image=input_image,
                     context=video_context,
                     context_mask=video_context_mask,
+                    proprio=proprio,
                     obs_index=obs_index,
                     env_step=env_step,
                     obs_timestamp_ms=obs_timestamp_ms,
                     tiled=tiled,
                 )
-                for layer_idx, layer_cache in enumerate(version.cache_layers):
-                    if layer_cache is None:
-                        raise RuntimeError(f"Bootstrap layer {layer_idx} is None.")
-                    exported = _export_layer_cache(layer_cache)
-                    layer_queue.put(
-                        {
-                            "type": "layer_update",
-                            "layer_idx": int(layer_idx),
-                            "version": int(version.version),
-                            "obs_index": int(version.obs_index),
-                            "env_step": int(version.env_step),
-                            "obs_timestamp_ms": float(version.obs_timestamp_ms),
-                            "video_seq_len": int(version.video_seq_len),
-                            "tokens_per_frame": int(version.tokens_per_frame),
-                            "k": exported["k"],
-                            "v": exported["v"],
-                            "source_delta": exported["source_delta"],
-                        }
-                    )
+                _publish_full_cache(version)
                 video_refresh_samples_ms.append((time.perf_counter() - t0) * 1000.0)
                 continue
 
-            version, video_pre, video_attention_mask = video_model._prepare_streaming_video_version(
+            version = video_model.submit_observation(
                 input_image=input_image,
                 context=video_context,
                 context_mask=video_context_mask,
+                proprio=proprio,
                 obs_index=obs_index,
                 env_step=env_step,
                 obs_timestamp_ms=obs_timestamp_ms,
                 tiled=tiled,
             )
-
-            def _publish_layer(layer_idx: int, layer_cache: dict[str, torch.Tensor]) -> None:
-                version.cache_layers[layer_idx] = {
-                    "k": layer_cache["k"],
-                    "v": layer_cache["v"],
-                    "source_delta": int(layer_cache.get("source_delta", 0)),
-                }
-                video_model.streaming_cache_state.apply_layer_update(version, layer_idx, ready_event=None)
-                exported = _export_layer_cache(layer_cache)
-                layer_queue.put(
-                    {
-                        "type": "layer_update",
-                        "layer_idx": int(layer_idx),
-                        "version": int(version.version),
-                        "obs_index": int(version.obs_index),
-                        "env_step": int(version.env_step),
-                        "obs_timestamp_ms": float(version.obs_timestamp_ms),
-                        "video_seq_len": int(version.video_seq_len),
-                        "tokens_per_frame": int(version.tokens_per_frame),
-                        "k": exported["k"],
-                        "v": exported["v"],
-                        "source_delta": exported["source_delta"],
-                    }
-                )
-
-            prefill_state = video_model.mot.init_video_prefill_state(
-                video_tokens=video_pre["tokens"],
-                video_freqs=video_pre["freqs"],
-                video_t_mod=video_pre["t_mod"],
-                video_context_payload={"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                video_attention_mask=video_attention_mask,
-            )
-            while prefill_state.next_layer_idx < video_model.mot.num_layers:
-                video_model.mot.advance_video_prefill_state(
-                    state=prefill_state,
-                    max_layers=video_layers_per_chunk,
-                    layer_callback=_publish_layer,
-                )
+            _publish_full_cache(version)
             video_refresh_samples_ms.append((time.perf_counter() - t0) * 1000.0)
 
         control_queue.put(
@@ -216,36 +193,53 @@ def _run_action_worker_loop(
         block: bool,
         timeout_s: float = 0.0,
     ) -> tuple[int, float]:
-        pending_by_layer: dict[int, dict[str, Any]] = {}
+        latest_update: Optional[dict[str, Any]] = None
         copy_ms = 0.0
         while True:
             try:
-                if block and len(pending_by_layer) == 0:
+                if block and latest_update is None:
                     msg = layer_queue.get(timeout=timeout_s)
                 else:
                     msg = layer_queue.get_nowait()
             except queue.Empty:
                 break
-            if str(msg.get("type")) != "layer_update":
+            if str(msg.get("type")) != "cache_update":
                 continue
-            layer_idx = int(msg["layer_idx"])
-            pending_by_layer[layer_idx] = msg
+            latest_update = msg
 
-        for layer_idx, msg in pending_by_layer.items():
+        if latest_update is None:
+            return 0, copy_ms
+
+        cache_layers_msg = list(latest_update["cache_layers"])
+        if len(cache_layers_msg) != num_layers:
+            raise ValueError(
+                f"Expected {num_layers} cache layers in cache_update, got {len(cache_layers_msg)}."
+            )
+        for layer_idx, layer_msg in enumerate(cache_layers_msg):
             t_copy0 = time.perf_counter()
             layer_cache_on_action[layer_idx] = {
-                "k": msg["k"].to(device=action_model.device, non_blocking=True),
-                "v": msg["v"].to(device=action_model.device, non_blocking=True),
-                "source_delta": int(msg.get("source_delta", 0)),
+                "k": layer_msg["k"].to(device=action_model.device, non_blocking=True),
+                "v": layer_msg["v"].to(device=action_model.device, non_blocking=True),
+                "source_delta": int(layer_msg.get("source_delta", 0)),
             }
             copy_ms += (time.perf_counter() - t_copy0) * 1000.0
-            layer_version_ids[layer_idx] = int(msg["version"])
-            layer_obs_indices[layer_idx] = int(msg["obs_index"])
-            layer_env_steps[layer_idx] = int(msg.get("env_step", msg["obs_index"]))
-            layer_obs_timestamps_ms[layer_idx] = float(msg["obs_timestamp_ms"])
-            live_video_seq_len[0] = int(msg["video_seq_len"])
-            live_tokens_per_frame[0] = int(msg["tokens_per_frame"])
-        return len(pending_by_layer), copy_ms
+            layer_version_ids[layer_idx] = int(latest_update["version"])
+            layer_obs_indices[layer_idx] = int(latest_update["obs_index"])
+            layer_env_steps[layer_idx] = int(latest_update.get("env_step", latest_update["obs_index"]))
+            layer_obs_timestamps_ms[layer_idx] = float(latest_update["obs_timestamp_ms"])
+        live_video_seq_len[0] = int(latest_update["video_seq_len"])
+        live_tokens_per_frame[0] = int(latest_update["tokens_per_frame"])
+        live_context[0] = latest_update["context"].to(
+            device=action_model.device,
+            dtype=action_model.torch_dtype,
+            non_blocking=True,
+        )
+        live_context_mask[0] = latest_update["context_mask"].to(
+            device=action_model.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+        return 1, copy_ms
 
     try:
         action_model = action_model.to(action_model.device).eval()
@@ -274,6 +268,8 @@ def _run_action_worker_loop(
         layer_obs_timestamps_ms: list[float] = [0.0] * num_layers
         live_video_seq_len = [-1]
         live_tokens_per_frame = [-1]
+        live_context = [action_context]
+        live_context_mask = [action_context_mask]
 
         while True:
             _drain_layer_updates(block=False)
@@ -299,14 +295,6 @@ def _run_action_worker_loop(
             phase_id = int(msg.get("phase_id", -1))
             job_id = int(msg.get("job_id", -1))
             seed_offset = int(msg["job_seed_offset"])
-            proprio_cpu = msg.get("proprio")
-            proprio = None
-            if proprio_cpu is not None:
-                proprio = proprio_cpu.to(
-                    device=action_model.device,
-                    dtype=action_model.torch_dtype,
-                    non_blocking=True,
-                )
 
             job_seed = None
             if seed is not None:
@@ -315,7 +303,6 @@ def _run_action_worker_loop(
                 action_horizon=int(action_horizon),
                 context=action_context,
                 context_mask=action_context_mask,
-                proprio=proprio,
                 trigger_obs_index=int(trigger_obs_index),
                 trigger_env_step=int(trigger_env_step),
                 num_inference_steps=int(num_inference_steps),
@@ -368,8 +355,8 @@ def _run_action_worker_loop(
                         }  # type: ignore[index]
                         for layer_idx, layer in enumerate(layer_cache_on_action)
                     ],
-                    context=action_context,
-                    context_mask=action_context_mask,
+                    context=live_context[0],
+                    context_mask=live_context_mask[0],
                     layer_version_ids=list(layer_version_ids),
                     layer_obs_indices=list(layer_obs_indices),
                     layer_env_steps=list(layer_env_steps),
@@ -430,6 +417,12 @@ def _run_action_worker_loop(
                 "trigger_env_step": int(trigger_env_step),
                 "trigger_obs_index": int(trigger_obs_index),
                 "latents_action_cpu": job.latents_action.detach().to(device="cpu", dtype=torch.float32),
+                "action_is_pad_cpu": (
+                    None
+                    if job.action_is_pad is None
+                    else job.action_is_pad.detach().to(device="cpu", dtype=torch.bool)
+                ),
+                "applied_shift_steps": int(job.applied_shift_steps),
                 "job_step_samples_ms": [float(v) for v in job_step_samples_ms],
                 "job_snapshot_copy_samples_ms": [float(v) for v in job_snapshot_copy_samples_ms],
                 "job_duration_ms": float(sum(job_step_samples_ms)),

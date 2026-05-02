@@ -225,6 +225,8 @@ class StreamingRuntime:
             self._publish_action_chunk(
                 action_chunk=np.asarray(action_chunk, dtype=np.float32),
                 trigger_env_step=int(msg["trigger_env_step"]),
+                applied_shift_steps=int(msg.get("applied_shift_steps", 0)),
+                action_is_pad=msg.get("action_is_pad_cpu"),
             )
 
     def _sync_main_state(self) -> None:
@@ -383,6 +385,11 @@ class StreamingRuntime:
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         image_cpu = input_image.detach().to(device="cpu", dtype=torch.float32)
+        prop_cpu = None
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            prop_cpu = proprio.detach().to(device="cpu", dtype=torch.float32)
         self._put_queue(
             self._obs_queue,
             {
@@ -391,27 +398,22 @@ class StreamingRuntime:
                 "obs_index": int(obs_index),
                 "obs_timestamp_ms": float(obs_timestamp_ms),
                 "input_image": image_cpu,
+                "proprio": prop_cpu,
             },
         )
         self._submitted_obs += 1
         self._obs_count += 1
         if trigger_job:
-            self.submit_action_job(env_step=env_step, proprio=proprio, obs_index=obs_index)
+            self.submit_action_job(env_step=env_step, obs_index=obs_index)
 
     def submit_action_job(
         self,
         *,
         env_step: int,
-        proprio: Optional[torch.Tensor],
         obs_index: int = -1,
     ) -> None:
         self._poll_control_queue()
         self._raise_if_error()
-        prop_cpu = None
-        if proprio is not None:
-            if proprio.ndim == 1:
-                proprio = proprio.unsqueeze(0)
-            prop_cpu = proprio.detach().to(device="cpu", dtype=torch.float32)
         self._put_queue(
             self._job_queue,
             {
@@ -420,7 +422,6 @@ class StreamingRuntime:
                 "job_id": int(self._job_id_counter),
                 "trigger_env_step": int(env_step),
                 "obs_index": int(obs_index),
-                "proprio": prop_cpu,
                 "job_seed_offset": int(self._job_seed_counter),
             },
         )
@@ -440,11 +441,28 @@ class StreamingRuntime:
         self._sync_main_state()
         return max(0, int(self._submitted_jobs - self._completed_jobs))
 
-    def _publish_action_chunk(self, action_chunk: np.ndarray, *, trigger_env_step: int) -> int:
+    def _publish_action_chunk(
+        self,
+        action_chunk: np.ndarray,
+        *,
+        trigger_env_step: int,
+        applied_shift_steps: int = 0,
+        action_is_pad=None,
+    ) -> int:
         dropped = 0
         current_env_step = int(self._current_env_step)
+        action_is_pad_np = None
+        if action_is_pad is not None:
+            if torch.is_tensor(action_is_pad):
+                action_is_pad_np = action_is_pad.detach().to(device="cpu", dtype=torch.bool).numpy()
+            else:
+                action_is_pad_np = np.asarray(action_is_pad, dtype=bool)
+            if action_is_pad_np.ndim == 2:
+                action_is_pad_np = action_is_pad_np[0]
         for i in range(int(action_chunk.shape[0])):
-            target_step = int(trigger_env_step) + i
+            if action_is_pad_np is not None and bool(action_is_pad_np[i]):
+                continue
+            target_step = int(trigger_env_step) + int(applied_shift_steps) + i
             if target_step < current_env_step:
                 dropped += 1
                 continue
