@@ -19,80 +19,8 @@ model:
     obs_stride: ${STREAMING.obs_stride}
     streaming_train:
       enabled: true
-      mix_with_base_loss: false
-      lambda_streaming_action: 1.0
-      lambda_base: 1.0
-      infer_num_inference_steps: 8
-      xt_timestep_jitter: 0.0
-      position_decay_tau: 12.0
-      position_decay_power: 2.0
-      distribution:
-        0:
-          - mode: full_prev
-            prob: 0.9731404958677685
-          - mode: full_cur
-            prob: 0.024793388429752063
-          - mode: full_next
-            prob: 0.002066115702479339
-        1:
-          - mode: full_cur
-            prob: 0.9895833333333334
-          - mode: full_next
-            prob: 0.010416666666666668
-        2:
-          - mode: full_cur
-            prob: 0.9917525773195877
-          - mode: full_next
-            prob: 0.008247422680412373
-        3:
-          - mode: full_cur
-            prob: 0.9854771784232366
-          - mode: full_next
-            prob: 0.014522821576763486
-        4:
-          - mode: full_cur
-            prob: 0.9640591966173362
-          - mode: full_next
-            prob: 0.03594080338266385
-        5:
-          - mode: full_cur
-            prob: 0.9370932754880694
-          - mode: full_next
-            prob: 0.060737527114967466
-          - mode: full_next2
-            prob: 0.002169197396963124
-        6:
-          - mode: full_cur
-            prob: 0.7537993920972644
-          - mode: full_next
-            prob: 0.22796352583586627
-          - mode: full_next2
-            prob: 0.0182370820668693
-        7:
-          - mode: full_next
-            prob: 0.9533333333333334
-          - mode: full_next2
-            prob: 0.036666666666666674
-          - mode: full_cur
-            prob: 0.01
-        8:
-          - mode: full_next
-            prob: 0.959915611814346
-          - mode: full_next2
-            prob: 0.03164556962025316
-          - mode: full_cur
-            prob: 0.006329113924050633
-          - mode: full_next3
-            prob: 0.0021097046413502112
-        9:
-          - mode: full_next
-            prob: 0.9320594479830149
-          - mode: full_next2
-            prob: 0.05520169851380042
-          - mode: full_cur
-            prob: 0.006369426751592356
-          - mode: full_next3
-            prob: 0.006369426751592356
+      cache_mode: full_cur
+      token_noise_pattern: front_low_high
 
 lr_scheduler_type: "cosine"
 learning_rate: 5e-5

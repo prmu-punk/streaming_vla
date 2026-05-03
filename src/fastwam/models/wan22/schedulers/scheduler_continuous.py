@@ -52,7 +52,7 @@ class WanContinuousFlowMatchScheduler:
         )
         if sigma.ndim == 0:
             return (1 - sigma) * original_samples + sigma * noise
-        sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
+        sigma = sigma.view(*sigma.shape, *([1] * (original_samples.ndim - sigma.ndim)))
         return (1 - sigma) * original_samples + sigma * noise
 
     @staticmethod
@@ -84,5 +84,5 @@ class WanContinuousFlowMatchScheduler:
         delta = delta.to(sample.device, dtype=sample.dtype)
         if delta.ndim == 0:
             return sample + model_output * delta
-        delta = delta.view(-1, *([1] * (sample.ndim - 1)))
+        delta = delta.view(*delta.shape, *([1] * (sample.ndim - delta.ndim)))
         return sample + model_output * delta

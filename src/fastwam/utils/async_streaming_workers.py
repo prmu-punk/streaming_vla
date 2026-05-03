@@ -271,136 +271,173 @@ def _run_action_worker_loop(
         live_context = [action_context]
         live_context_mask = [action_context_mask]
 
-        while True:
-            _drain_layer_updates(block=False)
-            try:
-                msg = job_queue.get(timeout=0.01)
-            except queue.Empty:
-                continue
-            msg_type = str(msg.get("type"))
-            if msg_type == "stop":
-                _drain_layer_updates(block=False)
-                break
-            if msg_type == "flush":
-                _drain_layer_updates(block=False)
-                control_queue.put(
-                    {"type": "flush_ack", "worker": "action", "flush_id": int(msg["flush_id"])}
-                )
-                continue
-            if msg_type != "job":
-                continue
+        active_job = None
+        active_phase_id = 0
+        step_id_counter = 0
+        pending_flush_ids: list[int] = []
+        pending_reset_phase: Optional[tuple[int, int]] = None
+        pending_stop = False
 
-            trigger_env_step = int(msg["trigger_env_step"])
-            trigger_obs_index = int(msg.get("obs_index", -1))
-            phase_id = int(msg.get("phase_id", -1))
-            job_id = int(msg.get("job_id", -1))
-            seed_offset = int(msg["job_seed_offset"])
+        def _drain_control_messages() -> bool:
+            nonlocal pending_reset_phase, pending_stop
+            handled = False
+            while True:
+                try:
+                    msg = job_queue.get_nowait()
+                except queue.Empty:
+                    break
+                handled = True
+                msg_type = str(msg.get("type"))
+                if msg_type == "stop":
+                    pending_stop = True
+                    continue
+                if msg_type == "flush":
+                    pending_flush_ids.append(int(msg["flush_id"]))
+                    continue
+                if msg_type == "reset_phase":
+                    pending_reset_phase = (
+                        int(msg.get("phase_id", active_phase_id + 1)),
+                        int(msg.get("env_step", 0)),
+                    )
+                    continue
+            return handled
 
-            job_seed = None
-            if seed is not None:
-                job_seed = int(seed) + seed_offset
-            job = action_model.start_action_job(
-                action_horizon=int(action_horizon),
-                context=action_context,
-                context_mask=action_context_mask,
-                trigger_obs_index=int(trigger_obs_index),
-                trigger_env_step=int(trigger_env_step),
-                num_inference_steps=int(num_inference_steps),
-                sigma_shift=sigma_shift,
-                seed=job_seed,
-                rand_device=resolved_rand_device,
+        def _handle_pending_control_at_safe_point() -> bool:
+            nonlocal active_job, active_phase_id, step_id_counter, pending_reset_phase
+            handled = False
+            if pending_reset_phase is not None:
+                active_phase_id, _env_step = pending_reset_phase
+                step_id_counter = 0
+                active_job = None
+                for layer_idx in range(num_layers):
+                    layer_cache_on_action[layer_idx] = None
+                    layer_version_ids[layer_idx] = -1
+                    layer_obs_indices[layer_idx] = -1
+                    layer_env_steps[layer_idx] = -1
+                    layer_obs_timestamps_ms[layer_idx] = 0.0
+                live_video_seq_len[0] = -1
+                live_tokens_per_frame[0] = -1
+                pending_reset_phase = None
+                handled = True
+            if pending_flush_ids:
+                for flush_id in pending_flush_ids:
+                    control_queue.put(
+                        {"type": "flush_ack", "worker": "action", "flush_id": int(flush_id)}
+                    )
+                pending_flush_ids.clear()
+                handled = True
+            return handled
+
+        def _maybe_step_once() -> bool:
+            nonlocal active_job, step_id_counter
+            copy_ms_step = 0.0
+            _, drained_copy_ms = _drain_layer_updates(block=False)
+            copy_ms_step += drained_copy_ms
+            if (
+                any(layer is None for layer in layer_cache_on_action)
+                or live_video_seq_len[0] <= 0
+                or live_tokens_per_frame[0] <= 0
+            ):
+                return False
+
+            version, obs_index, env_step, obs_timestamp_ms, frontier = _snapshot_header(
+                layer_version_ids=layer_version_ids,
+                layer_obs_indices=layer_obs_indices,
+                layer_env_steps=layer_env_steps,
+                layer_obs_timestamps_ms=layer_obs_timestamps_ms,
             )
+            if active_job is None:
+                job_seed = None if seed is None else int(seed) + int(step_id_counter)
+                active_job = action_model.start_action_job(
+                    action_horizon=int(action_horizon),
+                    context=action_context,
+                    context_mask=action_context_mask,
+                    trigger_obs_index=int(obs_index),
+                    trigger_env_step=int(env_step),
+                    num_inference_steps=int(num_inference_steps),
+                    sigma_shift=sigma_shift,
+                    seed=job_seed,
+                    rand_device=resolved_rand_device,
+                    persistent=True,
+                )
 
+            job = active_job
             job_step_samples_ms: list[float] = []
             job_step_event_pairs: list[tuple[Any, Any]] = []
             job_step_wall_samples_ms: list[float] = []
             job_snapshot_copy_samples_ms: list[float] = []
             job_layer_source_steps: list[dict[str, Any]] = []
             job_wall_t0 = time.perf_counter()
-            while not job.done:
-                copy_ms_step = 0.0
-                _, drained_copy_ms = _drain_layer_updates(block=False)
-                copy_ms_step += drained_copy_ms
-                while (
-                    any(layer is None for layer in layer_cache_on_action)
-                    or live_video_seq_len[0] <= 0
-                    or live_tokens_per_frame[0] <= 0
-                ):
-                    _, drained_copy_ms = _drain_layer_updates(block=True, timeout_s=0.01)
-                    copy_ms_step += drained_copy_ms
 
-                version, obs_index, env_step, obs_timestamp_ms, frontier = _snapshot_header(
-                    layer_version_ids=layer_version_ids,
-                    layer_obs_indices=layer_obs_indices,
-                    layer_env_steps=layer_env_steps,
-                    layer_obs_timestamps_ms=layer_obs_timestamps_ms,
+            snapshot = CacheSnapshot(
+                version=version,
+                obs_index=obs_index,
+                env_step=env_step,
+                obs_timestamp_ms=obs_timestamp_ms,
+                frontier=frontier,
+                video_seq_len=int(live_video_seq_len[0]),
+                tokens_per_frame=int(live_tokens_per_frame[0]),
+                cache_layers=[
+                    {
+                        "k": layer["k"],
+                        "v": layer["v"],
+                        "source_delta": 0,
+                    }  # type: ignore[index]
+                    for layer_idx, layer in enumerate(layer_cache_on_action)
+                ],
+                context=live_context[0],
+                context_mask=live_context_mask[0],
+                layer_version_ids=list(layer_version_ids),
+                layer_obs_indices=list(layer_obs_indices),
+                layer_env_steps=list(layer_env_steps),
+                layer_obs_timestamps_ms=list(layer_obs_timestamps_ms),
+                layer_ready_events=[None] * num_layers,
+            )
+            if (
+                active_job is not None
+                and job.token_denoise_counts is not None
+                and not bool(torch.any(job.token_denoise_counts < int(job.timesteps.shape[0])).item())
+                and int(env_step) <= int(job.window_start_env_step)
+            ):
+                return False
+            if profiled:
+                mode, mode_frontier, age_hist, latest_offset, older_offset = _classify_layer_sources(
+                    layer_env_steps=snapshot.layer_env_steps,
+                    trigger_env_step=int(job.window_start_env_step),
                 )
-                snapshot = CacheSnapshot(
-                    version=version,
-                    obs_index=obs_index,
-                    env_step=env_step,
-                    obs_timestamp_ms=obs_timestamp_ms,
-                    frontier=frontier,
-                    video_seq_len=int(live_video_seq_len[0]),
-                    tokens_per_frame=int(live_tokens_per_frame[0]),
-                    cache_layers=[
-                        {
-                            "k": layer["k"],
-                            "v": layer["v"],
-                            "source_delta": (
-                                0
-                                if int(trigger_env_step) < 0
-                                else int(layer_env_steps[layer_idx]) - int(trigger_env_step)
-                            ),
-                        }  # type: ignore[index]
-                        for layer_idx, layer in enumerate(layer_cache_on_action)
-                    ],
-                    context=live_context[0],
-                    context_mask=live_context_mask[0],
-                    layer_version_ids=list(layer_version_ids),
-                    layer_obs_indices=list(layer_obs_indices),
-                    layer_env_steps=list(layer_env_steps),
-                    layer_obs_timestamps_ms=list(layer_obs_timestamps_ms),
-                    layer_ready_events=[None] * num_layers,
+                job_layer_source_steps.append(
+                    {
+                        "denoise_step": int(job.current_step_idx),
+                        "layer_obs_indices": [int(v) for v in snapshot.layer_obs_indices],
+                        "mode": str(mode),
+                        "frontier": int(mode_frontier),
+                        "age_hist": {
+                            "age0": int(age_hist["age0"]),
+                            "age1": int(age_hist["age1"]),
+                            "age2": int(age_hist["age2"]),
+                            "age3p": int(age_hist["age3p"]),
+                        },
+                        "latest_offset": int(latest_offset),
+                        "older_offset": None if older_offset is None else int(older_offset),
+                    }
                 )
-                if profiled:
-                    mode, mode_frontier, age_hist, latest_offset, older_offset = _classify_layer_sources(
-                        layer_env_steps=snapshot.layer_env_steps,
-                        trigger_env_step=trigger_env_step,
-                    )
-                    job_layer_source_steps.append(
-                        {
-                            "denoise_step": int(job.current_step_idx),
-                            "layer_obs_indices": [int(v) for v in snapshot.layer_obs_indices],
-                            "mode": str(mode),
-                            "frontier": int(mode_frontier),
-                            "age_hist": {
-                                "age0": int(age_hist["age0"]),
-                                "age1": int(age_hist["age1"]),
-                                "age2": int(age_hist["age2"]),
-                                "age3p": int(age_hist["age3p"]),
-                            },
-                            "latest_offset": int(latest_offset),
-                            "older_offset": None if older_offset is None else int(older_offset),
-                        }
-                    )
-                if action_model.device.type == "cuda":
-                    step_wall_t0 = time.perf_counter()
-                    step_start_event = torch.cuda.Event(enable_timing=True)
-                    step_end_event = torch.cuda.Event(enable_timing=True)
-                    current_stream = torch.cuda.current_stream(device=action_model.device)
-                    step_start_event.record(current_stream)
-                    action_model.step_action_job(job, snapshot=snapshot)
-                    step_end_event.record(current_stream)
-                    job_step_event_pairs.append((step_start_event, step_end_event))
-                    job_step_wall_samples_ms.append((time.perf_counter() - step_wall_t0) * 1000.0)
-                else:
-                    step_t0 = time.perf_counter()
-                    action_model.step_action_job(job, snapshot=snapshot)
-                    job_step_samples_ms.append((time.perf_counter() - step_t0) * 1000.0)
-                job_snapshot_copy_samples_ms.append(float(copy_ms_step))
+            if action_model.device.type == "cuda" and profiled:
+                step_wall_t0 = time.perf_counter()
+                step_start_event = torch.cuda.Event(enable_timing=True)
+                step_end_event = torch.cuda.Event(enable_timing=True)
+                current_stream = torch.cuda.current_stream(device=action_model.device)
+                step_start_event.record(current_stream)
+                action_model.step_action_job(job, snapshot=snapshot)
+                step_end_event.record(current_stream)
+                job_step_event_pairs.append((step_start_event, step_end_event))
+                job_step_wall_samples_ms.append((time.perf_counter() - step_wall_t0) * 1000.0)
+            else:
+                step_t0 = time.perf_counter()
+                action_model.step_action_job(job, snapshot=snapshot)
+                job_step_samples_ms.append((time.perf_counter() - step_t0) * 1000.0)
+            job_snapshot_copy_samples_ms.append(float(copy_ms_step))
 
-            if action_model.device.type == "cuda":
+            if action_model.device.type == "cuda" and profiled:
                 torch.cuda.synchronize(action_model.device)
                 try:
                     job_step_samples_ms.extend(
@@ -410,19 +447,25 @@ def _run_action_worker_loop(
                 except RuntimeError:
                     job_step_samples_ms.extend(float(v) for v in job_step_wall_samples_ms)
 
+            released_mask = job.just_released_mask
+            released_actions_cpu = torch.empty(
+                (0, int(job.latents_action.shape[-1])),
+                dtype=torch.float32,
+            )
+            released_env_steps: list[int] = []
+            if released_mask is not None and bool(torch.any(released_mask).item()):
+                released_actions_cpu = job.latents_action[released_mask].detach().to(device="cpu", dtype=torch.float32)
+                if job.token_env_steps is None:
+                    raise ValueError("`job.token_env_steps` must be initialized when releasing actions.")
+                released_env_steps = [int(v) for v in job.token_env_steps[released_mask].detach().to(device="cpu").tolist()]
+
             result_payload = {
                 "type": "job_done",
-                "phase_id": int(phase_id),
-                "job_id": int(job_id),
-                "trigger_env_step": int(trigger_env_step),
-                "trigger_obs_index": int(trigger_obs_index),
-                "latents_action_cpu": job.latents_action.detach().to(device="cpu", dtype=torch.float32),
-                "action_is_pad_cpu": (
-                    None
-                    if job.action_is_pad is None
-                    else job.action_is_pad.detach().to(device="cpu", dtype=torch.bool)
-                ),
-                "applied_shift_steps": int(job.applied_shift_steps),
+                "phase_id": int(active_phase_id),
+                "job_id": int(step_id_counter),
+                "window_start_env_step": int(job.window_start_env_step),
+                "released_actions_cpu": released_actions_cpu,
+                "released_env_steps": released_env_steps,
                 "job_step_samples_ms": [float(v) for v in job_step_samples_ms],
                 "job_snapshot_copy_samples_ms": [float(v) for v in job_snapshot_copy_samples_ms],
                 "job_duration_ms": float(sum(job_step_samples_ms)),
@@ -431,6 +474,20 @@ def _run_action_worker_loop(
             if profiled:
                 result_payload["job_layer_source_steps"] = job_layer_source_steps
             result_queue.put(result_payload)
+            step_id_counter += 1
+            return True
+
+        while True:
+            handled_control = _drain_control_messages()
+            _, _ = _drain_layer_updates(block=False)
+            stepped = False
+            if pending_reset_phase is None and not pending_stop:
+                stepped = _maybe_step_once()
+            handled_control = _handle_pending_control_at_safe_point() or handled_control
+            if pending_stop:
+                break
+            if not stepped and not handled_control:
+                time.sleep(0.001)
     except BaseException:
         control_queue.put(
             {

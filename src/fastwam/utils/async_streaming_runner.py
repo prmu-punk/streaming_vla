@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import time
 
 
 @dataclass
@@ -77,28 +78,25 @@ class AsyncStreamingRunner:
             return int(start_obs_index)
 
         warmup_t = int(start_env_step)
-        warmup_obs_count = 0
-        warmup_first_triggered = False
         obs_index = int(start_obs_index)
 
-        while int(self.runtime.completed_jobs()) < target_jobs:
+        # Under the continuous action loop, "completed jobs" is no longer a stable
+        # semantic boundary for warmup. We instead warm up over a fixed negative
+        # env-step prefix and let the action worker denoise continuously in the
+        # background while we feed observations and advance the runtime clock.
+        while warmup_t < 0:
             if warmup_t % self.obs_stride_env_steps == 0:
-                should_trigger = bool(self.runtime.should_trigger_on_obs(warmup_obs_count + 1))
-                if self.force_first_job and not warmup_first_triggered:
-                    should_trigger = True
                 self.runtime.submit_observation(
                     input_image=input_image,
                     proprio=proprio,
                     env_step=warmup_t,
                     obs_index=obs_index,
                     obs_timestamp_ms=self._obs_timestamp_ms(obs_index),
-                    trigger_job=should_trigger,
+                    trigger_job=False,
                 )
                 obs_index += 1
-                warmup_obs_count += 1
-                if should_trigger:
-                    warmup_first_triggered = True
-            self.runtime.get_action(warmup_t)
+            self.runtime.get_action(warmup_t, count_miss=False)
+            self.runtime.poll()
             warmup_t += 1
         self.runtime.wait_until_idle()
         return obs_index
@@ -117,23 +115,18 @@ class AsyncStreamingRunner:
             return False
 
         obs_index = int(self.obs_counter)
-        should_trigger = bool(self.runtime.should_trigger_on_obs(self.formal_obs_count + 1))
-        if self.force_first_job and not self.first_formal_triggered:
-            should_trigger = True
         self.runtime.submit_observation(
             input_image=input_image,
             proprio=proprio,
             env_step=t,
             obs_index=obs_index,
             obs_timestamp_ms=self._obs_timestamp_ms(obs_index),
-            trigger_job=should_trigger,
+            trigger_job=False,
         )
         self.last_formal_obs_index = int(obs_index)
         self.last_formal_submit_env_step = int(t)
         self.obs_counter += 1
         self.formal_obs_count += 1
-        if should_trigger:
-            self.first_formal_triggered = True
         return True
 
     def wait_for_action(
@@ -145,9 +138,7 @@ class AsyncStreamingRunner:
         t = int(env_step)
         action = self.runtime.get_action(t)
         while action is None:
-            if int(self.runtime.pending_jobs()) <= 0:
-                fallback_obs_index = -1 if self.last_formal_obs_index is None else int(self.last_formal_obs_index)
-                self.runtime.submit_action_job(env_step=t, obs_index=fallback_obs_index)
-            self.runtime.wait_until_idle()
+            self.runtime.poll()
+            time.sleep(0.001)
             action = self.runtime.get_action(t, count_miss=False)
         return action

@@ -46,13 +46,21 @@ class StreamingActionJob:
     latents_action: torch.Tensor
     trigger_obs_index: int = -1
     trigger_env_step: int = -1
+    window_start_env_step: int = -1
     action_is_pad: Optional[torch.Tensor] = None
     applied_shift_steps: int = 0
+    token_env_steps: Optional[torch.Tensor] = None
+    token_denoise_counts: Optional[torch.Tensor] = None
+    just_released_mask: Optional[torch.Tensor] = None
+    persistent: bool = False
     current_step_idx: int = 0
     snapshot_history: list[CacheSnapshot] = field(default_factory=list)
+    generator: Optional[torch.Generator] = None
 
     @property
     def done(self) -> bool:
+        if self.persistent:
+            return False
         return self.current_step_idx >= int(self.timesteps.shape[0])
 
 

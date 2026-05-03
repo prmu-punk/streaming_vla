@@ -56,91 +56,8 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
 
     @torch.no_grad()
     def evaluate_streaming_action_mse(self, sample) -> dict[str, float]:
-        episode_batch = self._extract_streaming_episode_batch(sample)
-        resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
-            prompt=None,
-            context=episode_batch["context"],
-            context_mask=episode_batch["context_mask"],
-            proprio=episode_batch["proprio_t"],
-        )
-        episode_batch = dict(episode_batch)
-        episode_batch["context"] = resolved_context
-        episode_batch["context_mask"] = resolved_context_mask
-        target_action = episode_batch["target_action"]
-        action_is_pad = episode_batch.get("action_is_pad", None)
-        timestep_action, _, _ = self._sample_noisy_triplet(target_action)
-        bucket = self._map_training_timestep_to_bucket(timestep_action)
-        caches = self._build_selected_video_cache_payload(
-            episode_batch,
-            required_cache_keys=["prev", "cur", "next", "next2"],
-        )
-        sampled_mode, sampled_frontier = self._sample_cache_distribution(bucket)
-        stitched_cache = self._compose_distribution_cache(
-            caches=caches,
-            mode=sampled_mode,
-            frontier=sampled_frontier,
-        )
-        mean_offset = torch.full(
-            (int(target_action.shape[0]),),
-            fill_value=float(self._mode_to_mean_offset(sampled_mode)),
-            device=target_action.device,
-            dtype=target_action.dtype,
-        )
-        shift_steps = self._offset_to_shift_steps_tensor(
-            mean_offset,
-            action_horizon=int(target_action.shape[1]),
-        )
-        target_action, eval_action_is_pad = self._shift_action_window_by_steps(
-            target_action,
-            shift_steps,
-            pad_value=0.0,
-        )
-        job = self.start_action_job(
-            action_horizon=int(target_action.shape[1]),
-            context=episode_batch["context"],
-            context_mask=episode_batch["context_mask"],
-            trigger_obs_index=-1,
-            num_inference_steps=int(self.streaming_train_cfg.get("infer_num_inference_steps", 10)),
-            rand_device=str(self.device),
-        )
-        job.latents_action, job.action_is_pad = self._shift_action_window_by_steps(
-            job.latents_action,
-            shift_steps,
-            pad_value=0.0,
-        )
-        while not job.done:
-            snapshot = CacheSnapshot(
-                version=job.current_step_idx,
-                obs_timestamp_ms=0.0,
-                frontier=(
-                    int(self.mot.num_layers)
-                    if sampled_frontier is None
-                    else int(sampled_frontier)
-                ),
-                video_seq_len=int(caches["video_seq_len"]),
-                tokens_per_frame=int(caches["tokens_per_frame"]),
-                cache_layers=stitched_cache,
-                context=episode_batch["context"],
-                context_mask=episode_batch["context_mask"],
-                obs_index=int(round(float(self._mode_to_mean_offset(sampled_mode)))),
-                layer_version_ids=[job.current_step_idx] * int(self.mot.num_layers),
-                layer_obs_indices=[int(round(float(self._mode_to_mean_offset(sampled_mode))))] * int(self.mot.num_layers),
-                layer_obs_timestamps_ms=[0.0] * int(self.mot.num_layers),
-                layer_ready_events=[None] * int(self.mot.num_layers),
-            )
-            self.step_action_job(job, snapshot=snapshot)
-
-        diff = (job.latents_action.detach().float() - target_action.detach().float()).pow(2).mean(dim=2)
-        if eval_action_is_pad is not None:
-            valid = (~eval_action_is_pad.to(device=diff.device, dtype=torch.bool)).to(dtype=diff.dtype)
-            diff = (diff * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
-        elif action_is_pad is not None:
-            valid = (~action_is_pad.to(device=diff.device, dtype=torch.bool)).to(dtype=diff.dtype)
-            diff = (diff * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
-        else:
-            diff = diff.mean(dim=1)
-        action_mse = diff.mean()
-        return {"val_loss": float(action_mse.item())}
+        loss_stream, _ = self._compute_streaming_action_ft_loss(sample)
+        return {"val_loss": float(loss_stream.detach().item())}
 
     def _resolve_streaming_condition_inputs(
         self,
@@ -361,6 +278,80 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
     def snapshot_cache_for_action_step(self) -> CacheSnapshot:
         return self.streaming_cache_state.snapshot()
 
+    def _sample_action_latent_noise(
+        self,
+        *,
+        batch_size: int,
+        action_steps: int,
+        generator: Optional[torch.Generator],
+    ) -> torch.Tensor:
+        return torch.randn(
+            (batch_size, action_steps, self.action_expert.action_dim),
+            generator=generator,
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+
+    def _shift_persistent_action_window(
+        self,
+        job: StreamingActionJob,
+        *,
+        shift_steps: int,
+    ) -> None:
+        shift_steps = int(shift_steps)
+        if shift_steps <= 0:
+            return
+        batch_size, action_horizon, _ = job.latents_action.shape
+        shift_steps = min(shift_steps, int(action_horizon))
+        keep = max(0, int(action_horizon) - shift_steps)
+
+        new_latents = self._sample_action_latent_noise(
+            batch_size=batch_size,
+            action_steps=action_horizon,
+            generator=job.generator,
+        )
+        new_counts = torch.zeros(
+            (batch_size, action_horizon),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        new_env_steps = torch.zeros(
+            (batch_size, action_horizon),
+            device=self.device,
+            dtype=torch.int64,
+        )
+
+        if keep > 0:
+            new_latents[:, :keep] = job.latents_action[:, shift_steps:]
+            new_counts[:, :keep] = job.token_denoise_counts[:, shift_steps:]
+            new_env_steps[:, :keep] = job.token_env_steps[:, shift_steps:]
+
+        base_env_step = int(job.window_start_env_step) + shift_steps
+        append_steps = torch.arange(
+            base_env_step + keep,
+            base_env_step + action_horizon,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        if append_steps.numel() > 0:
+            new_env_steps[:, keep:] = append_steps.unsqueeze(0).expand(batch_size, -1)
+
+        job.latents_action = new_latents
+        job.token_denoise_counts = new_counts
+        job.token_env_steps = new_env_steps
+        job.just_released_mask = torch.zeros(
+            (batch_size, action_horizon),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        job.window_start_env_step = base_env_step
+        job.applied_shift_steps = int(job.window_start_env_step) - int(job.trigger_env_step)
+
+    def _latest_snapshot_env_step(self, snapshot: CacheSnapshot) -> int:
+        if len(snapshot.layer_env_steps) == 0:
+            return int(snapshot.env_step)
+        return max(int(v) for v in snapshot.layer_env_steps)
+
     def start_action_job(
         self,
         *,
@@ -374,36 +365,55 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
+        persistent: bool = False,
     ) -> StreamingActionJob:
         resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
             prompt=prompt,
             context=context,
             context_mask=context_mask,
         )
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (resolved_context.shape[0], action_horizon, self.action_expert.action_dim),
+        generator_device = self.device
+        if str(rand_device) == "cpu":
+            generator_device = torch.device("cpu")
+        generator = None if seed is None else torch.Generator(device=generator_device).manual_seed(seed)
+        latents_action = self._sample_action_latent_noise(
+            batch_size=int(resolved_context.shape[0]),
+            action_steps=int(action_horizon),
             generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        )
         timesteps, deltas = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        token_env_steps = torch.arange(
+            int(trigger_env_step),
+            int(trigger_env_step) + int(action_horizon),
+            device=self.device,
+            dtype=torch.int64,
+        ).unsqueeze(0).expand(int(resolved_context.shape[0]), -1).clone()
         return StreamingActionJob(
             timesteps=timesteps,
             deltas=deltas,
             latents_action=latents_action,
             trigger_obs_index=int(trigger_obs_index),
             trigger_env_step=int(trigger_env_step),
-            action_is_pad=torch.zeros(
+            window_start_env_step=int(trigger_env_step),
+            action_is_pad=None,
+            token_env_steps=token_env_steps,
+            token_denoise_counts=torch.zeros(
+                (resolved_context.shape[0], action_horizon),
+                device=self.device,
+                dtype=torch.int64,
+            ),
+            just_released_mask=torch.zeros(
                 (resolved_context.shape[0], action_horizon),
                 device=self.device,
                 dtype=torch.bool,
             ),
+            persistent=bool(persistent),
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -417,11 +427,30 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         if snapshot is None:
             snapshot = self.snapshot_cache_for_action_step()
 
-        step_t = job.timesteps[job.current_step_idx].unsqueeze(0).to(
+        if job.token_denoise_counts is None:
+            raise ValueError("`job.token_denoise_counts` must be initialized.")
+        max_denoise_steps = int(job.timesteps.shape[0])
+        if job.persistent and int(job.window_start_env_step) >= 0:
+            latest_env_step = self._latest_snapshot_env_step(snapshot)
+            shift_steps = max(0, int(latest_env_step) - int(job.window_start_env_step))
+            if shift_steps > 0:
+                self._shift_persistent_action_window(job, shift_steps=shift_steps)
+
+        active_mask = job.token_denoise_counts < max_denoise_steps
+        timestep_indices = job.token_denoise_counts.clamp(max=max_denoise_steps - 1)
+        step_t = job.timesteps[timestep_indices].to(
             device=self.device,
             dtype=job.latents_action.dtype,
         )
-        step_delta = job.deltas[job.current_step_idx]
+        step_delta = job.deltas[timestep_indices].to(
+            device=self.device,
+            dtype=job.latents_action.dtype,
+        )
+        step_delta = torch.where(
+            active_mask,
+            step_delta,
+            torch.zeros_like(step_delta),
+        )
         attention_mask = self._get_action_attn_mask(
             video_seq_len=int(snapshot.video_seq_len),
             action_seq_len=int(job.latents_action.shape[1]),
@@ -429,40 +458,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             device=job.latents_action.device,
             action_is_pad=job.action_is_pad,
         )
-        if int(job.trigger_env_step) >= 0:
-            current_offsets = torch.as_tensor(
-                [
-                    int(layer_env_step) - int(job.trigger_env_step)
-                    for layer_env_step in snapshot.layer_env_steps
-                ],
-                device=job.latents_action.device,
-                dtype=job.latents_action.dtype,
-            )
-            desired_shift = int(torch.round(current_offsets.mean()).item())
-            desired_shift = max(
-                -int(job.latents_action.shape[1]),
-                min(int(job.latents_action.shape[1]), desired_shift),
-            )
-            if desired_shift != int(job.applied_shift_steps):
-                delta_shift = desired_shift - int(job.applied_shift_steps)
-                job.latents_action, job.action_is_pad = self._shift_action_window_by_steps(
-                    job.latents_action,
-                    torch.full(
-                        (int(job.latents_action.shape[0]),),
-                        fill_value=delta_shift,
-                        device=job.latents_action.device,
-                        dtype=torch.int64,
-                    ),
-                    pad_value=0.0,
-                )
-                job.applied_shift_steps = desired_shift
-                attention_mask = self._get_action_attn_mask(
-                    video_seq_len=int(snapshot.video_seq_len),
-                    action_seq_len=int(job.latents_action.shape[1]),
-                    video_tokens_per_frame=int(snapshot.tokens_per_frame),
-                    device=job.latents_action.device,
-                    action_is_pad=job.action_is_pad,
-                )
         pred_action = self._predict_action_noise_with_cache(
             latents_action=job.latents_action,
             timestep_action=step_t,
@@ -472,21 +467,22 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
                 {
                     "k": layer["k"],
                     "v": layer["v"],
-                    "source_delta": (
-                        0
-                        if int(job.trigger_env_step) < 0
-                        else int(snapshot.layer_env_steps[layer_idx]) - int(job.trigger_env_step)
-                    ),
+                    "source_delta": 0,
                 }
                 for layer_idx, layer in enumerate(snapshot.cache_layers)
             ],
             attention_mask=attention_mask,
             video_seq_len=snapshot.video_seq_len,
         )
-        if job.action_is_pad is not None:
-            pred_action = pred_action.masked_fill(job.action_is_pad.unsqueeze(-1), 0.0)
+        pred_action = pred_action.masked_fill((~active_mask).unsqueeze(-1), 0.0)
         job.latents_action = self.infer_action_scheduler.step(pred_action, step_delta, job.latents_action)
-        job.snapshot_history.append(snapshot)
+        prev_counts = job.token_denoise_counts
+        next_counts = torch.where(active_mask, prev_counts + 1, prev_counts)
+        next_counts = next_counts.clamp(max=max_denoise_steps)
+        job.just_released_mask = (prev_counts < max_denoise_steps) & (next_counts >= max_denoise_steps)
+        job.token_denoise_counts = next_counts
+        if not job.persistent:
+            job.snapshot_history.append(snapshot)
         job.current_step_idx += 1
         return job.latents_action
 

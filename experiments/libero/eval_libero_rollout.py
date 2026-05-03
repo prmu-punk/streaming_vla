@@ -38,8 +38,7 @@ def _summarize_async_runtime_episodes(episodes: list[dict[str, Any]]) -> Optiona
 
     scalar_keys = [
         "submitted_obs",
-        "submitted_jobs",
-        "completed_jobs",
+        "completed_steps",
         "actions_served",
         "actions_missed",
         "dropped_prefix_actions",
@@ -50,7 +49,7 @@ def _summarize_async_runtime_episodes(episodes: list[dict[str, Any]]) -> Optiona
         summary[f"{key}_total"] = float(np.sum(values))
         summary[f"{key}_mean"] = float(np.mean(values))
 
-    timing_keys = ["video_refresh", "action_job", "action_job_wall", "action_step", "snapshot_copy"]
+    timing_keys = ["video_refresh", "action_step_loop", "action_step_loop_wall", "action_step", "snapshot_copy"]
     timing_summary: dict[str, Any] = {}
     for key in timing_keys:
         counts = [int(ep.get("timing_ms", {}).get(key, {}).get("count", 0)) for ep in episodes]
@@ -165,26 +164,25 @@ def run_single_episode_async(
         image, proprio, imgs = _encode_obs(obs)
         runtime.bootstrap_sync(input_image=image, obs_index=0, obs_timestamp_ms=0.0)
         runtime.wait_until_idle()
-        runtime.reset_for_formal_phase(env_step=0)
         runner = AsyncStreamingRunner(
             runtime=runtime,
             obs_stride_env_steps=obs_stride_env_steps,
             control_dt_ms=control_dt_ms,
             force_first_job=force_first_job,
         )
-        formal_obs_index_start = 0
         if warmup_action_jobs > 0:
-            warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
+            warmup_span = max(1, warmup_action_jobs)
             warmup_start = -int(warmup_span)
-            formal_obs_index_start = runner.run_warmup(
+            runtime.reset_for_formal_phase(env_step=warmup_start)
+            runner.run_warmup(
                 input_image=image,
                 proprio=proprio,
                 warmup_action_jobs=warmup_action_jobs,
                 start_env_step=warmup_start,
                 start_obs_index=warmup_start,
             )
-            runtime.reset_for_formal_phase(env_step=0)
-        runner.start_formal_phase(obs_index_start=formal_obs_index_start)
+        runtime.reset_for_formal_phase(env_step=0)
+        runner.start_formal_phase(obs_index_start=0)
         runner.prime_formal_observation(
             input_image=image,
             proprio=proprio,
@@ -223,12 +221,11 @@ def run_single_episode_async(
 
     runtime_summary = runtime.stats()
     logging.info(
-        "Async runtime stats | episode=%s submitted_obs=%s submitted_jobs=%s completed_jobs=%s "
+        "Async runtime stats | episode=%s submitted_obs=%s completed_steps=%s "
         "actions_served=%s actions_missed=%s dropped_prefix_actions=%s",
         episode_idx,
         runtime_summary["submitted_obs"],
-        runtime_summary["submitted_jobs"],
-        runtime_summary["completed_jobs"],
+        runtime_summary["completed_steps"],
         runtime_summary["actions_served"],
         runtime_summary["actions_missed"],
         runtime_summary["dropped_prefix_actions"],

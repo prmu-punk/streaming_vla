@@ -61,15 +61,7 @@ loss:
 streaming:
   freeze_video_expert: true
   use_cache_time_embedding: false
-  infer_frontier_schedule: null
   streaming_train:
     enabled: false
-    obs_gap_choices: [1, 2, 3]
-    obs_new_frame_choices: [1, 2]
-    mix_with_base_loss: false
-    lambda_streaming_action: 1.0
-    lambda_base: 1.0
-    frontier:
-      min_layers: 0
-      max_layers: 30
-      random_jitter: 2
+    cache_mode: full_cur
+    token_noise_pattern: front_low_high

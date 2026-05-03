@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-import re
 from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
-
-from .streaming_cache import stitch_prefix_cache
 
 
 class StreamingBackbone:
@@ -22,12 +19,28 @@ class StreamingBackbone:
         self,
         target_action: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = target_action.shape[0]
         noise_action = torch.randn_like(target_action)
-        timestep_action = self._sample_batchwise_training_t(batch_size=batch_size, dtype=target_action.dtype)
+        timestep_action = self._sample_tokenwise_training_t(target_action=target_action)
         noisy_action = self.train_action_scheduler.add_noise(target_action, noise_action, timestep_action)
         target_noise = self.train_action_scheduler.training_target(target_action, noise_action, timestep_action)
         return timestep_action, noisy_action, target_noise
+
+    def _sample_tokenwise_training_t(self, target_action: torch.Tensor) -> torch.Tensor:
+        batch_size, action_horizon = target_action.shape[:2]
+        sampled = self.train_action_scheduler.sample_training_t(
+            batch_size=int(batch_size * action_horizon),
+            device=self.device,
+            dtype=target_action.dtype,
+        ).view(batch_size, action_horizon)
+        pattern = str(self.streaming_train_cfg.get("token_noise_pattern", "front_low_high")).strip().lower()
+        if pattern == "random_all":
+            return sampled
+        if pattern == "front_low_high":
+            return torch.sort(sampled, dim=1, descending=False).values
+        raise ValueError(
+            f"Unsupported `streaming_train.token_noise_pattern`: {pattern}. "
+            "Expected one of: ['random_all', 'front_low_high']."
+        )
 
     def _offset_to_shift_steps_tensor(self, offset: torch.Tensor, *, action_horizon: int) -> torch.Tensor:
         if offset.ndim != 1:
@@ -78,14 +91,12 @@ class StreamingBackbone:
         video_kv_cache: list[dict[str, torch.Tensor]],
         video_seq_len: int,
         video_tokens_per_frame: int,
-        action_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attention_mask = self.build_joint_attention_mask(
             video_seq_len=int(video_seq_len),
             action_seq_len=noisy_action.shape[1],
             video_tokens_per_frame=int(video_tokens_per_frame),
             device=noisy_action.device,
-            action_is_pad=action_is_pad,
         )
         return self._predict_action_noise_with_cache(
             latents_action=noisy_action,
@@ -103,43 +114,29 @@ class StreamingBackbone:
         pred_action: torch.Tensor,
         target_noise: torch.Tensor,
         timestep_action: torch.Tensor,
-        action_is_pad: Optional[torch.Tensor],
-        position_weight: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
         return_per_sample: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         action_loss_token = F.mse_loss(pred_action.float(), target_noise.float(), reduction="none").mean(dim=2)
-        token_weight = torch.ones_like(action_loss_token)
-        if position_weight is not None:
-            if position_weight.shape != action_loss_token.shape:
-                raise ValueError(
-                    f"`position_weight` shape mismatch: expected {tuple(action_loss_token.shape)}, "
-                    f"got {tuple(position_weight.shape)}."
-                )
-            token_weight = position_weight.to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-        if action_is_pad is not None:
-            valid = (~action_is_pad.to(device=action_loss_token.device, dtype=torch.bool)).to(
-                device=action_loss_token.device,
-                dtype=action_loss_token.dtype,
-            )
-            token_weight = token_weight * valid
-        weight_sum = token_weight.sum(dim=1).clamp(min=1.0)
-        loss_stream = (action_loss_token * token_weight).sum(dim=1) / weight_sum
-        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            loss_stream.device,
-            dtype=loss_stream.dtype,
+        token_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            device=action_loss_token.device,
+            dtype=action_loss_token.dtype,
         )
-        loss_stream_per_sample = loss_stream * action_weight
+        if token_weight.ndim == 1:
+            token_weight = token_weight.unsqueeze(1)
+        if action_mask is not None:
+            action_mask = action_mask.to(device=action_loss_token.device, dtype=torch.bool)
+            if tuple(action_mask.shape) != tuple(action_loss_token.shape):
+                raise ValueError(
+                    f"`action_mask` shape mismatch: expected {tuple(action_loss_token.shape)}, got {tuple(action_mask.shape)}."
+                )
+            token_weight = token_weight * action_mask.to(dtype=action_loss_token.dtype)
+        weight_sum = token_weight.sum(dim=1).clamp(min=1.0)
+        loss_stream_per_sample = (action_loss_token * token_weight).sum(dim=1) / weight_sum
         loss_stream = loss_stream_per_sample.mean()
         if return_per_sample:
             return loss_stream, loss_stream_per_sample
         return loss_stream
-
-    @staticmethod
-    def _metric_mode_name(mode: str) -> str:
-        mode = str(mode).strip()
-        if not mode:
-            mode = "unknown"
-        return re.sub(r"[^0-9A-Za-z_]+", "_", mode)
 
     def _extract_streaming_episode_batch(self, sample) -> Optional[dict[str, torch.Tensor]]:
         required_keys = {
@@ -257,226 +254,31 @@ class StreamingBackbone:
             output[key] = sliced_cache
         return output
 
-    def _get_streaming_infer_timesteps(self, infer_num_inference_steps: int) -> torch.Tensor:
-        infer_num_inference_steps = int(infer_num_inference_steps)
-        if infer_num_inference_steps not in self._streaming_infer_timestep_cache:
-            timesteps, _ = self.infer_action_scheduler.build_inference_schedule(
-                num_inference_steps=infer_num_inference_steps,
-                device=self.device,
-                dtype=torch.float32,
+    @staticmethod
+    def _normalize_full_cache_mode(mode: str) -> str:
+        mode = str(mode).strip().lower()
+        valid_modes = {"full_prev", "full_cur", "full_next", "full_next2"}
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported `streaming_train.cache_mode`: {mode}. "
+                f"Expected one of: {sorted(valid_modes)}."
             )
-            self._streaming_infer_timestep_cache[infer_num_inference_steps] = timesteps.detach().float()
-        return self._streaming_infer_timestep_cache[infer_num_inference_steps]
+        return mode
 
-    def _map_training_timestep_to_bucket(self, timestep_action: torch.Tensor) -> int:
-        infer_num_inference_steps = int(self.streaming_train_cfg.get("infer_num_inference_steps", 10))
-        infer_timesteps = self._get_streaming_infer_timesteps(infer_num_inference_steps)
-        tau_scalar = float(timestep_action.detach().float().mean().item())
-        bucket = int(torch.argmin(torch.abs(infer_timesteps - tau_scalar)).item())
-        return bucket
+    def _resolve_streaming_train_cache_mode(self) -> str:
+        return self._normalize_full_cache_mode(self.streaming_train_cfg.get("cache_mode", "full_cur"))
 
-    def _sample_batchwise_training_t(self, batch_size: int, dtype: torch.dtype) -> torch.Tensor:
-        sampled = self.train_action_scheduler.sample_training_t(
-            batch_size=1,
-            device=self.device,
-            dtype=dtype,
-        )
-        return sampled.expand(int(batch_size))
+    @staticmethod
+    def _cache_key_from_full_mode(mode: str) -> str:
+        normalized_mode = StreamingBackbone._normalize_full_cache_mode(mode)
+        return normalized_mode[len("full_") :]
 
-
-    def _get_streaming_distribution_entries(self, bucket: int) -> list[dict[str, Any]]:
-        cfg_dist = self.streaming_train_cfg.get("distribution", None)
-        entries = cfg_dist.get(bucket)
-        if entries is None:
-            entries = cfg_dist.get(str(bucket))
-        return [dict(entry) for entry in entries]
-
-    def _sample_cache_distribution(self, bucket: int) -> tuple[str, Optional[int]]:
-        entries = self._get_streaming_distribution_entries(bucket)
-        weights = torch.tensor(
-            [float(entry.get("prob", 1.0)) for entry in entries],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        if float(weights.sum().item()) <= 0.0:
-            raise ValueError(f"Distribution weights for bucket {bucket} must sum to > 0.")
-        choice = int(torch.multinomial(weights / weights.sum(), 1).item())
-        entry = entries[choice]
-        mode = self._normalize_streaming_cache_mode(str(entry["mode"]))
-        if mode.startswith("full_"):
-            return mode, None
-        frontier_min = int(entry.get("frontier_min", 0))
-        frontier_max = int(entry.get("frontier_max", self.mot.num_layers))
-        frontier_min = max(0, min(self.mot.num_layers, frontier_min))
-        frontier_max = max(frontier_min, min(self.mot.num_layers, frontier_max))
-        frontier = int(torch.randint(frontier_min, frontier_max + 1, (1,), device=self.device).item())
-        return mode, frontier
-
-    def _compose_distribution_cache(
+    def _compute_streaming_action_ft_loss(
         self,
-        caches: dict[str, Any],
-        mode: str,
-        frontier: Optional[int],
-    ) -> list[dict[str, torch.Tensor]]:
-        normalized_mode = self._normalize_streaming_cache_mode(mode)
-        if normalized_mode.startswith("full_"):
-            offset = self._streaming_cache_label_to_offset(normalized_mode[len("full_") :])
-            return caches[self._cache_key_from_offset(offset)]
-        if "_to_" in normalized_mode:
-            old_label, new_label = normalized_mode.split("_to_", maxsplit=1)
-            old_offset = self._streaming_cache_label_to_offset(old_label)
-            new_offset = self._streaming_cache_label_to_offset(new_label)
-            return stitch_prefix_cache(
-                caches[self._cache_key_from_offset(new_offset)],
-                caches[self._cache_key_from_offset(old_offset)],
-                int(frontier),
-            )
-        raise ValueError(f"Unsupported streaming cache mode: {normalized_mode}")
-
-    @staticmethod
-    def _distribution_mode_to_id(mode: str) -> float:
-        mode = StreamingBackbone._normalize_streaming_cache_mode(mode)
-        mapping = {
-            "full_prev": 0.0,
-            "prev_to_cur": 1.0,
-            "full_cur": 2.0,
-            "cur_to_next": 3.0,
-            "full_next": 4.0,
-            "next_to_next2": 5.0,
-            "full_next2": 6.0,
-        }
-        if mode not in mapping:
-            raise ValueError(f"Unsupported streaming cache mode: {mode}")
-        return mapping[mode]
-
-    @staticmethod
-    def _distribution_mode_to_id_safe(mode: str) -> float:
-        try:
-            return StreamingBackbone._distribution_mode_to_id(mode)
-        except Exception:
-            return -1.0
-
-    @staticmethod
-    def _streaming_cache_label_to_offset(label: str) -> int:
-        label = str(label).strip()
-        if label == "prev":
-            return -1
-        if label == "cur":
-            return 0
-        if label == "next":
-            return 1
-        if label.startswith("prev"):
-            suffix = label[len("prev") :]
-            if suffix.isdigit():
-                return -int(suffix)
-        if label.startswith("next"):
-            suffix = label[len("next") :]
-            if suffix.isdigit():
-                return int(suffix)
-        raise ValueError(f"Unsupported streaming cache label: {label}")
-
-    @staticmethod
-    def _streaming_cache_offset_to_label(offset: int) -> str:
-        if int(offset) <= -1:
-            return "prev"
-        if int(offset) == 0:
-            return "cur"
-        if int(offset) == 1:
-            return "next"
-        return "next2"
-
-    @staticmethod
-    def _cache_key_from_offset(offset: int) -> str:
-        if int(offset) <= -1:
-            return "prev"
-        if int(offset) == 0:
-            return "cur"
-        if int(offset) == 1:
-            return "next"
-        return "next2"
-
-    @staticmethod
-    def _required_cache_keys_for_mode(mode: str) -> list[str]:
-        normalized_mode = StreamingBackbone._normalize_streaming_cache_mode(mode)
-        required = set()
-        if normalized_mode.startswith("full_"):
-            label = normalized_mode[len("full_") :]
-            offset = StreamingBackbone._streaming_cache_label_to_offset(label)
-            required.add(StreamingBackbone._cache_key_from_offset(offset))
-        elif "_to_" in normalized_mode:
-            old_label, new_label = normalized_mode.split("_to_", maxsplit=1)
-            old_offset = StreamingBackbone._streaming_cache_label_to_offset(old_label)
-            new_offset = StreamingBackbone._streaming_cache_label_to_offset(new_label)
-            required.add(StreamingBackbone._cache_key_from_offset(old_offset))
-            required.add(StreamingBackbone._cache_key_from_offset(new_offset))
-        else:
-            raise ValueError(f"Unsupported streaming cache mode: {normalized_mode}")
-        return [key for key in ("prev", "cur", "next", "next2") if key in required]
-
-    @staticmethod
-    def _normalize_streaming_cache_mode(mode: str) -> str:
-        mode = str(mode).strip()
-        if mode.startswith("full_"):
-            raw_label = mode[len("full_") :]
-            raw_offset = StreamingBackbone._streaming_cache_label_to_offset(raw_label)
-            normalized_label = StreamingBackbone._streaming_cache_offset_to_label(raw_offset)
-            return f"full_{normalized_label}"
-        if "_to_" in mode:
-            old_label, new_label = mode.split("_to_", maxsplit=1)
-            old_offset = StreamingBackbone._streaming_cache_label_to_offset(old_label)
-            new_offset = StreamingBackbone._streaming_cache_label_to_offset(new_label)
-            old_label_norm = StreamingBackbone._streaming_cache_offset_to_label(old_offset)
-            new_label_norm = StreamingBackbone._streaming_cache_offset_to_label(new_offset)
-            if old_label_norm == new_label_norm:
-                return f"full_{new_label_norm}"
-            if StreamingBackbone._streaming_cache_label_to_offset(old_label_norm) >= StreamingBackbone._streaming_cache_label_to_offset(new_label_norm):
-                return f"full_{new_label_norm}"
-            return f"{old_label_norm}_to_{new_label_norm}"
-        raise ValueError(f"Unsupported streaming cache mode: {mode}")
-
-    def _mode_to_mean_offset(self, mode: str) -> float:
-        normalized_mode = self._normalize_streaming_cache_mode(mode)
-        if normalized_mode.startswith("full_"):
-            return float(self._streaming_cache_label_to_offset(normalized_mode[len("full_") :]))
-        old_label, new_label = normalized_mode.split("_to_", maxsplit=1)
-        old_offset = float(self._streaming_cache_label_to_offset(old_label))
-        new_offset = float(self._streaming_cache_label_to_offset(new_label))
-        return 0.5 * (old_offset + new_offset)
-
-    def _offset_to_chunk_anchor(
-        self,
-        offset: torch.Tensor,
+        sample,
         *,
-        action_horizon: int,
-    ) -> torch.Tensor:
-        if offset.ndim != 1:
-            raise ValueError(f"`offset` must be [B], got shape {tuple(offset.shape)}.")
-        if action_horizon <= 0:
-            raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
-        anchor = offset * float(self._get_obs_stride())
-        return anchor.clamp(min=0.0, max=float(max(action_horizon - 1, 0)))
-
-    def _build_position_decay_weight(
-        self,
-        *,
-        anchor: torch.Tensor,
-        action_horizon: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if anchor.ndim != 1:
-            raise ValueError(f"`anchor` must be [B], got shape {tuple(anchor.shape)}.")
-        tau = float(self.streaming_train_cfg.get("position_decay_tau", 12.0))
-        power = float(self.streaming_train_cfg.get("position_decay_power", 2.0))
-        if tau <= 0.0:
-            raise ValueError(f"`position_decay_tau` must be positive, got {tau}.")
-        if power <= 0.0:
-            raise ValueError(f"`position_decay_power` must be positive, got {power}.")
-        positions = torch.arange(action_horizon, device=device, dtype=dtype).unsqueeze(0)
-        delta = positions - anchor.to(device=device, dtype=dtype).unsqueeze(1)
-        return torch.exp(-torch.pow(torch.clamp(delta, min=0.0) / tau, power))
-
-    def training_loss_streaming_action_ft(self, sample, tiled: bool = False):
+        tiled: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         del tiled
         episode_batch = self._extract_streaming_episode_batch(sample)
         if episode_batch is None:
@@ -507,65 +309,39 @@ class StreamingBackbone:
         episode_batch = dict(episode_batch)
         episode_batch["context"] = resolved_context
         episode_batch["context_mask"] = resolved_context_mask
+
         timestep_action, noisy_action, target_noise = self._sample_noisy_triplet(target_action)
-        bucket = self._map_training_timestep_to_bucket(timestep_action)
-        required_cache_keys = ["prev", "cur", "next", "next2"]
+        cache_mode = self._resolve_streaming_train_cache_mode()
+        cache_key = self._cache_key_from_full_mode(cache_mode)
         video_ctx = nullcontext() if not self.freeze_video_expert else torch.no_grad()
         with video_ctx:
             selected_caches = self._build_selected_video_cache_payload(
                 episode_batch,
-                required_cache_keys=required_cache_keys,
+                required_cache_keys=[cache_key],
             )
-        sampled_mode, sampled_frontier = self._sample_cache_distribution(bucket)
-        stitched_cache = self._compose_distribution_cache(
-            caches=selected_caches,
-            mode=sampled_mode,
-            frontier=sampled_frontier,
-        )
-        mean_offset = torch.full(
-            (int(target_action.shape[0]),),
-            fill_value=float(self._mode_to_mean_offset(sampled_mode)),
-            device=target_action.device,
-            dtype=target_action.dtype,
-        )
-        shift_steps = self._offset_to_shift_steps_tensor(
-            mean_offset,
-            action_horizon=int(target_action.shape[1]),
-        )
-        noisy_action, action_is_pad = self._shift_action_window_by_steps(
-            noisy_action,
-            shift_steps,
-            pad_value=0.0,
-        )
-        target_noise, _ = self._shift_action_window_by_steps(
-            target_noise,
-            shift_steps,
-            pad_value=0.0,
-        )
+        selected_cache = selected_caches[cache_key]
         pred_action = self._predict_stream_noise(
             noisy_action=noisy_action,
             timestep_action=timestep_action,
             context=episode_batch["context"],
             context_mask=episode_batch["context_mask"],
-            video_kv_cache=stitched_cache,
+            video_kv_cache=selected_cache,
             video_seq_len=int(selected_caches["video_seq_len"]),
             video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
-            action_is_pad=action_is_pad,
         )
         loss_stream = self._loss_stream_full_chunk(
             pred_action=pred_action,
             target_noise=target_noise,
             timestep_action=timestep_action,
-            action_is_pad=action_is_pad,
         )
-
-        if bool(self.streaming_train_cfg.get("mix_with_base_loss", False)):
-            raise ValueError("`mix_with_base_loss=true` is unsupported for episode-based streaming dataset.")
-
-        return loss_stream, {
+        metrics = {
             "loss_streaming_action": float(loss_stream.detach().item()),
-            "bucket": float(bucket),
-            "mode_id": self._distribution_mode_to_id_safe(sampled_mode),
-            "frontier": -1.0 if sampled_frontier is None else float(sampled_frontier),
-            "shift_steps_mean": float(shift_steps.detach().float().mean().item()),
+            "cache_mode_id": float(("prev", "cur", "next", "next2").index(cache_key)),
+            "token_t_min": float(timestep_action.detach().float().min().item()),
+            "token_t_max": float(timestep_action.detach().float().max().item()),
+            "token_t_mean": float(timestep_action.detach().float().mean().item()),
         }
+        return loss_stream, metrics
+
+    def training_loss_streaming_action_ft(self, sample, tiled: bool = False):
+        return self._compute_streaming_action_ft_loss(sample, tiled=tiled)

@@ -59,40 +59,30 @@ class ChunkOffsetRuntime(ProfiledRuntime):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._action_source_cache: dict[int, list[int]] = defaultdict(list)
-        self.last_served_action_trigger_env_step: int | None = None
+        self.last_served_action_source_env_step: int | None = None
 
     def reset_for_formal_phase(self, *, env_step: int = 0) -> None:
         super().reset_for_formal_phase(env_step=env_step)
         self._action_source_cache.clear()
-        self.last_served_action_trigger_env_step = None
+        self.last_served_action_source_env_step = None
 
-    def _publish_action_chunk(
+    def _publish_released_actions(
         self,
-        action_chunk: np.ndarray,
+        released_actions: np.ndarray,
         *,
-        trigger_env_step: int,
-        applied_shift_steps: int = 0,
-        action_is_pad=None,
+        released_env_steps: list[int],
+        source_env_step: int,
     ) -> int:
         dropped = 0
         current_env_step = int(self._current_env_step)
-        action_is_pad_np = None
-        if action_is_pad is not None:
-            if torch.is_tensor(action_is_pad):
-                action_is_pad_np = action_is_pad.detach().to(device="cpu", dtype=torch.bool).numpy()
-            else:
-                action_is_pad_np = np.asarray(action_is_pad, dtype=bool)
-            if action_is_pad_np.ndim == 2:
-                action_is_pad_np = action_is_pad_np[0]
-        for i in range(int(action_chunk.shape[0])):
-            if action_is_pad_np is not None and bool(action_is_pad_np[i]):
-                continue
-            target_step = int(trigger_env_step) + int(applied_shift_steps) + i
+        if released_actions.ndim == 1:
+            released_actions = released_actions[None, :]
+        for i, target_step in enumerate(released_env_steps):
             if target_step < current_env_step:
                 dropped += 1
                 continue
-            self._ensembler.action_cache[target_step].append(np.asarray(action_chunk[i], dtype=np.float32))
-            self._action_source_cache[target_step].append(int(trigger_env_step))
+            self._ensembler.action_cache[int(target_step)].append(np.asarray(released_actions[i], dtype=np.float32))
+            self._action_source_cache[int(target_step)].append(int(source_env_step))
         self._dropped_prefix_actions += dropped
         return dropped
 
@@ -101,7 +91,7 @@ class ChunkOffsetRuntime(ProfiledRuntime):
         if action is None:
             return None
         trigger_sources = self._action_source_cache.get(int(env_step), [])
-        self.last_served_action_trigger_env_step = None if len(trigger_sources) == 0 else int(trigger_sources[-1])
+        self.last_served_action_source_env_step = None if len(trigger_sources) == 0 else int(trigger_sources[-1])
         if int(env_step) in self._action_source_cache:
             del self._action_source_cache[int(env_step)]
         return action
@@ -380,7 +370,6 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         proprio0 = _episode_proprio(dataset, payload, 0)
         runtime.bootstrap_sync(input_image=image0, obs_index=0, obs_timestamp_ms=0.0)
         runtime.wait_until_idle()
-        runtime.reset_for_formal_phase(env_step=0)
 
         runner = AsyncStreamingRunner(
             runtime=runtime,
@@ -388,19 +377,19 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
             control_dt_ms=control_dt_ms,
             force_first_job=force_first_job,
         )
-        formal_obs_index_start = 0
         if warmup_action_jobs > 0:
-            warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
+            warmup_span = max(1, warmup_action_jobs)
             warmup_start = -int(warmup_span)
-            formal_obs_index_start = runner.run_warmup(
+            runtime.reset_for_formal_phase(env_step=warmup_start)
+            runner.run_warmup(
                 input_image=image0,
                 proprio=proprio0,
                 warmup_action_jobs=warmup_action_jobs,
                 start_env_step=warmup_start,
                 start_obs_index=warmup_start,
             )
-            runtime.reset_for_formal_phase(env_step=0)
-        runner.start_formal_phase(obs_index_start=formal_obs_index_start)
+        runtime.reset_for_formal_phase(env_step=0)
+        runner.start_formal_phase(obs_index_start=0)
         runner.prime_formal_observation(
             input_image=image0,
             proprio=proprio0,
@@ -427,12 +416,12 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
                 binarize_gripper=binarize_gripper,
             )
             diff = pred - target
-            trigger_env_step = runtime.last_served_action_trigger_env_step
-            chunk_offset = None if trigger_env_step is None else int(env_step) - int(trigger_env_step)
+            source_env_step = runtime.last_served_action_source_env_step
+            chunk_offset = None if source_env_step is None else int(env_step) - int(source_env_step)
             rows.append(
                 {
                     "env_step": int(env_step),
-                    "trigger_env_step": None if trigger_env_step is None else int(trigger_env_step),
+                    "source_env_step": None if source_env_step is None else int(source_env_step),
                     "chunk_offset": chunk_offset,
                     "submitted_obs": bool(submitted_obs),
                     "had_initial_miss": bool(had_initial_miss),

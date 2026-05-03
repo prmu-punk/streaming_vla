@@ -106,21 +106,19 @@ class StreamingRuntime:
         self._phase_min_env_step = 0
         self._phase_id = 0
         self._job_seed_counter = 0
-        self._job_id_counter = 0
         self._flush_counter = 0
-        self._submitted_jobs = 0
-        self._completed_jobs = 0
+        self._completed_steps = 0
         self._actions_served = 0
         self._actions_missed = 0
         self._dropped_prefix_actions = 0
         self._submitted_obs = 0
         self._video_refresh_samples_ms: list[float] = []
-        self._action_job_samples_ms: list[float] = []
-        self._action_job_wall_samples_ms: list[float] = []
+        self._action_step_loop_samples_ms: list[float] = []
+        self._action_step_loop_wall_samples_ms: list[float] = []
         self._action_step_samples_ms: list[float] = []
         self._snapshot_copy_samples_ms: list[float] = []
-        self._action_job_samples_raw_ms: list[float] = []
-        self._job_records: list[dict[str, Any]] = []
+        self._action_step_loop_samples_raw_ms: list[float] = []
+        self._step_records: list[dict[str, Any]] = []
         self._reset_layer_source_stats()
 
     @staticmethod
@@ -210,35 +208,40 @@ class StreamingRuntime:
                 continue
             if not self._should_accept_job_result(msg):
                 continue
-            self._completed_jobs += 1
-            job_duration_ms = float(msg["job_duration_ms"])
-            job_wall_ms = float(msg["job_wall_ms"])
-            self._action_job_samples_ms.append(job_duration_ms)
-            self._action_job_wall_samples_ms.append(job_wall_ms)
-            self._action_job_samples_raw_ms.append(job_duration_ms)
+            self._completed_steps += 1
+            step_loop_duration_ms = float(msg["job_duration_ms"])
+            step_loop_wall_ms = float(msg["job_wall_ms"])
+            self._action_step_loop_samples_ms.append(step_loop_duration_ms)
+            self._action_step_loop_wall_samples_ms.append(step_loop_wall_ms)
+            self._action_step_loop_samples_raw_ms.append(step_loop_duration_ms)
             self._action_step_samples_ms.extend([float(v) for v in msg["job_step_samples_ms"]])
             self._snapshot_copy_samples_ms.extend([float(v) for v in msg["job_snapshot_copy_samples_ms"]])
             if self.profile:
                 self._accumulate_layer_source_steps(msg.get("job_layer_source_steps", []))
-            self._job_records.append(self._build_job_record(msg))
-            action_chunk = self.action_postprocess(msg["latents_action_cpu"])
-            self._publish_action_chunk(
-                action_chunk=np.asarray(action_chunk, dtype=np.float32),
-                trigger_env_step=int(msg["trigger_env_step"]),
-                applied_shift_steps=int(msg.get("applied_shift_steps", 0)),
-                action_is_pad=msg.get("action_is_pad_cpu"),
-            )
+            self._step_records.append(self._build_step_record(msg))
+            released_actions_cpu = msg.get("released_actions_cpu")
+            released_env_steps = [int(v) for v in msg.get("released_env_steps", [])]
+            if released_actions_cpu is not None and len(released_env_steps) > 0:
+                released_actions = self.action_postprocess(released_actions_cpu)
+                self._publish_released_actions(
+                    released_actions=np.asarray(released_actions, dtype=np.float32),
+                    released_env_steps=released_env_steps,
+                    source_env_step=int(msg.get("window_start_env_step", -1)),
+                )
 
     def _sync_main_state(self) -> None:
         self._drain_action_results()
         self._poll_control_queue()
         self._raise_if_error()
 
+    def poll(self) -> None:
+        self._sync_main_state()
+
     def start(self) -> None:
         if self._started:
             return
         self._obs_queue = self._ctx.Queue(maxsize=1)
-        self._job_queue = self._ctx.Queue(maxsize=1)
+        self._job_queue = self._ctx.Queue(maxsize=16)
         self._layer_queue = self._ctx.Queue(maxsize=128)
         self._result_queue = self._ctx.Queue(maxsize=16)
         self._control_queue = self._ctx.Queue(maxsize=32)
@@ -353,21 +356,46 @@ class StreamingRuntime:
         self._current_env_step = int(env_step)
         self._phase_min_env_step = int(env_step)
         self._phase_id += 1
+        if self._obs_queue is not None:
+            self._put_queue(
+                self._obs_queue,
+                {
+                    "type": "reset_phase",
+                    "phase_id": int(self._phase_id),
+                    "env_step": int(env_step),
+                },
+            )
+            self._flush_counter += 1
+            video_flush_id = int(self._flush_counter)
+            self._put_queue(self._obs_queue, {"type": "flush", "flush_id": video_flush_id})
+            self._wait_flush_ack(worker="video", flush_id=video_flush_id)
+        if self._job_queue is not None:
+            self._put_queue(
+                self._job_queue,
+                {
+                    "type": "reset_phase",
+                    "phase_id": int(self._phase_id),
+                    "env_step": int(env_step),
+                },
+            )
+            self._flush_counter += 1
+            action_flush_id = int(self._flush_counter)
+            self._put_queue(self._job_queue, {"type": "flush", "flush_id": action_flush_id})
+            self._wait_flush_ack(worker="action", flush_id=action_flush_id)
         self._obs_count = 0
         self._job_seed_counter = 0
-        self._submitted_jobs = 0
-        self._completed_jobs = 0
+        self._completed_steps = 0
         self._actions_served = 0
         self._actions_missed = 0
         self._dropped_prefix_actions = 0
         self._submitted_obs = 0
         self._video_refresh_samples_ms = []
-        self._action_job_samples_ms = []
-        self._action_job_wall_samples_ms = []
+        self._action_step_loop_samples_ms = []
+        self._action_step_loop_wall_samples_ms = []
         self._action_step_samples_ms = []
         self._snapshot_copy_samples_ms = []
-        self._action_job_samples_raw_ms = []
-        self._job_records = []
+        self._action_step_loop_samples_raw_ms = []
+        self._step_records = []
         self._reset_layer_source_stats()
 
     def submit_observation(
@@ -403,70 +431,37 @@ class StreamingRuntime:
         )
         self._submitted_obs += 1
         self._obs_count += 1
-        if trigger_job:
-            self.submit_action_job(env_step=env_step, obs_index=obs_index)
-
-    def submit_action_job(
-        self,
-        *,
-        env_step: int,
-        obs_index: int = -1,
-    ) -> None:
-        self._poll_control_queue()
-        self._raise_if_error()
-        self._put_queue(
-            self._job_queue,
-            {
-                "type": "job",
-                "phase_id": int(self._phase_id),
-                "job_id": int(self._job_id_counter),
-                "trigger_env_step": int(env_step),
-                "obs_index": int(obs_index),
-                "job_seed_offset": int(self._job_seed_counter),
-            },
-        )
-        self._job_id_counter += 1
-        self._job_seed_counter += 1
-        self._submitted_jobs += 1
-
-    def should_trigger_on_obs(self, obs_count: Optional[int] = None) -> bool:
-        count = self._obs_count if obs_count is None else int(obs_count)
-        return count > 0 and count % self.action_trigger_every_n_obs == 0
+        del trigger_job
 
     def completed_jobs(self) -> int:
         self._sync_main_state()
-        return int(self._completed_jobs)
+        return int(self._completed_steps)
 
     def pending_jobs(self) -> int:
         self._sync_main_state()
-        return max(0, int(self._submitted_jobs - self._completed_jobs))
+        return 0
 
-    def _publish_action_chunk(
+    def _publish_released_actions(
         self,
-        action_chunk: np.ndarray,
+        released_actions: np.ndarray,
         *,
-        trigger_env_step: int,
-        applied_shift_steps: int = 0,
-        action_is_pad=None,
+        released_env_steps: list[int],
+        source_env_step: int,
     ) -> int:
         dropped = 0
         current_env_step = int(self._current_env_step)
-        action_is_pad_np = None
-        if action_is_pad is not None:
-            if torch.is_tensor(action_is_pad):
-                action_is_pad_np = action_is_pad.detach().to(device="cpu", dtype=torch.bool).numpy()
-            else:
-                action_is_pad_np = np.asarray(action_is_pad, dtype=bool)
-            if action_is_pad_np.ndim == 2:
-                action_is_pad_np = action_is_pad_np[0]
-        for i in range(int(action_chunk.shape[0])):
-            if action_is_pad_np is not None and bool(action_is_pad_np[i]):
-                continue
-            target_step = int(trigger_env_step) + int(applied_shift_steps) + i
+        if released_actions.ndim == 1:
+            released_actions = released_actions[None, :]
+        if int(released_actions.shape[0]) != len(released_env_steps):
+            raise ValueError(
+                f"Released action count mismatch: actions={int(released_actions.shape[0])}, "
+                f"env_steps={len(released_env_steps)}"
+            )
+        for i, target_step in enumerate(released_env_steps):
             if target_step < current_env_step:
                 dropped += 1
                 continue
-            self._ensembler.action_cache[target_step].append(np.asarray(action_chunk[i], dtype=np.float32))
+            self._ensembler.action_cache[int(target_step)].append(np.asarray(released_actions[i], dtype=np.float32))
         self._dropped_prefix_actions += dropped
         return dropped
 
@@ -486,19 +481,19 @@ class StreamingRuntime:
     def _should_accept_job_result(self, msg: dict[str, Any]) -> bool:
         if int(msg.get("phase_id", -1)) != int(self._phase_id):
             return False
-        trigger_env_step = int(msg.get("trigger_env_step", -1))
-        if trigger_env_step < int(self._phase_min_env_step):
+        window_start_env_step = int(msg.get("window_start_env_step", -1))
+        if window_start_env_step < int(self._phase_min_env_step):
             return False
         return True
 
-    def _build_job_record(self, msg: dict[str, Any]) -> dict[str, Any]:
+    def _build_step_record(self, msg: dict[str, Any]) -> dict[str, Any]:
         record: dict[str, Any] = {
             "phase_id": int(msg.get("phase_id", -1)),
-            "job_id": int(msg.get("job_id", -1)),
-            "trigger_env_step": int(msg.get("trigger_env_step", -1)),
-            "trigger_obs_index": int(msg.get("trigger_obs_index", -1)),
-            "job_duration_ms": float(msg.get("job_duration_ms", 0.0)),
-            "job_wall_ms": float(msg.get("job_wall_ms", 0.0)),
+            "step_id": int(msg.get("job_id", -1)),
+            "window_start_env_step": int(msg.get("window_start_env_step", -1)),
+            "num_released_actions": int(len(msg.get("released_env_steps", []))),
+            "step_loop_duration_ms": float(msg.get("job_duration_ms", 0.0)),
+            "step_loop_wall_ms": float(msg.get("job_wall_ms", 0.0)),
             "num_step_samples": int(len(msg.get("job_step_samples_ms", []))),
             "num_snapshot_copy_samples": int(len(msg.get("job_snapshot_copy_samples_ms", []))),
         }
@@ -606,28 +601,26 @@ class StreamingRuntime:
         payload: dict[str, object] = {
             "phase_id": int(self._phase_id),
             "submitted_obs": int(self._submitted_obs),
-            "submitted_jobs": int(self._submitted_jobs),
-            "completed_jobs": int(self._completed_jobs),
+            "completed_steps": int(self._completed_steps),
             "actions_served": int(self._actions_served),
             "actions_missed": int(self._actions_missed),
             "dropped_prefix_actions": int(self._dropped_prefix_actions),
             "timing_ms": {
                 "video_refresh": _summarize_ms(self._video_refresh_samples_ms),
-                "action_job": _summarize_ms(self._action_job_samples_ms),
-                "action_job_wall": _summarize_ms(self._action_job_wall_samples_ms),
+                "action_step_loop": _summarize_ms(self._action_step_loop_samples_ms),
+                "action_step_loop_wall": _summarize_ms(self._action_step_loop_wall_samples_ms),
                 "action_step": _summarize_ms(self._action_step_samples_ms),
                 "snapshot_copy": _summarize_ms(self._snapshot_copy_samples_ms),
             },
             "timing_samples_ms": {
-                "action_job": [float(v) for v in self._action_job_samples_raw_ms],
-                "action_job_wall": [float(v) for v in self._action_job_wall_samples_ms],
+                "action_step_loop": [float(v) for v in self._action_step_loop_samples_raw_ms],
+                "action_step_loop_wall": [float(v) for v in self._action_step_loop_wall_samples_ms],
             },
-            "job_records": list(self._job_records),
+            "step_records": list(self._step_records),
         }
         if self.profile:
             payload["layer_source_stats"] = self._build_layer_source_stats()
         return payload
-
 
 class ProfiledRuntime(StreamingRuntime):
     def __init__(self, *args, **kwargs) -> None:
@@ -651,7 +644,7 @@ class SpawnInitRuntime(ProfiledRuntime):
         if self._started:
             return
         self._obs_queue = self._ctx.Queue(maxsize=1)
-        self._job_queue = self._ctx.Queue(maxsize=1)
+        self._job_queue = self._ctx.Queue(maxsize=16)
         self._layer_queue = self._ctx.Queue(maxsize=128)
         self._result_queue = self._ctx.Queue(maxsize=16)
         self._control_queue = self._ctx.Queue(maxsize=32)
