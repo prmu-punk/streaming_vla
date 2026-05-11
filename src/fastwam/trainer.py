@@ -121,13 +121,7 @@ class Wan22Trainer:
         )
         if self.train_action_expert_only and hasattr(self.model, "action_expert"):
             trainable_params = list(self.model.action_expert.parameters())
-            mot = getattr(self.model, "mot", None)
-            if mot is not None:
-                for attr in ("cache_time_embedding", "cache_time_k_mlps", "cache_time_v_mlps"):
-                    module = getattr(mot, attr, None)
-                    if module is not None:
-                        trainable_params.extend(list(module.parameters()))
-            logger.info("Optimizer scope: action_expert plus MoT cache-time modules.")
+            logger.info("Optimizer scope: action_expert.")
         else:
             trainable_params = list(self.model.dit.parameters())
             logger.info("Optimizer scope: full DiT (MoT).")
@@ -361,13 +355,6 @@ class Wan22Trainer:
             model.dit.train()
             model.action_expert.train()
             model.action_expert.requires_grad_(True)
-            mot = getattr(model, "mot", None)
-            if mot is not None:
-                for attr in ("cache_time_embedding", "cache_time_k_mlps", "cache_time_v_mlps"):
-                    module = getattr(mot, attr, None)
-                    if module is not None:
-                        module.train()
-                        module.requires_grad_(True)
             video_expert = getattr(model, "video_expert", None)
             if video_expert is not None:
                 video_expert.eval()

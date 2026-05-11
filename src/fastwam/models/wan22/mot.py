@@ -38,7 +38,6 @@ class MoT(nn.Module):
         self.mixtures = nn.ModuleDict(mixtures)
         self.expert_order = list(self.mixtures.keys())
         self.mot_checkpoint_mixed_attn = mot_checkpoint_mixed_attn
-        self.use_cache_time_embedding = True
         if mot_checkpoint_mixed_attn:
             logger.info("Using gradient checkpointing for mixture attention. This will save memory but use more computation.")
 
@@ -46,37 +45,6 @@ class MoT(nn.Module):
         self.num_layers = len(first_expert.blocks)
         self.num_heads = first_expert.num_heads
         self.attn_head_dim = first_expert.attn_head_dim
-        self.attn_inner_dim = int(self.num_heads) * int(self.attn_head_dim)
-        time_hidden_dim = max(self.attn_inner_dim // 4, 64)
-        self.cache_time_embedding = nn.Embedding(16, 32)
-        self.cache_time_k_mlps = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(32, time_hidden_dim),
-                    nn.SiLU(),
-                    nn.Linear(time_hidden_dim, self.attn_inner_dim),
-                )
-                for _ in range(self.num_layers)
-            ]
-        )
-        self.cache_time_v_mlps = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(32, time_hidden_dim),
-                    nn.SiLU(),
-                    nn.Linear(time_hidden_dim, self.attn_inner_dim),
-                )
-                for _ in range(self.num_layers)
-            ]
-        )
-        with torch.no_grad():
-            center_idx = self._source_delta_to_index(0)
-            self.cache_time_embedding.weight[center_idx].zero_()
-            for mlp in list(self.cache_time_k_mlps) + list(self.cache_time_v_mlps):
-                final_linear = mlp[-1]
-                final_linear.weight.zero_()
-                final_linear.bias.zero_()
-
         for name in self.expert_order[1:]:
             expert = self.mixtures[name]
             if len(expert.blocks) != self.num_layers:
@@ -97,50 +65,6 @@ class MoT(nn.Module):
         for name in self.expert_order:
             expert = self.mixtures[name]
             logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
-
-    @staticmethod
-    def _source_delta_to_index(source_delta: int) -> int:
-        clipped = max(-8, min(7, int(source_delta)))
-        return int(clipped + 8)
-
-    def _apply_cache_time_embedding(
-        self,
-        *,
-        layer_idx: int,
-        k_video: torch.Tensor,
-        v_video: torch.Tensor,
-        source_delta,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not bool(getattr(self, "use_cache_time_embedding", True)):
-            return k_video, v_video
-        if torch.is_tensor(source_delta):
-            source_delta = source_delta.to(device=k_video.device, dtype=torch.int64).reshape(-1)
-            if source_delta.numel() == 1:
-                source_delta = int(source_delta.item())
-            else:
-                if source_delta.shape[0] != k_video.shape[0]:
-                    raise ValueError(
-                        f"`source_delta` batch mismatch for layer {layer_idx}: "
-                        f"got {tuple(source_delta.shape)} vs batch {k_video.shape[0]}"
-                    )
-                delta_idx = torch.clamp(source_delta, min=-8, max=7) + 8
-                k_mlp = self.cache_time_k_mlps[layer_idx]
-                v_mlp = self.cache_time_v_mlps[layer_idx]
-                k_dtype = next(k_mlp.parameters()).dtype
-                v_dtype = next(v_mlp.parameters()).dtype
-                delta_emb = self.cache_time_embedding.weight[delta_idx].to(device=k_video.device)
-                k_res = k_mlp(delta_emb.to(dtype=k_dtype)).view(k_video.shape[0], 1, -1).to(dtype=k_video.dtype)
-                v_res = v_mlp(delta_emb.to(dtype=v_dtype)).view(v_video.shape[0], 1, -1).to(dtype=v_video.dtype)
-                return k_video + k_res, v_video + v_res
-        delta_idx = self._source_delta_to_index(int(source_delta))
-        k_mlp = self.cache_time_k_mlps[layer_idx]
-        v_mlp = self.cache_time_v_mlps[layer_idx]
-        k_dtype = next(k_mlp.parameters()).dtype
-        v_dtype = next(v_mlp.parameters()).dtype
-        delta_emb = self.cache_time_embedding.weight[delta_idx].to(device=k_video.device)
-        k_res = k_mlp(delta_emb.to(dtype=k_dtype)).view(1, 1, -1).to(dtype=k_video.dtype)
-        v_res = v_mlp(delta_emb.to(dtype=v_dtype)).view(1, 1, -1).to(dtype=v_video.dtype)
-        return k_video + k_res, v_video + v_res
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
@@ -547,17 +471,10 @@ class MoT(nn.Module):
 
             k_video = layer_cache["k"]
             v_video = layer_cache["v"]
-            source_delta = layer_cache.get("source_delta", 0)
             if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
                 raise ValueError(
                     f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
                 )
-            k_video, v_video = self._apply_cache_time_embedding(
-                layer_idx=layer_idx,
-                k_video=k_video,
-                v_video=v_video,
-                source_delta=source_delta,
-            )
 
             # Mixed attention: action queries attend to cached video K/V plus current action K/V.
             k_cat = torch.cat([k_video, k_action], dim=1)

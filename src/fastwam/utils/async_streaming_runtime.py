@@ -461,7 +461,7 @@ class StreamingRuntime:
             if target_step < current_env_step:
                 dropped += 1
                 continue
-            self._ensembler.action_cache[int(target_step)].append(np.asarray(released_actions[i], dtype=np.float32))
+            self._ensembler.action_cache[int(target_step)] = [np.asarray(released_actions[i], dtype=np.float32)]
         self._dropped_prefix_actions += dropped
         return dropped
 

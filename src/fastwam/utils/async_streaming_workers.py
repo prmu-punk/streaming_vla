@@ -98,6 +98,9 @@ def _video_worker_loop(
             msg_type = str(msg.get("type"))
             if msg_type == "stop":
                 break
+            if msg_type == "reset_phase":
+                video_model.reset_streaming_state()
+                continue
             if msg_type == "flush":
                 control_queue.put(
                     {"type": "flush_ack", "worker": "video", "flush_id": int(msg["flush_id"])}

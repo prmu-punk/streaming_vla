@@ -37,9 +37,24 @@ class StreamingBackbone:
             return sampled
         if pattern == "front_low_high":
             return torch.sort(sampled, dim=1, descending=False).values
+        if pattern == "position_low_high":
+            steps = float(self.train_action_scheduler.num_train_timesteps)
+            bias_strength = float(self.streaming_train_cfg.get("token_noise_position_bias_strength", 0.5))
+            bias_strength = min(max(bias_strength, 0.0), 1.0)
+            margin = float(self.streaming_train_cfg.get("token_noise_position_margin", 0.1))
+            margin = min(max(margin, 0.0), 0.49)
+            position_ratio = torch.linspace(
+                margin,
+                1.0 - margin,
+                action_horizon,
+                device=self.device,
+                dtype=target_action.dtype,
+            ).unsqueeze(0)
+            position_target = position_ratio.expand(batch_size, -1) * steps
+            return torch.lerp(sampled, position_target, bias_strength)
         raise ValueError(
             f"Unsupported `streaming_train.token_noise_pattern`: {pattern}. "
-            "Expected one of: ['random_all', 'front_low_high']."
+            "Expected one of: ['random_all', 'front_low_high', 'position_low_high']."
         )
 
     def _offset_to_shift_steps_tensor(self, offset: torch.Tensor, *, action_horizon: int) -> torch.Tensor:

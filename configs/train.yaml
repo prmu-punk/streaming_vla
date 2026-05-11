@@ -25,7 +25,7 @@ max_steps: null
 log_every: 10
 save_every: 100
 eval_every: 50
-eval_num_inference_steps: 10
+eval_num_inference_steps: 12
 
 # training
 gradient_accumulation_steps: 1
@@ -36,7 +36,7 @@ weight_decay: 0.0
 resume: null
 
 STREAMING:
-  obs_stride: 2
+  obs_stride: 1
   action_trigger_every_n_obs: 4
   video_layers_per_chunk: 30
   force_first_job: true

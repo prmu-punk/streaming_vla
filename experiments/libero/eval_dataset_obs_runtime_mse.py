@@ -81,8 +81,9 @@ class ChunkOffsetRuntime(ProfiledRuntime):
             if target_step < current_env_step:
                 dropped += 1
                 continue
-            self._ensembler.action_cache[int(target_step)].append(np.asarray(released_actions[i], dtype=np.float32))
-            self._action_source_cache[int(target_step)].append(int(source_env_step))
+            target_step = int(target_step)
+            self._ensembler.action_cache[target_step] = [np.asarray(released_actions[i], dtype=np.float32)]
+            self._action_source_cache[target_step].append(int(source_env_step))
         self._dropped_prefix_actions += dropped
         return dropped
 
@@ -405,7 +406,7 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
                 proprio=proprio,
                 env_step=int(env_step),
             )
-            action = runtime.get_action(int(env_step))
+            action = runtime.get_action(int(env_step), count_miss=False)
             had_initial_miss = action is None
             if action is None:
                 action = runner.wait_for_action(env_step=int(env_step), proprio=proprio)

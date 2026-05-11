@@ -60,7 +60,6 @@ loss:
 
 streaming:
   freeze_video_expert: true
-  use_cache_time_embedding: false
   streaming_train:
     enabled: false
     cache_mode: full_cur

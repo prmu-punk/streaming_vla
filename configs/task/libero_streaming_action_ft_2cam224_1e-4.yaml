@@ -20,7 +20,7 @@ model:
     streaming_train:
       enabled: true
       cache_mode: full_cur
-      token_noise_pattern: front_low_high
+      token_noise_pattern: random_all
 
 lr_scheduler_type: "cosine"
 learning_rate: 5e-5

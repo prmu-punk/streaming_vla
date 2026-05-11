@@ -131,6 +131,28 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     )
 
 
+def _select_initial_states(
+    initial_states,
+    *,
+    num_trials: int,
+    seed: Optional[int],
+    task_suite_name: str,
+    task_id: int,
+) -> list:
+    if num_trials <= 0:
+        raise ValueError(f"EVALUATION.num_trials must be positive, got {num_trials}")
+    states = list(initial_states)
+    if len(states) == 0:
+        raise ValueError(f"No initial states found for {task_suite_name} task {task_id}")
+
+    suite_seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(task_suite_name))
+    base_seed = 0 if seed is None else int(seed)
+    rng = np.random.default_rng(base_seed + suite_seed + 1009 * int(task_id))
+    replace = num_trials > len(states)
+    sampled_indices = rng.choice(len(states), size=num_trials, replace=replace)
+    return [states[int(idx)] for idx in sampled_indices]
+
+
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         raise ValueError("Async-only LIBERO evaluator does not support visualize_future_video=true.")
@@ -199,9 +221,13 @@ def eval_single_process(cfg: DictConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
     task = task_suite.get_task(cfg.EVALUATION.task_id)
-    initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
-    while len(initial_states) < int(cfg.EVALUATION.num_trials):
-        initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+    initial_states = _select_initial_states(
+        task_suite.get_task_init_states(cfg.EVALUATION.task_id),
+        num_trials=int(cfg.EVALUATION.num_trials),
+        seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+        task_suite_name=str(cfg.EVALUATION.task_suite_name),
+        task_id=int(cfg.EVALUATION.task_id),
+    )
 
     results = {
         "task_suite": cfg.EVALUATION.task_suite_name,

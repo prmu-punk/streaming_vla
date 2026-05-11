@@ -26,6 +26,7 @@ from experiments.libero.eval_libero_single_profiled import (
     _resolve_async_runtime_devices,
     _resolve_dataset_stats_path,
     _resolve_eval_device,
+    _select_initial_states,
     _validate_visualize_future_video_cfg,
 )
 from experiments.libero.summarize_results import summarize_results
@@ -128,9 +129,13 @@ def eval_all_serial(cfg: DictConfig):
             cfg.EVALUATION.task_id = int(task_id)
 
             task = task_suite.get_task(task_id)
-            initial_states = task_suite.get_task_init_states(task_id)
-            while len(initial_states) < int(cfg.EVALUATION.num_trials):
-                initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+            initial_states = _select_initial_states(
+                task_suite.get_task_init_states(task_id),
+                num_trials=int(cfg.EVALUATION.num_trials),
+                seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+                task_suite_name=str(suite_name),
+                task_id=int(task_id),
+            )
 
             task_results = run_single_task(
                 task=task,

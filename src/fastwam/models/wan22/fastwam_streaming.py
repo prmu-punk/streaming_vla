@@ -34,7 +34,6 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         self.streaming_cfg = cfg
         self.streaming_train_cfg = dict(cfg.get("streaming_train", {}))
         self.freeze_video_expert = bool(cfg.get("freeze_video_expert", True))
-        self.mot.use_cache_time_embedding = bool(cfg.get("use_cache_time_embedding", True))
         if self.freeze_video_expert:
             for module in (self.video_expert, self.vae):
                 for param in module.parameters():
