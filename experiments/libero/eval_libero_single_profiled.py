@@ -138,7 +138,7 @@ def _select_initial_states(
     seed: Optional[int],
     task_suite_name: str,
     task_id: int,
-) -> list:
+) -> tuple[list, list[int]]:
     if num_trials <= 0:
         raise ValueError(f"EVALUATION.num_trials must be positive, got {num_trials}")
     states = list(initial_states)
@@ -150,7 +150,42 @@ def _select_initial_states(
     rng = np.random.default_rng(base_seed + suite_seed + 1009 * int(task_id))
     replace = num_trials > len(states)
     sampled_indices = rng.choice(len(states), size=num_trials, replace=replace)
-    return [states[int(idx)] for idx in sampled_indices]
+    selected_indices = [int(idx) for idx in sampled_indices]
+    return [states[idx] for idx in selected_indices], selected_indices
+
+
+def _resolve_trial_selection(
+    cfg: DictConfig,
+    initial_states,
+    *,
+    task_suite_name: str,
+    task_id: int,
+) -> tuple[list, list[int]]:
+    trial_indices_cfg = cfg.EVALUATION.get("trial_indices")
+    states = list(initial_states)
+    if len(states) == 0:
+        raise ValueError(f"No initial states found for {task_suite_name} task {task_id}")
+
+    if trial_indices_cfg is not None:
+        selected_indices = [int(idx) for idx in trial_indices_cfg]
+        if len(selected_indices) == 0:
+            raise ValueError("EVALUATION.trial_indices must not be empty.")
+        max_index = len(states) - 1
+        for idx in selected_indices:
+            if idx < 0 or idx > max_index:
+                raise IndexError(
+                    f"Trial index {idx} out of range for {task_suite_name} task {task_id}; "
+                    f"valid range is [0, {max_index}]"
+                )
+        return [states[idx] for idx in selected_indices], selected_indices
+
+    return _select_initial_states(
+        states,
+        num_trials=int(cfg.EVALUATION.num_trials),
+        seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+        task_suite_name=task_suite_name,
+        task_id=task_id,
+    )
 
 
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
@@ -221,10 +256,9 @@ def eval_single_process(cfg: DictConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
     task = task_suite.get_task(cfg.EVALUATION.task_id)
-    initial_states = _select_initial_states(
+    initial_states, selected_trial_indices = _resolve_trial_selection(
+        cfg,
         task_suite.get_task_init_states(cfg.EVALUATION.task_id),
-        num_trials=int(cfg.EVALUATION.num_trials),
-        seed=(None if cfg.get("seed") is None else int(cfg.seed)),
         task_suite_name=str(cfg.EVALUATION.task_suite_name),
         task_id=int(cfg.EVALUATION.task_id),
     )
@@ -236,8 +270,9 @@ def eval_single_process(cfg: DictConfig):
         "action_horizon": int(action_horizon),
         "ckpt_loaded": bool(cfg.get("ckpt") is not None),
         "successes": 0,
-        "total_episodes": int(cfg.EVALUATION.num_trials),
+        "total_episodes": int(len(initial_states)),
         "gpu_id": int(cfg.gpu_id),
+        "trial_indices": [int(idx) for idx in selected_trial_indices],
         "success_episodes": [],
         "failure_episodes": [],
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -271,7 +306,7 @@ def eval_single_process(cfg: DictConfig):
 
     print(
         f"Task {cfg.EVALUATION.task_id} completed: "
-        f"{results['successes']}/{cfg.EVALUATION.num_trials} successes"
+        f"{results['successes']}/{results['total_episodes']} successes"
     )
     if results.get("future_video_psnr_mean") is not None:
         print(f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")

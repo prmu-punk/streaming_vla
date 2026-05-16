@@ -12,6 +12,7 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
     def __init__(
         self,
         *args,
+        return_single_obs: bool = False,
         obs_stride: Optional[int] = None,
         effective_obs_stride: int = 3,
         history_obs: int = 1,
@@ -37,6 +38,7 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
 
         self.effective_obs_stride = int(effective_obs_stride)
+        self.return_single_obs = bool(return_single_obs)
         self.history_obs = int(history_obs)
         self.future_obs = int(future_obs)
         self.trigger_every_n_obs = int(trigger_every_n_obs)
@@ -63,8 +65,12 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             raw_num_obs = int(ep_to[episode_idx].item() - ep_from[episode_idx].item())
             if raw_num_obs <= 1:
                 continue
-            trigger_start = int(self.history_obs) * int(self.effective_obs_stride)
-            trigger_end = raw_num_obs - int(self.future_obs) * int(self.effective_obs_stride)
+            if self.return_single_obs:
+                trigger_start = 0
+                trigger_end = raw_num_obs
+            else:
+                trigger_start = int(self.history_obs) * int(self.effective_obs_stride)
+                trigger_end = raw_num_obs - int(self.future_obs) * int(self.effective_obs_stride)
             for trigger_obs_idx in range(trigger_start, trigger_end):
                 raw_action_start = int(trigger_obs_idx)
                 if raw_action_start + self.action_horizon > raw_num_obs - 1:
@@ -193,12 +199,15 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         episode_idx, trigger_obs_idx, raw_action_start = self.sample_index[idx]
         payload = self._load_episode_cache(episode_idx)
 
-        raw_frame_indices = [
-            trigger_obs_idx - self.effective_obs_stride,
-            trigger_obs_idx,
-            trigger_obs_idx + self.effective_obs_stride,
-            trigger_obs_idx + 2 * self.effective_obs_stride,
-        ]
+        if self.return_single_obs:
+            raw_frame_indices = [trigger_obs_idx]
+        else:
+            raw_frame_indices = [
+                trigger_obs_idx - self.effective_obs_stride,
+                trigger_obs_idx,
+                trigger_obs_idx + self.effective_obs_stride,
+                trigger_obs_idx + 2 * self.effective_obs_stride,
+            ]
         video = self._query_episode_images(
             dataset=payload["dataset"],
             local_episode_idx=payload["local_episode_idx"],
@@ -227,10 +236,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         context_mask = torch.ones_like(context_mask)
 
         sample = {
-            "obs_prev": video[0],
-            "obs_cur": video[1],
-            "obs_next": video[2],
-            "obs_next2": video[3],
             "target_action": target_action,
             "action_is_pad": torch.zeros((target_action.shape[0],), dtype=torch.bool),
             "proprio_t": proprio_t.squeeze(0),
@@ -241,4 +246,11 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             "raw_action_start": int(raw_action_start),
             "episode_idx": int(episode_idx),
         }
+        if self.return_single_obs:
+            sample["obs"] = video[0]
+        else:
+            sample["obs_prev"] = video[0]
+            sample["obs_cur"] = video[1]
+            sample["obs_next"] = video[2]
+            sample["obs_next2"] = video[3]
         return sample

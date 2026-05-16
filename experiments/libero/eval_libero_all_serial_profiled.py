@@ -26,6 +26,7 @@ from experiments.libero.eval_libero_single_profiled import (
     _resolve_async_runtime_devices,
     _resolve_dataset_stats_path,
     _resolve_eval_device,
+    _resolve_trial_selection,
     _select_initial_states,
     _validate_visualize_future_video_cfg,
 )
@@ -129,10 +130,9 @@ def eval_all_serial(cfg: DictConfig):
             cfg.EVALUATION.task_id = int(task_id)
 
             task = task_suite.get_task(task_id)
-            initial_states = _select_initial_states(
+            initial_states, selected_trial_indices = _resolve_trial_selection(
+                cfg,
                 task_suite.get_task_init_states(task_id),
-                num_trials=int(cfg.EVALUATION.num_trials),
-                seed=(None if cfg.get("seed") is None else int(cfg.seed)),
                 task_suite_name=str(suite_name),
                 task_id=int(task_id),
             )
@@ -160,8 +160,9 @@ def eval_all_serial(cfg: DictConfig):
                 "action_horizon": int(action_horizon),
                 "ckpt_loaded": bool(cfg.get("ckpt") is not None),
                 "successes": int(task_results["successes"]),
-                "total_episodes": int(cfg.EVALUATION.num_trials),
+                "total_episodes": int(len(initial_states)),
                 "gpu_id": int(cfg.gpu_id),
+                "trial_indices": [int(idx) for idx in selected_trial_indices],
                 "success_episodes": task_results.get("success_episodes", []),
                 "failure_episodes": task_results.get("failure_episodes", []),
                 "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),

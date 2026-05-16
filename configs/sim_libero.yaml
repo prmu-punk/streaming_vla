@@ -16,7 +16,7 @@ model:
 EVALUATION:
   task_suite_name: libero_spatial
   task_id: 0
-  num_trials: 50
+  num_trials: 1
   trial_start_idx: 0
   trials_per_process: 1
   output_dir: ./evaluate_results/libero/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
@@ -77,7 +77,6 @@ MULTIRUN:
     - libero_object
   num_gpus: 8
   max_tasks_per_gpu: 2
-
 hydra:
   job:
     chdir: false

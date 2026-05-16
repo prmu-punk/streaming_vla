@@ -291,7 +291,13 @@ def run_single_task(
     action_device: str,
     render_gpu_device_id: int,
 ) -> dict:
-    task_description = getattr(task, "language", None)
+    env, task_description = get_libero_env(
+        task,
+        LIBERO_ENV_RESOLUTION,
+        cfg.get("seed"),
+        render_gpu_device_id=render_gpu_device_id,
+    )
+    task_description = task_description or getattr(task, "language", None)
     resolved_action_model = model if action_model is None else action_model
     results = {
         "successes": 0,
@@ -304,17 +310,9 @@ def run_single_task(
         "async_video_device": str(model_device),
         "async_action_device": str(action_device),
     }
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        env, env_task_description = get_libero_env(
-            task,
-            LIBERO_ENV_RESOLUTION,
-            cfg.get("seed"),
-            render_gpu_device_id=render_gpu_device_id,
-        )
-        if task_description is None:
-            task_description = env_task_description
-            results["task_description"] = task_description
-        try:
+    total_trials = int(len(initial_states))
+    try:
+        for trial_idx in range(total_trials):
             save_video = bool(cfg.EVALUATION.get("save_video", True))
             success, replay_images, runtime_summary = run_single_episode_async(
                 env=env,
@@ -352,12 +350,12 @@ def run_single_task(
                     success=success,
                     task_description=task_description,
                 )
-        finally:
-            if hasattr(env, "close"):
-                try:
-                    env.close()
-                except Exception:
-                    logging.exception("Failed to close LIBERO env cleanly.")
+    finally:
+        if hasattr(env, "close"):
+            try:
+                env.close()
+            except Exception:
+                logging.exception("Failed to close LIBERO env cleanly.")
 
     results["async_runtime_summary"] = _summarize_async_runtime_episodes(results["async_runtime_episodes"])
     return results

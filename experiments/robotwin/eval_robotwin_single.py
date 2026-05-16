@@ -30,6 +30,7 @@ Examples:
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -65,6 +66,10 @@ def _resolve_dataset_stats_path(cfg: DictConfig, ckpt_path: Path) -> Path:
     candidates: list[Path] = []
     if explicit is not None:
         candidates.append(explicit)
+
+    ckpt_stem = ckpt_path.stem
+    candidates.append(ckpt_path.with_name(f"{ckpt_stem}_dataset_stats.json").resolve())
+    candidates.append(ckpt_path.with_suffix(".dataset_stats.json").resolve())
 
     for parent in list(ckpt_path.parents)[:4]:
         candidates.append((parent / "dataset_stats.json").resolve())
@@ -124,10 +129,18 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
             )
         return policy_target
 
-    raise RuntimeError(
-        f"Path already exists and is not a symlink: {policy_target}. "
-        "Please handle it manually to avoid overriding existing policy files."
-    )
+    if policy_target.is_dir():
+        for src_path in policy_source_dir.iterdir():
+            dst_path = policy_target / src_path.name
+            if src_path.is_dir():
+                if dst_path.exists():
+                    shutil.rmtree(dst_path)
+                shutil.copytree(src_path, dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
+        return policy_target
+
+    raise RuntimeError(f"Policy target exists but is not a directory or symlink: {policy_target}")
 
 
 def _format_override_value(value: Any) -> str:
@@ -211,6 +224,8 @@ def main(cfg: DictConfig):
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
+    _append_override(overrides, "async_video_device", cfg.EVALUATION.get("async_video_device", None))
+    _append_override(overrides, "async_action_device", cfg.EVALUATION.get("async_action_device", None))
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
     _append_override(overrides, "action_horizon", cfg.EVALUATION.action_horizon)
     _append_override(overrides, "replan_steps", cfg.EVALUATION.replan_steps)
@@ -221,6 +236,12 @@ def main(cfg: DictConfig):
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    _append_override(overrides, "profile_runtime", cfg.EVALUATION.get("profile_runtime", None))
+    _append_override(
+        overrides,
+        "async_video_layers_per_chunk",
+        cfg.EVALUATION.get("async_video_layers_per_chunk", None),
+    )
     _append_override(
         overrides,
         "skip_get_obs_within_replan",

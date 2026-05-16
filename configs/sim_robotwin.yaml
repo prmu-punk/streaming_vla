@@ -23,20 +23,30 @@ EVALUATION:
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
 
   # Action inference
-  action_horizon: null
+  action_horizon: 10
   replan_steps: 24
   num_inference_steps: ${eval_num_inference_steps}
   sigma_shift: null
   text_cfg_scale: 1.0
   negative_prompt: ""
-  rand_device: cpu
+  rand_device: "cuda:0"
   tiled: false
   timing_enabled: false
   skip_get_obs_within_replan: true
+  async_obs_stride_env_steps: ${STREAMING.obs_stride}
+  async_action_trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
+  async_video_layers_per_chunk: ${STREAMING.video_layers_per_chunk}
+  async_force_first_job: ${STREAMING.force_first_job}
+  async_control_dt_ms: ${STREAMING.control_dt_ms}
+  async_warmup_action_jobs: ${STREAMING.warmup_action_jobs}
+  async_action_wait_timeout_s: 10.0
 
   # Runtime inputs
   dataset_stats_path: null
   device: cuda
+  async_video_device: null
+  async_action_device: null
+  profile_runtime: null
 
 MULTIRUN:
   enabled: false

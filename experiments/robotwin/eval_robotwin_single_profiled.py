@@ -55,10 +55,10 @@ for p in (PROJECT_ROOT, SRC_ROOT, ROBOTWIN_ROOT, ROBOTWIN_SCRIPT_DIR, ROBOTWIN_P
         sys.path.insert(0, sp)
 
 
-# Importing deploy_policy registers the streaming policy on the import path
-# `experiments.robotwin.fastwam_streaming_policy.deploy_policy`, which is the
+# Importing deploy_policy registers the runtime-backed RobotWin policy on the
+# import path `experiments.robotwin.fastwam_policy.deploy_policy`, which is the
 # `policy_name` we will feed into RoboTwin's `eval_policy.main()`.
-from experiments.robotwin.fastwam_streaming_policy import deploy_policy as streaming_policy  # noqa: E402
+from experiments.robotwin.fastwam_policy import deploy_policy as streaming_policy  # noqa: E402
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logger = logging.getLogger(__name__)
@@ -166,7 +166,7 @@ def _build_usr_args(args: argparse.Namespace) -> Dict[str, Any]:
         "task_name": args.task_name,
         "task_config": args.task_config,
         "ckpt_setting": str(Path(args.ckpt_setting).resolve()),
-        "policy_name": "experiments.robotwin.fastwam_streaming_policy.deploy_policy",
+        "policy_name": "experiments.robotwin.fastwam_policy.deploy_policy",
         "instruction_type": args.instruction_type,
         "skip_get_obs_within_replan": bool(args.skip_get_obs_within_replan),
         "eval_num_episodes": int(args.eval_num_episodes),
@@ -186,6 +186,7 @@ def _build_usr_args(args: argparse.Namespace) -> Dict[str, Any]:
         "rand_device": args.rand_device,
         "tiled": bool(args.tiled),
         "timing_enabled": bool(args.timing_enabled),
+        "profile_runtime": True,
         "load_text_encoder": bool(args.load_text_encoder),
         "redirect_common_files": bool(args.redirect_common_files),
         "async_video_device": args.async_video_device,

@@ -372,6 +372,9 @@ class Wan22Trainer:
         # only add batch dimensions so `training_loss` can run in eval.
         if "video" not in sample:
             out = dict(sample)
+            tensor = out.get("obs", None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 3:
+                out["obs"] = tensor.unsqueeze(0)
             for key in ("obs_prev", "obs_cur", "obs_next", "obs_next2"):
                 tensor = out.get(key, None)
                 if isinstance(tensor, torch.Tensor) and tensor.ndim == 3:

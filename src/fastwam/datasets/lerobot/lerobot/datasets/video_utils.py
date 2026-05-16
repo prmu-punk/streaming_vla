@@ -28,14 +28,21 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+_FORCE_DISABLE_TORCHCODEC = False
+_TORCHCODEC_FALLBACK_WARNED = False
+_DEFAULT_CODEC_WARNED = False
+
 
 def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
+    global _DEFAULT_CODEC_WARNED
+    if (not _FORCE_DISABLE_TORCHCODEC) and importlib.util.find_spec("torchcodec"):
         return "torchcodec"
     else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
+        if not _DEFAULT_CODEC_WARNED:
+            logging.warning(
+                "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+            )
+            _DEFAULT_CODEC_WARNED = True
         return "pyav"
 
 
@@ -65,9 +72,14 @@ def decode_video_frames(
         try:
             return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
         except Exception as err:
-            warnings.warn(
-                f"torchcodec video decode failed ({type(err).__name__}: {err}); falling back to torchvision/pyav."
-            )
+            global _FORCE_DISABLE_TORCHCODEC, _TORCHCODEC_FALLBACK_WARNED
+            _FORCE_DISABLE_TORCHCODEC = True
+            if not _TORCHCODEC_FALLBACK_WARNED:
+                warnings.warn(
+                    f"torchcodec video decode failed ({type(err).__name__}: {err}); "
+                    "disabling torchcodec for this process and falling back to torchvision/pyav."
+                )
+                _TORCHCODEC_FALLBACK_WARNED = True
             return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend="pyav")
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)

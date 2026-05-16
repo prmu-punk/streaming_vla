@@ -29,6 +29,20 @@ class Robot:
 
         self.left_js = None
         self.right_js = None
+        if not hasattr(self, "communication_flag"):
+            self.communication_flag = False
+        for attr_name in (
+            "left_planner",
+            "right_planner",
+            "left_mplib_planner",
+            "right_mplib_planner",
+            "left_conn",
+            "right_conn",
+            "left_proc",
+            "right_proc",
+        ):
+            if not hasattr(self, attr_name):
+                setattr(self, attr_name, None)
 
         left_embodiment_args = kwargs["left_embodiment_config"]
         right_embodiment_args = kwargs["right_embodiment_config"]
@@ -132,7 +146,9 @@ class Robot:
                 self.right_conn.send({"cmd": "reset"})
                 _ = self.right_conn.recv()
         else:
-            if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
+            left_planner = getattr(self, "left_planner", None)
+            right_planner = getattr(self, "right_planner", None)
+            if not isinstance(left_planner, CuroboPlanner) or not isinstance(right_planner, CuroboPlanner):
                 self.set_planner(scene=scene)
 
         self.init_joints()

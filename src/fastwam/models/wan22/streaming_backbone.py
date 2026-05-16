@@ -154,17 +154,16 @@ class StreamingBackbone:
         return loss_stream
 
     def _extract_streaming_episode_batch(self, sample) -> Optional[dict[str, torch.Tensor]]:
-        required_keys = {
-            "obs_prev",
-            "obs_cur",
-            "obs_next",
-            "obs_next2",
+        shared_required = {
             "target_action",
             "proprio_t",
             "context",
             "context_mask",
         }
-        if not required_keys.issubset(sample.keys()):
+        legacy_required = {"obs_prev", "obs_cur", "obs_next", "obs_next2"}
+        has_single_obs = "obs" in sample
+        has_legacy_obs = legacy_required.issubset(sample.keys())
+        if not shared_required.issubset(sample.keys()) or (not has_single_obs and not has_legacy_obs):
             return None
 
         def _to_image(x: torch.Tensor) -> torch.Tensor:
@@ -178,11 +177,7 @@ class StreamingBackbone:
             raise ValueError(
                 f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}."
             )
-        return {
-            "obs_prev": _to_image(sample["obs_prev"]),
-            "obs_cur": _to_image(sample["obs_cur"]),
-            "obs_next": _to_image(sample["obs_next"]),
-            "obs_next2": _to_image(sample["obs_next2"]),
+        batch = {
             "target_action": sample["target_action"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
             "action_is_pad": sample.get("action_is_pad", None).to(device=self.device, dtype=torch.bool, non_blocking=True)
             if sample.get("action_is_pad", None) is not None
@@ -191,6 +186,14 @@ class StreamingBackbone:
             "context": context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
             "context_mask": context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True),
         }
+        if has_single_obs:
+            batch["obs"] = _to_image(sample["obs"])
+        else:
+            batch["obs_prev"] = _to_image(sample["obs_prev"])
+            batch["obs_cur"] = _to_image(sample["obs_cur"])
+            batch["obs_next"] = _to_image(sample["obs_next"])
+            batch["obs_next2"] = _to_image(sample["obs_next2"])
+        return batch
 
     @staticmethod
     def _slice_cache_batch(
@@ -298,14 +301,8 @@ class StreamingBackbone:
         episode_batch = self._extract_streaming_episode_batch(sample)
         if episode_batch is None:
             required_keys = (
-                "obs_prev",
-                "obs_cur",
-                "obs_next",
-                "obs_next2",
-                "target_action",
-                "proprio_t",
-                "context",
-                "context_mask",
+                "obs + target_action + proprio_t + context + context_mask",
+                "or obs_prev/obs_cur/obs_next/obs_next2 + target_action + proprio_t + context + context_mask",
             )
             present_keys = sorted(str(key) for key in sample.keys())
             raise ValueError(
@@ -330,19 +327,36 @@ class StreamingBackbone:
         cache_key = self._cache_key_from_full_mode(cache_mode)
         video_ctx = nullcontext() if not self.freeze_video_expert else torch.no_grad()
         with video_ctx:
-            selected_caches = self._build_selected_video_cache_payload(
-                episode_batch,
-                required_cache_keys=[cache_key],
-            )
-        selected_cache = selected_caches[cache_key]
+            if "obs" in episode_batch:
+                if cache_key != "cur":
+                    raise ValueError(
+                        "Single-observation streaming training only supports "
+                        "`streaming_train.cache_mode=full_cur`."
+                    )
+                selected_caches = self.build_streaming_video_cache_from_input_image(
+                    input_image=episode_batch["obs"],
+                    context=episode_batch["context"],
+                    context_mask=episode_batch["context_mask"],
+                )
+                selected_cache = selected_caches["video_kv_cache"]
+                video_seq_len = int(selected_caches["video_seq_len"])
+                tokens_per_frame = int(selected_caches["video_pre"]["meta"]["tokens_per_frame"])
+            else:
+                selected_caches = self._build_selected_video_cache_payload(
+                    episode_batch,
+                    required_cache_keys=[cache_key],
+                )
+                selected_cache = selected_caches[cache_key]
+                video_seq_len = int(selected_caches["video_seq_len"])
+                tokens_per_frame = int(selected_caches["tokens_per_frame"])
         pred_action = self._predict_stream_noise(
             noisy_action=noisy_action,
             timestep_action=timestep_action,
             context=episode_batch["context"],
             context_mask=episode_batch["context_mask"],
             video_kv_cache=selected_cache,
-            video_seq_len=int(selected_caches["video_seq_len"]),
-            video_tokens_per_frame=int(selected_caches["tokens_per_frame"]),
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=tokens_per_frame,
         )
         loss_stream = self._loss_stream_full_chunk(
             pred_action=pred_action,

@@ -38,6 +38,32 @@ class Base_Task(gym.Env):
     def __init__(self):
         pass
 
+    def _get_eval_video_frame(self):
+        def _camera_rgb(camera):
+            camera.take_picture()
+            camera_rgba = camera.get_picture("Color")
+            return (camera_rgba * 255).clip(0, 255).astype("uint8")[:, :, :3]
+
+        cameras = getattr(self, "cameras", None)
+        if cameras is not None:
+            world_camera = getattr(cameras, "world_camera1", None)
+            if world_camera is not None:
+                return _camera_rgb(world_camera)
+            observer_camera = getattr(cameras, "observer_camera", None)
+            if observer_camera is not None:
+                return _camera_rgb(observer_camera)
+
+        obs = self.now_obs["observation"]
+        if "head_camera" in obs:
+            return obs["head_camera"]["rgb"]
+        if "front_camera" in obs:
+            return obs["front_camera"]["rgb"]
+        if "left_camera" in obs:
+            return obs["left_camera"]["rgb"]
+        if "right_camera" in obs:
+            return obs["right_camera"]["rgb"]
+        raise KeyError("No RGB camera found for eval video frame.")
+
     # =========================================================== Init Task Env ===========================================================
     def _init_task_env_(self, table_xy_bias=[0, 0], table_height_bias=0, **kwags):
         """
@@ -1482,7 +1508,8 @@ class Base_Task(gym.Env):
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+            eval_frame = self._get_eval_video_frame()
+            self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1658,7 +1685,8 @@ class Base_Task(gym.Env):
                 self.eval_success = True
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                    eval_frame = self._get_eval_video_frame()
+                    self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
                 return
 
         self._update_render()

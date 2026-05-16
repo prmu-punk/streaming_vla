@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 import logging
 import os
 import sys
 import time
-import inspect
-from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -15,7 +15,15 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+def _find_project_root() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "src" / "fastwam").is_dir() and (parent / "configs").is_dir():
+            return parent
+    raise RuntimeError(f"Failed to locate FastWAM project root from: {current}")
+
+
+PROJECT_ROOT = _find_project_root()
 SRC_ROOT = PROJECT_ROOT / "src"
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,8 +34,15 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.utils.async_streaming_runtime import ProfiledRuntime, StreamingRuntime
 
 logger = logging.getLogger(__name__)
+
+_LAST_POLICY: Optional["StreamingRuntimeRobotWinPolicy"] = None
+
+
+def get_last_policy() -> Optional["StreamingRuntimeRobotWinPolicy"]:
+    return _LAST_POLICY
 
 
 def _is_none_like(value: Any) -> bool:
@@ -135,14 +150,28 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
-class WorldActionRobotWinPolicy:
+def _summarize_ms(samples_ms: list[float]) -> dict[str, float | int | None]:
+    if len(samples_ms) == 0:
+        return {"count": 0, "avg_ms": None, "p50_ms": None, "p90_ms": None, "max_ms": None}
+    arr = np.asarray(samples_ms, dtype=np.float64)
+    return {
+        "count": int(arr.shape[0]),
+        "avg_ms": float(np.mean(arr)),
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p90_ms": float(np.percentile(arr, 90)),
+        "max_ms": float(np.max(arr)),
+    }
+
+
+class StreamingRuntimeRobotWinPolicy:
     def __init__(
         self,
         model_cfg: DictConfig,
         processor_cfg: DictConfig,
         checkpoint_path: str,
         dataset_stats_path: Path,
-        device: str,
+        video_device: str,
+        action_device: str,
         model_dtype: torch.dtype,
         action_horizon: int,
         replan_steps: int,
@@ -154,14 +183,22 @@ class WorldActionRobotWinPolicy:
         rand_device: str,
         tiled: bool,
         timing_enabled: bool,
-        num_video_frames: int,
+        profile_runtime: bool,
+        video_layers_per_chunk: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
 
-        self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
+        self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=video_device)
         self.model.load_checkpoint(checkpoint_path)
-        self.model = self.model.to(device).eval()
+        self.model = self.model.to(video_device).eval()
+
+        if str(action_device) == str(video_device):
+            self.action_model = self.model
+        else:
+            self.action_model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=action_device)
+            self.action_model.load_checkpoint(checkpoint_path)
+            self.action_model = self.action_model.to(action_device).eval()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -177,19 +214,28 @@ class WorldActionRobotWinPolicy:
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
-        self._num_video_frames = int(num_video_frames)
+        self.profile_runtime = bool(profile_runtime)
+        self.video_layers_per_chunk = int(max(1, video_layers_per_chunk))
 
-        self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._runtime: Optional[StreamingRuntime] = None
+        self._runtime_started = False
+        self._current_instruction: Optional[str] = None
+        self._env_step_samples_ms: list[float] = []
+        self._episode_stats: list[dict[str, Any]] = []
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized StreamingRuntimeRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d | "
+            "video_device=%s | action_device=%s | profile=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            video_device,
+            action_device,
+            self.profile_runtime,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -226,72 +272,132 @@ class WorldActionRobotWinPolicy:
         bottom = np.concatenate([left, right], axis=1)
         image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
 
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
-            device=self.model.device,
-            dtype=self.model.torch_dtype,
-        )
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32)
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
-    def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
+    def _encode_observation(self, observation: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
+        return image_tensor, proprio
 
+    def _action_postprocess(self, actions: torch.Tensor) -> np.ndarray:
+        return self._denormalize_action(actions)[0]
+
+    def _build_runtime(self, instruction: str) -> None:
         prompt = DEFAULT_PROMPT.format(task=instruction)
-        infer_kwargs = {
-            "prompt": prompt,
-            "input_image": image_tensor,
-            "action_horizon": self.action_horizon,
-            "proprio": proprio,
-            "negative_prompt": self.negative_prompt,
-            "text_cfg_scale": self.text_cfg_scale,
-            "num_inference_steps": self.num_inference_steps,
-            "sigma_shift": self.sigma_shift,
-            "seed": self.seed,
-            "rand_device": self.rand_device,
-            "tiled": self.tiled,
-        }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
-            infer_kwargs["num_video_frames"] = int(self._num_video_frames)
-        infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            video_context, video_context_mask = self.model.encode_prompt(prompt)
+            if self.action_model is self.model:
+                action_context, action_context_mask = video_context, video_context_mask
+            else:
+                action_context, action_context_mask = self.action_model.encode_prompt(prompt)
+        video_context = video_context.to(device="cpu", dtype=self.model.torch_dtype)
+        video_context_mask = video_context_mask.to(device="cpu", dtype=torch.bool)
+        action_context = action_context.to(device="cpu", dtype=self.action_model.torch_dtype)
+        action_context_mask = action_context_mask.to(device="cpu", dtype=torch.bool)
+
+        runtime_cls = ProfiledRuntime if self.profile_runtime else StreamingRuntime
+        self._runtime = runtime_cls(
+            video_model=self.model,
+            action_model=self.action_model,
+            video_context=video_context,
+            video_context_mask=video_context_mask,
+            action_context=action_context,
+            action_context_mask=action_context_mask,
+            action_postprocess=self._action_postprocess,
+            action_horizon=self.action_horizon,
+            num_inference_steps=self.num_inference_steps,
+            sigma_shift=self.sigma_shift,
+            rand_device=self.rand_device,
+            tiled=self.tiled,
+            action_trigger_every_n_obs=1,
+            video_layers_per_chunk=self.video_layers_per_chunk,
+            seed=self.seed,
+        )
+        self._runtime.start()
+        self._runtime_started = True
+
+    def _wait_for_action(self, env_step: int) -> np.ndarray:
+        if self._runtime is None:
+            raise RuntimeError("Streaming runtime is not initialized.")
+
+        action = self._runtime.get_action(env_step)
+        while action is None:
+            self._runtime.wait_until_idle()
+            action = self._runtime.get_action(env_step, count_miss=False)
+        return np.asarray(action, dtype=np.float32)
+
+    def _teardown_runtime(self) -> None:
+        if self._runtime is None or not self._runtime_started:
+            self._runtime = None
+            self._runtime_started = False
+            return
+
+        try:
+            self._runtime.stop()
+        except Exception:
+            logger.exception("Failed to stop streaming runtime cleanly.")
+
+        try:
+            stats = self._runtime.stats()
+        except Exception:
+            logger.exception("Failed to collect streaming runtime stats.")
+            stats = None
+
+        if stats is not None:
+            stats = dict(stats)
+            stats.setdefault("timing_ms", {})
+            stats["timing_ms"]["env_step"] = _summarize_ms(self._env_step_samples_ms)
+            stats.setdefault("timing_samples_ms", {})
+            stats["timing_samples_ms"]["env_step"] = [float(v) for v in self._env_step_samples_ms]
+            completed_steps = int(stats.get("completed_steps", 0))
+            stats.setdefault("submitted_jobs", completed_steps)
+            stats.setdefault("completed_jobs", completed_steps)
+            self._episode_stats.append(stats)
+
+        self._runtime = None
+        self._runtime_started = False
+        self._env_step_samples_ms = []
+
+    def should_request_observation(self) -> bool:
+        return True
+
+    def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if observation is None:
+            raise ValueError("RobotWin streaming runtime requires an observation every take_action step.")
+
+        env_step = int(self.step_count)
+        if self._runtime is None:
+            instruction = task_env.get_instruction()
+            self._current_instruction = instruction
+            self._build_runtime(instruction)
+
+        if self._runtime is None:
+            raise RuntimeError("Streaming runtime failed to initialize.")
+
+        image_tensor, proprio = self._encode_observation(observation)
+
+        infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
+        self._runtime.submit_observation(
+            input_image=image_tensor,
+            proprio=proprio,
+            env_step=env_step,
+            obs_index=env_step,
+            obs_timestamp_ms=float(env_step),
+            trigger_job=False,
+        )
+        action = self._wait_for_action(env_step)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        action_tensor = pred["action"]  # [T, D]
-        action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
-        return action_chunk
-
-    def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
-        action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
-        n_exec = min(self.replan_steps, action_chunk.shape[0])
-        for i in range(n_exec):
-            self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
-
-    def should_request_observation(self) -> bool:
-        return not self.pending_actions
-
-    def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
-        if not self.pending_actions:
-            if observation is None:
-                raise ValueError(
-                    "Observation is required when action queue is empty "
-                    "(replan step for fastwam)."
-                )
-            instruction = task_env.get_instruction()
-            self._fill_action_queue(observation=observation, instruction=instruction)
-
-        if not self.pending_actions:
-            logger.warning("No action generated; skip current eval step.")
-            return
-
-        action = self.pending_actions.popleft()
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
+        step_t0 = time.perf_counter()
         task_env.take_action(action, action_type="qpos")
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
+        self._env_step_samples_ms.append(float((time.perf_counter() - step_t0) * 1000.0))
         self.step_count += 1
 
     def reset_timing_rollout(self) -> None:
@@ -304,10 +410,16 @@ class WorldActionRobotWinPolicy:
             "sim_s": float(self._timing_rollout["sim_s"]),
         }
 
+    def collect_episode_stats(self) -> list[dict[str, Any]]:
+        self._teardown_runtime()
+        return list(self._episode_stats)
+
     def reset(self) -> None:
-        self.pending_actions.clear()
+        self._teardown_runtime()
         self.episode_count += 1
         self.step_count = 0
+        self._current_instruction = None
+        self._env_step_samples_ms = []
         self.reset_timing_rollout()
 
 
@@ -329,10 +441,18 @@ def get_model(usr_args: Dict[str, Any]):
     if _is_none_like(checkpoint_path):
         raise ValueError("`ckpt_setting` is required and must be a valid checkpoint path.")
 
-    device = str(usr_args.get("device") or cfg.EVALUATION.get("device") or "cuda")
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA is unavailable; fallback device to cpu.")
-        device = "cpu"
+    video_device = str(
+        usr_args.get("async_video_device")
+        or usr_args.get("video_device")
+        or usr_args.get("device")
+        or cfg.EVALUATION.get("device")
+        or "cuda"
+    )
+    action_device = str(usr_args.get("async_action_device") or usr_args.get("action_device") or video_device)
+    if video_device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA is unavailable; fallback both runtime devices to cpu.")
+        video_device = "cpu"
+        action_device = "cpu"
 
     mixed_precision = str(usr_args.get("mixed_precision") or cfg.get("mixed_precision", "bf16"))
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
@@ -368,13 +488,24 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    profile_runtime = _parse_bool(usr_args.get("profile_runtime", False))
+    video_layers_per_chunk = _parse_optional_int(usr_args.get("async_video_layers_per_chunk"))
+    if video_layers_per_chunk is None:
+        video_layers_per_chunk = int(getattr(cfg.model.video_dit_config, "num_layers", 30))
 
-    policy = WorldActionRobotWinPolicy(
+    OmegaConf.set_struct(cfg, False)
+    cfg.model.load_text_encoder = True
+    if not _is_none_like(usr_args.get("redirect_common_files")):
+        cfg.model.redirect_common_files = _parse_bool(usr_args.get("redirect_common_files"))
+    OmegaConf.set_struct(cfg, True)
+
+    policy = StreamingRuntimeRobotWinPolicy(
         model_cfg=cfg.model,
         processor_cfg=cfg.data.train.processor,
         checkpoint_path=str(checkpoint_path),
         dataset_stats_path=dataset_stats_path,
-        device=device,
+        video_device=video_device,
+        action_device=action_device,
         model_dtype=model_dtype,
         action_horizon=action_horizon,
         replan_steps=replan_steps,
@@ -386,8 +517,11 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         timing_enabled=timing_enabled,
-        num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        profile_runtime=profile_runtime,
+        video_layers_per_chunk=video_layers_per_chunk,
     )
+    global _LAST_POLICY
+    _LAST_POLICY = policy
     return policy
 
 

@@ -57,6 +57,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        video_backend: Optional[str] = None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -66,6 +67,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            video_backend=video_backend,
         )
     
         self.num_frames = num_frames
@@ -260,7 +262,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"Missing text embedding cache: {cache_path}. "
                 "Run scripts/precompute_text_embeds.py first."
             )
-        payload = torch.load(cache_path, map_location="cpu")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         context = payload["context"]
         context_mask = payload["mask"].bool()
         if context.ndim != 2:

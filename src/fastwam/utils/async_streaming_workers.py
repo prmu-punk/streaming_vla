@@ -57,13 +57,29 @@ def _video_worker_loop(
             "source_delta": int(layer_cache.get("source_delta", 0)),
         }
 
+    def _put_latest_layer_update(payload: dict[str, Any]) -> None:
+        while True:
+            try:
+                layer_queue.put_nowait(payload)
+                return
+            except queue.Full:
+                drained_any = False
+                while True:
+                    try:
+                        layer_queue.get_nowait()
+                        drained_any = True
+                    except queue.Empty:
+                        break
+                if not drained_any:
+                    time.sleep(0.001)
+
     def _publish_full_cache(version) -> None:
         exported_layers = []
         for layer_idx, layer_cache in enumerate(version.cache_layers):
             if layer_cache is None:
                 raise RuntimeError(f"Version {version.version} layer {layer_idx} is None.")
             exported_layers.append(_export_layer_cache(layer_cache))
-        layer_queue.put(
+        _put_latest_layer_update(
             {
                 "type": "cache_update",
                 "version": int(version.version),
@@ -323,6 +339,10 @@ def _run_action_worker_loop(
                 pending_reset_phase = None
                 handled = True
             if pending_flush_ids:
+                # By the time the runtime asks the action worker to flush, the video
+                # worker has already acknowledged its own flush. Drain any queued
+                # cache updates now so no stale CUDA IPC payloads remain unread.
+                _drain_layer_updates(block=False)
                 for flush_id in pending_flush_ids:
                     control_queue.put(
                         {"type": "flush_ack", "worker": "action", "flush_id": int(flush_id)}
