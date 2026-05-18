@@ -8,7 +8,7 @@ defaults:
 batch_size: 96
 num_workers: 8
 dataloader_disable_shared_memory: false
-dataloader_pin_memory: false
+dataloader_pin_memory: true
 dataloader_persistent_workers: true
 dataloader_prefetch_factor: 2
 
@@ -20,16 +20,23 @@ model:
     streaming_train:
       enabled: true
       cache_mode: full_cur
-      token_noise_pattern: front_low_high
+      token_noise_pattern: random_all
 
 lr_scheduler_type: "cosine"
-learning_rate: 1e-4
+learning_rate: 5e-5
 num_epochs: 5
 max_steps: null
 log_every: 10
-save_every: 1000
-eval_every: 1000
+save_every: 250
+eval_every: 250
 
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 1
 weight_decay: 1e-2
-resume: null
+resume: /inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/FastWAM/checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt
+
+wandb:
+  enabled: true
+  project: fast-wam
+  name: robotwin_streaming_action_ft_2cam224_5e-5
+  group: robotwin_streaming
+  mode: offline

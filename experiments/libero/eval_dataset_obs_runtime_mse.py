@@ -72,7 +72,12 @@ class ChunkOffsetRuntime(ProfiledRuntime):
         *,
         released_env_steps: list[int],
         source_env_step: int,
+        release_obs_index: int = -1,
+        release_obs_env_step: int = -1,
+        job_id: int = -1,
+        phase_id: int = -1,
     ) -> int:
+        del release_obs_index, release_obs_env_step, job_id, phase_id
         dropped = 0
         current_env_step = int(self._current_env_step)
         if released_actions.ndim == 1:
@@ -119,6 +124,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rand-device", default=None)
     parser.add_argument("--control-dt-ms", type=float, default=None)
     parser.add_argument("--obs-stride-env-steps", type=int, default=None)
+    parser.add_argument(
+        "--skip-initial-steps",
+        type=int,
+        default=0,
+        help="Exclude the first N executed env steps from the secondary summary block.",
+    )
     parser.add_argument(
         "--no-realtime-pacing",
         action="store_true",
@@ -205,6 +216,39 @@ def _slice_rows(rows: list[dict[str, Any]], start: int, end: int | None = None) 
 
 def _rows_stat(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
     return _array_stats([float(row[key]) for row in rows])
+
+
+def _build_summary(
+    rows: list[dict[str, Any]],
+    *,
+    action_horizon: int,
+) -> dict[str, Any]:
+    mses = [float(row["mse"]) for row in rows]
+    maes = [float(row["mae"]) for row in rows]
+    head = rows[: min(8, len(rows))]
+    next8 = _slice_rows(rows, 8, 16)
+    tail = _slice_rows(rows, 16, None)
+    pred_arr = np.asarray([row["pred_action"] for row in rows], dtype=np.float32) if len(rows) > 0 else np.empty((0, 0))
+    target_arr = np.asarray([row["target_action"] for row in rows], dtype=np.float32) if len(rows) > 0 else np.empty((0, 0))
+    return {
+        "env_action_mse": _array_stats(mses),
+        "env_action_mae": _array_stats(maes),
+        "head8_env_action_mse": _rows_stat(head, "mse"),
+        "next8_env_action_mse": _rows_stat(next8, "mse"),
+        "tail_env_action_mse": _rows_stat(tail, "mse"),
+        "chunk_offset_env_action_mse": _chunk_offset_stats(
+            rows,
+            action_horizon=action_horizon,
+            key="mse",
+        ),
+        "per_dim_mse": (
+            []
+            if len(rows) == 0
+            else np.mean(np.square(pred_arr - target_arr), axis=0).astype(float).tolist()
+        ),
+        "initial_miss_steps": int(sum(1 for row in rows if bool(row["had_initial_miss"]))),
+        "submitted_obs_steps": int(sum(1 for row in rows if bool(row["submitted_obs"]))),
+    }
 
 
 def _chunk_offset_stats(
@@ -405,13 +449,8 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         if runtime_started:
             runtime.stop()
 
-    mses = [float(row["mse"]) for row in rows]
-    maes = [float(row["mae"]) for row in rows]
-    head = rows[: min(8, len(rows))]
-    next8 = _slice_rows(rows, 8, 16)
-    tail = _slice_rows(rows, 16, None)
-    pred_arr = np.asarray([row["pred_action"] for row in rows], dtype=np.float32)
-    target_arr = np.asarray([row["target_action"] for row in rows], dtype=np.float32)
+    skip_initial_steps = max(0, int(args.skip_initial_steps))
+    rows_after_skip = rows[skip_initial_steps:]
     result = {
         "ckpt": str(resolve_weight_checkpoint(str(args.ckpt))),
         "task_config": str(args.task_config),
@@ -428,24 +467,10 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         "obs_stride_env_steps": int(obs_stride_env_steps),
         "control_dt_ms": float(control_dt_ms),
         "realtime_pacing": not bool(args.no_realtime_pacing),
-        "summary": {
-            "env_action_mse": _array_stats(mses),
-            "env_action_mae": _array_stats(maes),
-            "head8_env_action_mse": _rows_stat(head, "mse"),
-            "next8_env_action_mse": _rows_stat(next8, "mse"),
-            "tail_env_action_mse": _rows_stat(tail, "mse"),
-            "chunk_offset_env_action_mse": _chunk_offset_stats(
-                rows,
-                action_horizon=action_horizon,
-                key="mse",
-            ),
-            "per_dim_mse": (
-                []
-                if len(rows) == 0
-                else np.mean(np.square(pred_arr - target_arr), axis=0).astype(float).tolist()
-            ),
-            "initial_miss_steps": int(sum(1 for row in rows if bool(row["had_initial_miss"]))),
-            "submitted_obs_steps": int(sum(1 for row in rows if bool(row["submitted_obs"]))),
+        "summary": _build_summary(rows, action_horizon=action_horizon),
+        "summary_after_skip": {
+            "skip_initial_steps": int(skip_initial_steps),
+            **_build_summary(rows_after_skip, action_horizon=action_horizon),
         },
         "runtime_stats": runtime_stats,
         "per_step": rows,

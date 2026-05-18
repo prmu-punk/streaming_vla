@@ -1204,19 +1204,31 @@ class WanVideoVAE(nn.Module):
 
 
     def single_encode(self, video, device):
-        video = video.to(device)
+        if video.device != torch.device(device):
+            video = video.to(device)
         x = self.model.encode(video, self.scale)
         return x
 
 
     def single_decode(self, hidden_state, device):
-        hidden_state = hidden_state.to(device)
+        if hidden_state.device != torch.device(device):
+            hidden_state = hidden_state.to(device)
         video = self.model.decode(hidden_state, self.scale)
         return video.clamp_(-1, 1)
 
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        # videos = [video.to("cpu") for video in videos]
+        if isinstance(videos, torch.Tensor):
+            if videos.ndim == 4:
+                videos = videos.unsqueeze(0)
+            if videos.ndim != 5:
+                raise ValueError(
+                    f"`videos` must have shape [B,C,T,H,W] or [C,T,H,W], got {tuple(videos.shape)}"
+                )
+            if tiled:
+                raise NotImplementedError("Tiled encoding is not allowed yet.")
+            return self.single_encode(videos, device)
+
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
@@ -1234,6 +1246,18 @@ class WanVideoVAE(nn.Module):
 
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+        if isinstance(hidden_states, torch.Tensor):
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.unsqueeze(0)
+            if hidden_states.ndim != 5:
+                raise ValueError(
+                    f"`hidden_states` must have shape [B,C,T,H,W] or [C,T,H,W], got {tuple(hidden_states.shape)}"
+                )
+            if tiled:
+                hidden_states = hidden_states.to("cpu")
+            else:
+                return self.single_decode(hidden_states, device)
+
         hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
         videos = []
         for hidden_state in hidden_states:

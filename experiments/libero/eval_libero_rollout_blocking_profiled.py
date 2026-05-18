@@ -11,7 +11,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from experiments.libero.eval_libero_policy_utils import _obs_to_model_input, _postprocess_libero_action_chunk
-from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_dummy_action, get_libero_env, save_rollout_video
+from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env, save_rollout_video
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.utils.async_streaming_runtime import StreamingRuntime
@@ -99,7 +99,6 @@ def run_single_episode_async(
         raise ValueError("Async LIBERO rollout requires a FastWAMStreaming-style model.")
 
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
-    num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", 3))
     control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
     no_realtime_pacing = bool(cfg.EVALUATION.get("no_realtime_pacing", False))
@@ -138,8 +137,6 @@ def run_single_episode_async(
     replay_images = []
     runtime_started = False
     done = False
-    terminated_during_wait = False
-
     env.reset()
     obs = env.set_init_state(initial_state)
     try:
@@ -159,96 +156,70 @@ def run_single_episode_async(
 
         image, proprio, imgs = _encode_obs(obs)
 
+        runtime.reset_for_formal_phase(env_step=0)
         obs_counter = 0
-        for wait_step in range(num_steps_wait):
-            if wait_step % obs_stride_env_steps == 0:
+        runtime.submit_observation(
+            input_image=image,
+            proprio=proprio,
+            env_step=0,
+            obs_index=obs_counter,
+            obs_timestamp_ms=float(obs_counter) * control_dt_ms * float(obs_stride_env_steps),
+            trigger_job=False,
+        )
+        obs_counter += 1
+
+        t = 0
+        executed_env_steps = 0
+        pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (blocking-hf-video)")
+        while executed_env_steps < max_steps:
+            action = runtime.get_action(t)
+            if action is None:
+                # Drain any in-flight job first; if still no action for this env step,
+                # trigger one fresh job from the latest observation and wait for completion.
+                runtime.wait_until_idle()
+                action = runtime.get_action(t)
+            if action is None:
+                formal_obs_index = obs_counter
                 runtime.submit_observation(
                     input_image=image,
                     proprio=proprio,
-                    env_step=wait_step,
-                    obs_index=obs_counter,
-                    obs_timestamp_ms=float(obs_counter) * control_dt_ms * float(obs_stride_env_steps),
-                    trigger_job=False,
+                    env_step=t,
+                    obs_index=formal_obs_index,
+                    obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
+                    trigger_job=True,
                 )
                 obs_counter += 1
+                runtime.wait_until_idle()
+                action = runtime.get_action(t)
+                while action is None:
+                    runtime.wait_until_idle()
+                    action = runtime.get_action(t)
+
+            replay_images.append(imgs.copy())
             obs, _, done, _ = _step_env_with_min_dt(
                 env,
-                get_libero_dummy_action(),
+                action.tolist(),
                 min_step_dt_s=min_step_dt_s,
             )
+            executed_env_steps += 1
+            pbar.update(1)
             if done:
-                runtime.wait_until_idle()
-                terminated_during_wait = True
                 break
-            image, proprio, imgs = _encode_obs(obs)
-        if not terminated_during_wait:
-            runtime.wait_until_idle()
-            runtime.reset_for_formal_phase(env_step=num_steps_wait)
 
-            if num_steps_wait % obs_stride_env_steps == 0:
+            t += 1
+            image, proprio, imgs = _encode_obs(obs)
+            if t % obs_stride_env_steps == 0:
+                formal_obs_index = obs_counter
                 runtime.submit_observation(
                     input_image=image,
                     proprio=proprio,
-                    env_step=num_steps_wait,
-                    obs_index=obs_counter,
-                    obs_timestamp_ms=float(obs_counter) * control_dt_ms * float(obs_stride_env_steps),
+                    env_step=t,
+                    obs_index=formal_obs_index,
+                    obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
                     trigger_job=False,
                 )
                 obs_counter += 1
-                runtime.wait_until_idle()
-
-            t = num_steps_wait
-            executed_env_steps = 0
-            pbar = tqdm(total=max_steps, desc=f"Episode {episode_idx + 1} (blocking-hf-video)")
-            while executed_env_steps < max_steps:
-                action = runtime.get_action(t)
-                if action is None:
-                    # Drain any in-flight job first; if still no action for this env step,
-                    # trigger one fresh job from the latest observation and wait for completion.
-                    runtime.wait_until_idle()
-                    action = runtime.get_action(t)
-                if action is None:
-                    formal_obs_index = obs_counter
-                    runtime.submit_observation(
-                        input_image=image,
-                        proprio=proprio,
-                        env_step=t,
-                        obs_index=formal_obs_index,
-                        obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                        trigger_job=True,
-                    )
-                    obs_counter += 1
-                    runtime.wait_until_idle()
-                    action = runtime.get_action(t)
-                    while action is None:
-                        runtime.wait_until_idle()
-                        action = runtime.get_action(t)
-
-                replay_images.append(imgs.copy())
-                obs, _, done, _ = _step_env_with_min_dt(
-                    env,
-                    action.tolist(),
-                    min_step_dt_s=min_step_dt_s,
-                )
-                executed_env_steps += 1
-                pbar.update(1)
-                if done:
-                    break
-
-                t += 1
-                image, proprio, imgs = _encode_obs(obs)
-                if (t - num_steps_wait) % obs_stride_env_steps == 0:
-                    formal_obs_index = obs_counter
-                    runtime.submit_observation(
-                        input_image=image,
-                        proprio=proprio,
-                        env_step=t,
-                        obs_index=formal_obs_index,
-                        obs_timestamp_ms=float(formal_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                        trigger_job=False,
-                    )
-                    obs_counter += 1
-            pbar.close()
+        pbar.close()
     finally:
         if runtime_started:
             runtime.stop()

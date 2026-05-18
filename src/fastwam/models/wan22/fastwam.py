@@ -1203,7 +1203,8 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [B,3,H,W], got {tuple(input_image.shape)}"
             )
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        if input_image.device != torch.device(self.device) or input_image.dtype != self.torch_dtype:
+            input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_batch(input_image=input_image, tiled=tiled)
         return self.build_streaming_video_cache_from_latents(
             first_frame_latents=first_frame_latents,

@@ -351,6 +351,23 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             return int(snapshot.env_step)
         return max(int(v) for v in snapshot.layer_env_steps)
 
+    def _build_startup_token_delays(
+        self,
+        *,
+        action_horizon: int,
+        batch_size: int,
+        uncertainty_scale: float,
+    ) -> torch.Tensor:
+        if uncertainty_scale < 0.0:
+            raise ValueError(f"`startup_uncertainty_scale` must be non-negative, got {uncertainty_scale}.")
+        token_idx = torch.arange(
+            int(action_horizon),
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+        token_delays = torch.floor(token_idx * float(uncertainty_scale)).to(dtype=torch.int64)
+        return token_delays.unsqueeze(0).expand(int(batch_size), -1).clone()
+
     def start_action_job(
         self,
         *,
@@ -365,6 +382,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         persistent: bool = False,
+        startup_uncertainty_scale: Optional[float] = None,
     ) -> StreamingActionJob:
         resolved_context, resolved_context_mask = self._resolve_streaming_condition_inputs(
             prompt=prompt,
@@ -392,6 +410,15 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             device=self.device,
             dtype=torch.int64,
         ).unsqueeze(0).expand(int(resolved_context.shape[0]), -1).clone()
+        startup_token_delays = None
+        startup_schedule_enabled = False
+        if bool(persistent) and startup_uncertainty_scale is not None and float(startup_uncertainty_scale) > 0.0:
+            startup_token_delays = self._build_startup_token_delays(
+                action_horizon=int(action_horizon),
+                batch_size=int(resolved_context.shape[0]),
+                uncertainty_scale=float(startup_uncertainty_scale),
+            )
+            startup_schedule_enabled = True
         return StreamingActionJob(
             timesteps=timesteps,
             deltas=deltas,
@@ -412,6 +439,9 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
                 dtype=torch.bool,
             ),
             persistent=bool(persistent),
+            startup_token_delays=startup_token_delays,
+            startup_schedule_enabled=bool(startup_schedule_enabled),
+            startup_schedule_step_idx=0,
             generator=generator,
         )
 
@@ -436,6 +466,12 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
                 self._shift_persistent_action_window(job, shift_steps=shift_steps)
 
         active_mask = job.token_denoise_counts < max_denoise_steps
+        advance_mask = active_mask
+        if job.startup_schedule_enabled:
+            if job.startup_token_delays is None:
+                raise ValueError("`job.startup_token_delays` must be initialized when startup schedule is enabled.")
+            schedule_ready = job.startup_token_delays <= int(job.startup_schedule_step_idx)
+            advance_mask = active_mask & schedule_ready
         timestep_indices = job.token_denoise_counts.clamp(max=max_denoise_steps - 1)
         step_t = job.timesteps[timestep_indices].to(
             device=self.device,
@@ -446,7 +482,7 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             dtype=job.latents_action.dtype,
         )
         step_delta = torch.where(
-            active_mask,
+            advance_mask,
             step_delta,
             torch.zeros_like(step_delta),
         )
@@ -473,13 +509,15 @@ class FastWAMStreaming(StreamingBackbone, FastWAM):
             attention_mask=attention_mask,
             video_seq_len=snapshot.video_seq_len,
         )
-        pred_action = pred_action.masked_fill((~active_mask).unsqueeze(-1), 0.0)
+        pred_action = pred_action.masked_fill((~advance_mask).unsqueeze(-1), 0.0)
         job.latents_action = self.infer_action_scheduler.step(pred_action, step_delta, job.latents_action)
         prev_counts = job.token_denoise_counts
-        next_counts = torch.where(active_mask, prev_counts + 1, prev_counts)
+        next_counts = torch.where(advance_mask, prev_counts + 1, prev_counts)
         next_counts = next_counts.clamp(max=max_denoise_steps)
         job.just_released_mask = (prev_counts < max_denoise_steps) & (next_counts >= max_denoise_steps)
         job.token_denoise_counts = next_counts
+        if job.startup_schedule_enabled:
+            job.startup_schedule_step_idx += 1
         if not job.persistent:
             job.snapshot_history.append(snapshot)
         job.current_step_idx += 1

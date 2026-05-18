@@ -54,6 +54,9 @@ class StreamingActionJob:
     just_released_mask: Optional[torch.Tensor] = None
     persistent: bool = False
     current_step_idx: int = 0
+    startup_token_delays: Optional[torch.Tensor] = None
+    startup_schedule_enabled: bool = False
+    startup_schedule_step_idx: int = 0
     snapshot_history: list[CacheSnapshot] = field(default_factory=list)
     generator: Optional[torch.Generator] = None
 

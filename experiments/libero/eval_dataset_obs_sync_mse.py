@@ -68,6 +68,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-precision", default="bf16")
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--action-horizon", type=int, default=None)
+    parser.add_argument(
+        "--skip-initial-steps",
+        type=int,
+        default=0,
+        help="Exclude the first N env steps from the secondary summary block.",
+    )
     parser.add_argument("--rand-device", default=None)
     parser.add_argument("--tiled", action="store_true")
     return parser.parse_args()
@@ -129,6 +135,32 @@ def _slice_rows(rows: list[dict[str, Any]], start: int, end: int | None = None) 
     if end is None:
         return rows[start:]
     return rows[start : max(start, int(end))]
+
+
+def _build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    chunk_mses = [float(row["chunk_mse"]) for row in rows]
+    chunk_env_mses = [
+        float(row["chunk_env_action_mse"])
+        for row in rows
+        if row.get("chunk_env_action_mse") is not None
+    ]
+    head = rows[: min(8, len(rows))]
+    next8 = _slice_rows(rows, 8, 16)
+    tail = _slice_rows(rows, 16, None)
+    return {
+        "chunk_mse": _array_stats(chunk_mses),
+        "env_action_mse": _array_stats(chunk_env_mses),
+        "head8_env_action_mse": _array_stats(
+            [float(row["chunk_env_action_mse"]) for row in head if row.get("chunk_env_action_mse") is not None]
+        ),
+        "next8_env_action_mse": _array_stats(
+            [float(row["chunk_env_action_mse"]) for row in next8 if row.get("chunk_env_action_mse") is not None]
+        ),
+        "tail_env_action_mse": _array_stats(
+            [float(row["chunk_env_action_mse"]) for row in tail if row.get("chunk_env_action_mse") is not None]
+        ),
+        "chunk_offset_env_action_mse": _mean_per_position(rows, "chunk_env_action_mse_per_position"),
+    }
 
 
 def _episode_index_from_dataset_index(dataset, dataset_index: int) -> int:
@@ -399,15 +431,8 @@ def run_dataset_obs_sync_mse(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    chunk_mses = [float(row["chunk_mse"]) for row in rows]
-    chunk_env_mses = [
-        float(row["chunk_env_action_mse"])
-        for row in rows
-        if row.get("chunk_env_action_mse") is not None
-    ]
-    head = rows[: min(8, len(rows))]
-    next8 = _slice_rows(rows, 8, 16)
-    tail = _slice_rows(rows, 16, None)
+    skip_initial_steps = max(0, int(args.skip_initial_steps))
+    rows_after_skip = rows[skip_initial_steps:]
 
     result = {
         "ckpt": str(resolve_weight_checkpoint(str(args.ckpt))),
@@ -423,19 +448,10 @@ def run_dataset_obs_sync_mse(args: argparse.Namespace) -> dict[str, Any]:
         "action_horizon": int(action_horizon),
         "num_inference_steps": int(num_inference_steps),
         "tiled": bool(tiled),
-        "summary": {
-            "chunk_mse": _array_stats(chunk_mses),
-            "env_action_mse": _array_stats(chunk_env_mses),
-            "head8_env_action_mse": _array_stats(
-                [float(row["chunk_env_action_mse"]) for row in head if row.get("chunk_env_action_mse") is not None]
-            ),
-            "next8_env_action_mse": _array_stats(
-                [float(row["chunk_env_action_mse"]) for row in next8 if row.get("chunk_env_action_mse") is not None]
-            ),
-            "tail_env_action_mse": _array_stats(
-                [float(row["chunk_env_action_mse"]) for row in tail if row.get("chunk_env_action_mse") is not None]
-            ),
-            "chunk_offset_env_action_mse": _mean_per_position(rows, "chunk_env_action_mse_per_position"),
+        "summary": _build_summary(rows),
+        "summary_after_skip": {
+            "skip_initial_steps": int(skip_initial_steps),
+            **_build_summary(rows_after_skip),
         },
         "per_step": rows,
     }

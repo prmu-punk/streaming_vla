@@ -113,6 +113,7 @@ class StreamingRuntime:
         sigma_shift: Optional[float],
         rand_device: str,
         tiled: bool,
+        first_chunk_uncertainty_scale: Optional[float] = 1.0,
         seed: Optional[int] = None,
         profile: bool = False,
         collect_layer_source_stats: bool = False,
@@ -132,6 +133,9 @@ class StreamingRuntime:
         self.sigma_shift = sigma_shift
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
+        self.first_chunk_uncertainty_scale = (
+            None if first_chunk_uncertainty_scale is None else float(first_chunk_uncertainty_scale)
+        )
         self.seed = seed
         self.profile = bool(profile)
         self.collect_layer_source_stats = bool(collect_layer_source_stats)
@@ -541,6 +545,7 @@ class StreamingRuntime:
                 seed=self.seed,
                 rand_device=self.rand_device,
                 persistent=True,
+                startup_uncertainty_scale=self.first_chunk_uncertainty_scale,
             )
 
         job = self._active_job
@@ -726,17 +731,6 @@ class StreamingRuntime:
                     return
                 if not progressed and self._inflight_action_step is None:
                     return
-
-    def bootstrap_sync(self, *, input_image: torch.Tensor, obs_index: int, obs_timestamp_ms: float) -> None:
-        self.submit_observation(
-            input_image=input_image,
-            proprio=None,
-            env_step=-1,
-            obs_index=int(obs_index),
-            obs_timestamp_ms=float(obs_timestamp_ms),
-            trigger_job=False,
-        )
-        self.wait_until_idle()
 
     def reset_for_formal_phase(self, *, env_step: int = 0, preserve_streaming_state: bool = False) -> None:
         with self._completion_lock:
