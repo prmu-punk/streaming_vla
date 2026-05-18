@@ -33,14 +33,11 @@ train:
   pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
-  video_backend: "pyav"
   return_single_obs: true
   obs_stride: ${STREAMING.obs_stride}
   history_obs: 0
   future_obs: 0
-  trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
-  keep_trigger_phase: true
-  action_horizon: 32
+  action_horizon: 10
   episode_cache_size: 16
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor

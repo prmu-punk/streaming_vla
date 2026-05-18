@@ -38,32 +38,6 @@ class Base_Task(gym.Env):
     def __init__(self):
         pass
 
-    def _get_eval_video_frame(self):
-        def _camera_rgb(camera):
-            camera.take_picture()
-            camera_rgba = camera.get_picture("Color")
-            return (camera_rgba * 255).clip(0, 255).astype("uint8")[:, :, :3]
-
-        cameras = getattr(self, "cameras", None)
-        if cameras is not None:
-            world_camera = getattr(cameras, "world_camera1", None)
-            if world_camera is not None:
-                return _camera_rgb(world_camera)
-            observer_camera = getattr(cameras, "observer_camera", None)
-            if observer_camera is not None:
-                return _camera_rgb(observer_camera)
-
-        obs = self.now_obs["observation"]
-        if "head_camera" in obs:
-            return obs["head_camera"]["rgb"]
-        if "front_camera" in obs:
-            return obs["front_camera"]["rgb"]
-        if "left_camera" in obs:
-            return obs["left_camera"]["rgb"]
-        if "right_camera" in obs:
-            return obs["right_camera"]["rgb"]
-        raise KeyError("No RGB camera found for eval video frame.")
-
     # =========================================================== Init Task Env ===========================================================
     def _init_task_env_(self, table_xy_bias=[0, 0], table_height_bias=0, **kwags):
         """
@@ -124,6 +98,7 @@ class Base_Task(gym.Env):
         self.now_obs = {}
         self.take_action_cnt = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
+        self._last_take_action_profile = None
 
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
@@ -600,6 +575,27 @@ class Base_Task(gym.Env):
 
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
+
+    def _enqueue_eval_video_observation(self, observation=None):
+        if self.eval_video_ffmpeg is None:
+            return
+        obs = observation
+        if obs is None:
+            obs = self.now_obs.get("observation", {})
+        else:
+            obs = observation.get("observation", observation)
+
+        frame = None
+        if "head_camera" in obs:
+            frame = obs["head_camera"]["rgb"]
+        elif "front_camera" in obs:
+            frame = obs["front_camera"]["rgb"]
+        elif "left_camera" in obs:
+            frame = obs["left_camera"]["rgb"]
+        elif "right_camera" in obs:
+            frame = obs["right_camera"]["rgb"]
+        if frame is not None:
+            self.eval_video_ffmpeg.stdin.write(np.asarray(frame, dtype=np.uint8).tobytes())
 
     def close_env(self, clear_cache=False):
         if clear_cache:
@@ -1506,11 +1502,6 @@ class Base_Task(gym.Env):
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
-        eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            eval_frame = self._get_eval_video_frame()
-            self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
-
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
@@ -1651,6 +1642,13 @@ class Base_Task(gym.Env):
             right_gripper = right_gripper + region_right_gripper.tolist()
         right_gripper = np.array(right_gripper)
 
+        self._last_take_action_profile = {
+            "left_n_step": int(left_n_step),
+            "right_n_step": int(right_n_step),
+            "topp_left_flag": bool(topp_left_flag),
+            "topp_right_flag": bool(topp_right_flag),
+        }
+
         now_left_id, now_right_id = 0, 0
 
         # ========== Control Loop ==========
@@ -1683,10 +1681,6 @@ class Base_Task(gym.Env):
                 
             if self.check_success():
                 self.eval_success = True
-                self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    eval_frame = self._get_eval_video_frame()
-                    self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
                 return
 
         self._update_render()

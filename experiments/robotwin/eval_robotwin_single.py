@@ -153,6 +153,7 @@ def _format_override_value(value: Any) -> str:
     return repr(str(value))
 
 
+
 def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: bool = True) -> None:
     if skip_none and value is None:
         return
@@ -224,8 +225,6 @@ def main(cfg: DictConfig):
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
-    _append_override(overrides, "async_video_device", cfg.EVALUATION.get("async_video_device", None))
-    _append_override(overrides, "async_action_device", cfg.EVALUATION.get("async_action_device", None))
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
     _append_override(overrides, "action_horizon", cfg.EVALUATION.action_horizon)
     _append_override(overrides, "replan_steps", cfg.EVALUATION.replan_steps)
@@ -237,11 +236,8 @@ def main(cfg: DictConfig):
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(overrides, "profile_runtime", cfg.EVALUATION.get("profile_runtime", None))
-    _append_override(
-        overrides,
-        "async_video_layers_per_chunk",
-        cfg.EVALUATION.get("async_video_layers_per_chunk", None),
-    )
+    _append_override(overrides, "save_full_runtime_trace", cfg.EVALUATION.get("save_full_runtime_trace", None))
+    _append_override(overrides, "async_obs_stride_env_steps", cfg.EVALUATION.async_obs_stride_env_steps)
     _append_override(
         overrides,
         "skip_get_obs_within_replan",
@@ -259,7 +255,6 @@ def main(cfg: DictConfig):
     ]
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
 
     with open(log_file, "w", encoding="utf-8") as log_f:

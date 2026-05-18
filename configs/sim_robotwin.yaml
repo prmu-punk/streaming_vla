@@ -34,19 +34,12 @@ EVALUATION:
   timing_enabled: false
   skip_get_obs_within_replan: true
   async_obs_stride_env_steps: ${STREAMING.obs_stride}
-  async_action_trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
-  async_video_layers_per_chunk: ${STREAMING.video_layers_per_chunk}
-  async_force_first_job: ${STREAMING.force_first_job}
-  async_control_dt_ms: ${STREAMING.control_dt_ms}
-  async_warmup_action_jobs: ${STREAMING.warmup_action_jobs}
-  async_action_wait_timeout_s: 10.0
 
   # Runtime inputs
   dataset_stats_path: null
   device: cuda
-  async_video_device: null
-  async_action_device: null
   profile_runtime: null
+  save_full_runtime_trace: false
 
 MULTIRUN:
   enabled: false

@@ -1,34 +1,3 @@
-"""
-RoboTwin streaming-pipeline profiling entrypoint — REAL machine (full SAPIEN).
-
-This delegates the entire episode loop to RoboTwin's upstream `script/eval_policy.py:main()` 
-so we inherit every piece of real-env behaviour (asset loading, task_config yaml, instruction sampler,
-seeds, eval_video ffmpeg pipe, cache clearing). After `main()` returns we pull
-the built `StreamingWorldActionRobotWinPolicy` via `get_last_policy()` and dump
-a JSON in the same schema as libero profiling.
-
-Usage (expects to be run from the Streaming_VLA repo root):
-
-    bash experiments/robotwin/run_profile.sh click_alarmclock demo_randomized
-
-or equivalently:
-
-    PYTHONPATH=src:. .venv/bin/python \
-        experiments/robotwin/eval_robotwin_single_profiled.py \
-        --task-name click_alarmclock \
-        --task-config demo_randomized \
-        --ckpt-setting checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
-        --dataset-stats checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json \
-        --eval-num-episodes 1 \
-        --async-video-device cuda:0 \
-        --async-action-device cuda:1 \
-        --profile-output-dir ./evaluate_results/robotwin_profile/real
-
-Output:
-    <profile-output-dir>/<task_name>/gpu0_task<task_name>_results.json
-        (schema matches libero profiling:
-         async_runtime_episodes / async_runtime_summary / layer_source_stats)
-"""
 from __future__ import annotations
 
 import argparse
@@ -75,41 +44,24 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def _summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
-    if not episodes:
-        return {"num_episodes": 0}
-    summary: dict[str, Any] = {"num_episodes": len(episodes)}
-    scalar_keys = [
-        "submitted_obs",
-        "submitted_jobs",
-        "completed_jobs",
-        "actions_served",
-        "actions_missed",
-        "dropped_prefix_actions",
-    ]
-    for key in scalar_keys:
-        values = [float(ep.get(key, 0)) for ep in episodes]
-        summary[f"{key}_total"] = float(np.sum(values))
-        summary[f"{key}_mean"] = float(np.mean(values))
-    timing_keys = ["video_refresh", "action_job", "action_job_wall", "action_step", "snapshot_copy", "env_step"]
-    timing_summary: dict[str, Any] = {}
-    for key in timing_keys:
-        weighted = 0.0
-        total = 0
-        for ep in episodes:
-            entry = ep.get("timing_ms", {}).get(key, {}) or {}
-            c = int(entry.get("count", 0))
-            a = entry.get("avg_ms")
-            if a is None or c <= 0:
-                continue
-            weighted += float(a) * c
-            total += c
-        timing_summary[key] = {
-            "count_total": int(total),
-            "avg_ms": (None if total == 0 else float(weighted / total)),
-        }
-    summary["timing_ms"] = timing_summary
-    return summary
+def _compact_episode_stats(episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for ep in episodes:
+        item: dict[str, Any] = {}
+        if "completed_steps" in ep:
+            item["completed_steps"] = ep["completed_steps"]
+        if "timing_ms" in ep:
+            item["timing_ms"] = {
+                key: value
+                for key, value in ep["timing_ms"].items()
+                if key in {"video_refresh", "action_step", "take_action"}
+            }
+        if "take_action_internal_steps" in ep:
+            item["take_action_internal_steps"] = ep["take_action_internal_steps"]
+        if "sampled_denoise_traces" in ep:
+            item["sampled_denoise_traces"] = ep["sampled_denoise_traces"]
+        compacted.append(item)
+    return compacted
 
 
 def _parse_args() -> argparse.Namespace:
@@ -123,18 +75,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-stats", required=True,
                    help="Path to dataset_stats.json used by the FastWAM processor.")
     # --- streaming runtime knobs
-    p.add_argument("--async-video-device", default="cuda:0")
-    p.add_argument("--async-action-device", default="cuda:1")
-    p.add_argument("--async-obs-stride-env-steps", type=int, default=3)
-    p.add_argument("--async-action-trigger-every-n-obs", type=int, default=3)
-    p.add_argument("--async-video-layers-per-chunk", type=int, default=2)
-    p.add_argument("--async-force-first-job", type=int, default=0)
-    p.add_argument("--async-warmup-action-jobs", type=int, default=20)
-    p.add_argument("--async-control-dt-ms", type=float, default=150.0)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--async-obs-stride-env-steps", type=int, default=1)
     # --- model / inference knobs
     p.add_argument("--mixed-precision", default="bf16")
     p.add_argument("--replan-steps", type=int, default=24)
-    p.add_argument("--num-inference-steps", type=int, default=8)
+    p.add_argument("--num-inference-steps", type=int, default=12)
     p.add_argument("--action-horizon", type=int, default=None)
     p.add_argument("--sigma-shift", type=float, default=None)
     p.add_argument("--text-cfg-scale", type=float, default=1.0)
@@ -142,6 +88,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--rand-device", default="cpu")
     p.add_argument("--tiled", type=int, default=0)
     p.add_argument("--timing-enabled", type=int, default=1)
+    p.add_argument("--save-full-runtime-trace", type=int, default=0)
     p.add_argument("--load-text-encoder", type=int, default=1,
                    help="Must be 1 for streaming RobotWin profiling.")
     p.add_argument("--redirect-common-files", type=int, default=1)
@@ -187,16 +134,11 @@ def _build_usr_args(args: argparse.Namespace) -> Dict[str, Any]:
         "tiled": bool(args.tiled),
         "timing_enabled": bool(args.timing_enabled),
         "profile_runtime": True,
+        "save_full_runtime_trace": bool(args.save_full_runtime_trace),
         "load_text_encoder": bool(args.load_text_encoder),
         "redirect_common_files": bool(args.redirect_common_files),
-        "async_video_device": args.async_video_device,
-        "async_action_device": args.async_action_device,
+        "device": args.device,
         "async_obs_stride_env_steps": args.async_obs_stride_env_steps,
-        "async_action_trigger_every_n_obs": args.async_action_trigger_every_n_obs,
-        "async_video_layers_per_chunk": args.async_video_layers_per_chunk,
-        "async_force_first_job": bool(args.async_force_first_job),
-        "async_warmup_action_jobs": args.async_warmup_action_jobs,
-        "async_control_dt_ms": args.async_control_dt_ms,
     }
 
 
@@ -279,6 +221,7 @@ def main() -> None:
                 "main() fail before calling get_model?"
             )
         episodes = policy.collect_episode_stats()
+        compact_episodes = _compact_episode_stats(episodes)
 
         task_name = args.task_name
         output_root = Path(args.profile_output_dir)
@@ -295,11 +238,8 @@ def main() -> None:
             "total_episodes": int(args.eval_num_episodes),
             "duration": float(duration),
             "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "async_video_device": str(args.async_video_device),
-            "async_action_device": str(args.async_action_device),
-            "async_runtime_episodes": episodes,
-            "async_runtime_summary": _summarize_episodes(episodes),
-            "layer_source_stats": episodes[-1].get("layer_source_stats") if episodes else None,
+            "device": str(args.device),
+            "async_runtime_episodes": compact_episodes,
         }
 
         with open(output_file, "w", encoding="utf-8") as f:

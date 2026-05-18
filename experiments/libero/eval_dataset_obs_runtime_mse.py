@@ -113,16 +113,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=160)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--video-device", default=None)
-    parser.add_argument("--action-device", default=None)
     parser.add_argument("--mixed-precision", default="bf16")
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--action-horizon", type=int, default=None)
     parser.add_argument("--rand-device", default=None)
     parser.add_argument("--control-dt-ms", type=float, default=None)
     parser.add_argument("--obs-stride-env-steps", type=int, default=None)
-    parser.add_argument("--trigger-every-n-obs", type=int, default=None)
-    parser.add_argument("--warmup-action-jobs", type=int, default=None)
     parser.add_argument(
         "--no-realtime-pacing",
         action="store_true",
@@ -140,10 +136,6 @@ def _compose_cfg(args: argparse.Namespace):
     ]
     if args.device is not None:
         overrides.append(f"EVALUATION.device={args.device}")
-    if args.video_device is not None:
-        overrides.append(f"EVALUATION.async_video_device={args.video_device}")
-    if args.action_device is not None:
-        overrides.append(f"EVALUATION.async_action_device={args.action_device}")
     if args.num_inference_steps is not None:
         overrides.append(f"EVALUATION.num_inference_steps={int(args.num_inference_steps)}")
     if args.action_horizon is not None:
@@ -154,25 +146,17 @@ def _compose_cfg(args: argparse.Namespace):
         overrides.append(f"EVALUATION.async_control_dt_ms={float(args.control_dt_ms)}")
     if args.obs_stride_env_steps is not None:
         overrides.append(f"EVALUATION.async_obs_stride_env_steps={int(args.obs_stride_env_steps)}")
-    if args.trigger_every_n_obs is not None:
-        overrides.append(f"EVALUATION.async_action_trigger_every_n_obs={int(args.trigger_every_n_obs)}")
-    if args.warmup_action_jobs is not None:
-        overrides.append(f"EVALUATION.async_warmup_action_jobs={int(args.warmup_action_jobs)}")
 
     config_dir = str((project_root / "configs").resolve())
     with initialize_config_dir(version_base="1.3", config_dir=config_dir):
         return compose(config_name="sim_libero", overrides=overrides)
 
 
-def _resolve_device(cfg, args: argparse.Namespace) -> tuple[str, str]:
-    fallback = str(args.device or cfg.EVALUATION.get("device") or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    video_device = str(args.video_device or cfg.EVALUATION.get("async_video_device") or fallback)
-    action_device = str(args.action_device or cfg.EVALUATION.get("async_action_device") or fallback)
-    if video_device == "cuda":
-        video_device = "cuda:0"
-    if action_device == "cuda":
-        action_device = "cuda:0"
-    return video_device, action_device
+def _resolve_device(cfg, args: argparse.Namespace) -> str:
+    device = str(args.device or cfg.EVALUATION.get("device") or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    if device == "cuda":
+        device = "cuda:0"
+    return device
 
 
 def _build_model(cfg, *, ckpt: str, model_dtype: torch.dtype, device: str):
@@ -300,13 +284,9 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
 
     mixed_precision = _normalize_mixed_precision(str(cfg.get("mixed_precision", args.mixed_precision)))
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-    video_device, action_device = _resolve_device(cfg, args)
-    video_model = _build_model(cfg, ckpt=str(args.ckpt), model_dtype=model_dtype, device=video_device)
-    action_model = (
-        video_model
-        if action_device == video_device
-        else _build_model(cfg, ckpt=str(args.ckpt), model_dtype=model_dtype, device=action_device)
-    )
+    device = _resolve_device(cfg, args)
+    video_model = _build_model(cfg, ckpt=str(args.ckpt), model_dtype=model_dtype, device=device)
+    action_model = video_model
 
     processor = dataset.lerobot_dataset.processor
     if processor is None:
@@ -330,11 +310,7 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
             cfg.data.train.get("obs_stride", 3),
         )
     )
-    trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", cfg.data.train.trigger_every_n_obs))
-    video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
-    force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
     control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
-    warmup_action_jobs = int(cfg.EVALUATION.get("async_warmup_action_jobs", 0))
     action_horizon = int(_resolve_action_horizon(cfg))
     num_inference_steps = int(cfg.EVALUATION.get("num_inference_steps", cfg.get("eval_num_inference_steps", 10)))
     sigma_shift = None if cfg.EVALUATION.get("sigma_shift") is None else float(cfg.EVALUATION.get("sigma_shift"))
@@ -356,8 +332,6 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         sigma_shift=sigma_shift,
         rand_device=rand_device,
         tiled=tiled,
-        action_trigger_every_n_obs=trigger_every_n_obs,
-        video_layers_per_chunk=video_layers_per_chunk,
         seed=int(args.seed),
     )
 
@@ -369,26 +343,12 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
 
         image0 = _episode_image(dataset, payload, 0)
         proprio0 = _episode_proprio(dataset, payload, 0)
-        runtime.bootstrap_sync(input_image=image0, obs_index=0, obs_timestamp_ms=0.0)
-        runtime.wait_until_idle()
 
         runner = AsyncStreamingRunner(
             runtime=runtime,
             obs_stride_env_steps=obs_stride_env_steps,
             control_dt_ms=control_dt_ms,
-            force_first_job=force_first_job,
         )
-        if warmup_action_jobs > 0:
-            warmup_span = max(1, warmup_action_jobs)
-            warmup_start = -int(warmup_span)
-            runtime.reset_for_formal_phase(env_step=warmup_start)
-            runner.run_warmup(
-                input_image=image0,
-                proprio=proprio0,
-                warmup_action_jobs=warmup_action_jobs,
-                start_env_step=warmup_start,
-                start_obs_index=warmup_start,
-            )
         runtime.reset_for_formal_phase(env_step=0)
         runner.start_formal_phase(obs_index_start=0)
         runner.prime_formal_observation(
@@ -459,18 +419,15 @@ def run_dataset_obs_runtime_mse(args: argparse.Namespace) -> dict[str, Any]:
         "episode_index": int(episode_index),
         "instruction": str(payload["instruction"]),
         "seed": int(args.seed),
-        "video_device": str(video_device),
-        "action_device": str(action_device),
+        "device": str(device),
         "mixed_precision": str(mixed_precision),
         "num_episode_raw_actions": int(raw_num_steps),
         "num_compared_steps": int(len(rows)),
         "action_horizon": int(action_horizon),
         "num_inference_steps": int(num_inference_steps),
         "obs_stride_env_steps": int(obs_stride_env_steps),
-        "trigger_every_n_obs": int(trigger_every_n_obs),
         "control_dt_ms": float(control_dt_ms),
         "realtime_pacing": not bool(args.no_realtime_pacing),
-        "warmup_action_jobs": int(warmup_action_jobs),
         "summary": {
             "env_action_mse": _array_stats(mses),
             "env_action_mae": _array_stats(maes),

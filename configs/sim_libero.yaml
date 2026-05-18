@@ -29,14 +29,8 @@ EVALUATION:
   use_action_ensembler: false
   visualize_future_video: false
   async_obs_stride_env_steps: ${STREAMING.obs_stride}
-  async_action_trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
-  async_video_layers_per_chunk: ${STREAMING.video_layers_per_chunk}
-  async_video_device: cuda:0
-  async_action_device: cuda:1
-  async_force_first_job: ${STREAMING.force_first_job}
   async_control_dt_ms: ${STREAMING.control_dt_ms}
-  async_warmup_action_jobs: ${STREAMING.warmup_action_jobs}
-  async_action_wait_timeout_s: 10.0
+  no_realtime_pacing: false
 
   # Action inference
   action_horizon: 13
@@ -47,6 +41,7 @@ EVALUATION:
   rand_device: cuda
   tiled: false
   profile_runtime: false
+  save_full_runtime_trace: false
   save_video: false
   continue_on_task_failure: false
   schedule_output_path: ./data/trajectory_replay/libero_async_schedule/schedule.pt

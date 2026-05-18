@@ -35,8 +35,6 @@ train:
   obs_stride: ${STREAMING.obs_stride}
   history_obs: 1
   future_obs: 2
-  trigger_every_n_obs: ${STREAMING.action_trigger_every_n_obs}
-  keep_trigger_phase: true
   action_horizon: 10
   episode_cache_size: 8
   processor:

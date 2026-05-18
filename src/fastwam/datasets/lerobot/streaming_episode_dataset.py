@@ -17,8 +17,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         effective_obs_stride: int = 3,
         history_obs: int = 1,
         future_obs: int = 2,
-        trigger_every_n_obs: int = 3,
-        keep_trigger_phase: bool = True,
         action_horizon: int = 32,
         episode_cache_size: int = 8,
         **kwargs,
@@ -32,8 +30,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
             raise ValueError(f"`history_obs` must be non-negative, got {history_obs}.")
         if future_obs < 0:
             raise ValueError(f"`future_obs` must be non-negative, got {future_obs}.")
-        if trigger_every_n_obs <= 0:
-            raise ValueError(f"`trigger_every_n_obs` must be positive, got {trigger_every_n_obs}.")
         if action_horizon <= 0:
             raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
 
@@ -41,8 +37,6 @@ class StreamingRobotEpisodeDataset(RobotVideoDataset):
         self.return_single_obs = bool(return_single_obs)
         self.history_obs = int(history_obs)
         self.future_obs = int(future_obs)
-        self.trigger_every_n_obs = int(trigger_every_n_obs)
-        self.keep_trigger_phase = bool(keep_trigger_phase)
         self.action_horizon = int(action_horizon)
         self.episode_cache_size = max(int(episode_cache_size), 0)
         self._episode_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()

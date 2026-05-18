@@ -2,8 +2,6 @@ import logging
 import os
 import sys
 import time
-import atexit
-import faulthandler
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +20,6 @@ from experiments.libero.eval_libero_single_profiled import (
     _build_eval_model,
     _configure_egl_device,
     _mixed_precision_to_model_dtype,
-    _resolve_async_runtime_devices,
     _resolve_dataset_stats_path,
     _resolve_eval_device,
     _validate_visualize_future_video_cfg,
@@ -30,8 +27,6 @@ from experiments.libero.eval_libero_single_profiled import (
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
-from fastwam.utils import async_streaming_runtime as _runtime_mod
-from fastwam.utils import async_streaming_workers as _workers_mod
 from libero.libero import benchmark
 
 def _register_resolver_if_needed(name: str, fn) -> None:
@@ -46,61 +41,6 @@ _register_resolver_if_needed("split", lambda s, idx: s.split("/")[int(idx)])
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
-
-def _maybe_enable_worker_faulthandler(worker_name: str) -> None:
-    fault_dir_raw = os.environ.get("FASTWAM_FAULT_DIR", "").strip()
-    if not fault_dir_raw:
-        return
-    enable_raw = str(os.environ.get("FASTWAM_CHILD_FAULTHANDLER", "1")).strip().lower()
-    if enable_raw in {"0", "false", "no", "n"}:
-        return
-
-    handle = None
-    try:
-        fault_dir = Path(fault_dir_raw)
-        fault_dir.mkdir(parents=True, exist_ok=True)
-        fault_file = fault_dir / f"{worker_name}_pid{os.getpid()}_faulthandler.log"
-        handle = open(fault_file, "a", encoding="utf-8")
-        faulthandler.enable(file=handle, all_threads=True)
-    except Exception:
-        if handle is not None:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        return
-
-    def _flush_and_close() -> None:
-        try:
-            handle.flush()
-        except Exception:
-            pass
-        try:
-            os.fsync(handle.fileno())
-        except Exception:
-            pass
-        try:
-            handle.close()
-        except Exception:
-            pass
-
-    atexit.register(_flush_and_close)
-
-
-def _libero_video_worker_loop_with_fault(**kwargs):
-    _maybe_enable_worker_faulthandler("streaming_video_worker")
-    _workers_mod._video_worker_loop(**kwargs)
-
-
-def _libero_action_worker_loop_profiled_with_fault(**kwargs):
-    _maybe_enable_worker_faulthandler("streaming_action_worker")
-    _workers_mod._action_worker_loop_profiled(**kwargs)
-
-
-_runtime_mod._video_worker_loop = _libero_video_worker_loop_with_fault
-_runtime_mod._action_worker_loop_profiled = _libero_action_worker_loop_profiled_with_fault
-
 
 def _collect_schedules(results: dict) -> list[dict]:
     schedules: list[dict] = []
@@ -142,14 +82,8 @@ def main(cfg: DictConfig):
 
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
-    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
-
+    model = _build_eval_model(cfg, model_dtype=model_dtype, device=model_device)
     action_model: Optional[torch.nn.Module] = None
-    if async_action_device != async_video_device:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
-        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
-    else:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
 
     dataset_stats = load_dataset_stats_from_json(str(_resolve_dataset_stats_path(cfg)))
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
@@ -198,8 +132,7 @@ def main(cfg: DictConfig):
             action_horizon=action_horizon,
             input_w=input_w,
             input_h=input_h,
-            model_device=async_video_device,
-            action_device=async_action_device,
+            device=model_device,
             render_gpu_device_id=render_gpu_device_id,
         )
         schedules = _collect_schedules(results)

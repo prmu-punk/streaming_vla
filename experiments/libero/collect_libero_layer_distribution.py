@@ -74,14 +74,6 @@ def _resolve_eval_device(cfg: DictConfig) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _resolve_async_runtime_devices(cfg: DictConfig, fallback_device: str) -> tuple[str, str]:
-    video_device = cfg.EVALUATION.get("async_video_device")
-    action_device = cfg.EVALUATION.get("async_action_device")
-    resolved_video_device = fallback_device if video_device is None else str(video_device)
-    resolved_action_device = fallback_device if action_device is None else str(action_device)
-    return resolved_video_device, resolved_action_device
-
-
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
@@ -350,13 +342,8 @@ def main(cfg: DictConfig):
 
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
-    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
+    model = _build_eval_model(cfg, model_dtype=model_dtype, device=model_device)
     action_model: Optional[torch.nn.Module] = None
-    if async_action_device != async_video_device:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
-        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
-    else:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))

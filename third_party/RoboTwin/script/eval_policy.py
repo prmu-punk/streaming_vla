@@ -65,14 +65,6 @@ def get_eval_video_size(args):
     head_camera_cfg = get_camera_config(args["camera"]["head_camera_type"])
     video_w = int(head_camera_cfg["w"])
     video_h = int(head_camera_cfg["h"])
-
-    if args["camera"].get("collect_wrist_camera", False):
-        wrist_camera_cfg = get_camera_config(args["camera"]["wrist_camera_type"])
-        wrist_w = int(wrist_camera_cfg["w"])
-        wrist_h = int(wrist_camera_cfg["h"])
-        video_w = max(video_w, wrist_w * 2)
-        video_h = video_h + wrist_h
-
     return f"{video_w}x{video_h}"
 
 

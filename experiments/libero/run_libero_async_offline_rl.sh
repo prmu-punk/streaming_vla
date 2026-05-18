@@ -100,8 +100,7 @@ collect_shard() {
     "EVALUATION.task_suite_name=${task_suite}" \
     "EVALUATION.task_id=${task_id}" \
     "EVALUATION.num_trials=$((TRIALS * num_shards))" \
-    "EVALUATION.async_video_device=cuda:0" \
-    "EVALUATION.async_action_device=cuda:1" \
+    "EVALUATION.device=cuda:0" \
     "EVALUATION.save_video=false" \
     "EVALUATION.schedule_output_path=${output_path}" \
     "EVALUATION.schedule_shard_id=${shard_id}" \

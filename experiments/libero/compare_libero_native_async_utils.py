@@ -172,14 +172,8 @@ def run_native_async_anchor_chunk(
         resolved_action_model.reset_streaming_state()
 
     obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", 3))
-    trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", 3))
-    video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
-    force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
     control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
     min_step_dt_s = 0.0
-    warmup_action_jobs = int(cfg.EVALUATION.get("async_warmup_action_jobs", 0))
-    if warmup_action_jobs < 0:
-        raise ValueError(f"`async_warmup_action_jobs` must be >= 0, got {warmup_action_jobs}.")
     num_inference_steps = int(cfg.EVALUATION.get("num_inference_steps", cfg.get("eval_num_inference_steps", 10)))
     sigma_shift = None if cfg.EVALUATION.get("sigma_shift") is None else float(cfg.EVALUATION.get("sigma_shift"))
     rand_device = str(cfg.EVALUATION.get("rand_device", "cpu"))
@@ -227,8 +221,6 @@ def run_native_async_anchor_chunk(
             sigma_shift=sigma_shift,
             rand_device=rand_device,
             tiled=tiled,
-            action_trigger_every_n_obs=int(trigger_every_n_obs),
-            video_layers_per_chunk=int(video_layers_per_chunk),
             seed=prompt_seed,
         )
         runtime.start()
@@ -251,55 +243,17 @@ def run_native_async_anchor_chunk(
             width=input_w,
             height=input_h,
         )
-        runtime.bootstrap_sync(
-            input_image=bootstrap_image,
-            obs_index=0,
-            obs_timestamp_ms=0.0,
-        )
-        runtime.wait_until_idle()
-        print(
-            f"[anchor-debug] bootstrap complete anchor_step={int(anchor_step)}",
-            flush=True,
-        )
         runtime.reset_for_formal_phase(env_step=0)
         runner = AsyncStreamingRunner(
             runtime=runtime,
             obs_stride_env_steps=obs_stride_env_steps,
             control_dt_ms=control_dt_ms,
-            force_first_job=force_first_job,
         )
 
-        submission_trace: list[dict[str, Any]] = [
-            {
-                "submission_kind": "bootstrap",
-                "obs_index": 0,
-                "env_step": 0,
-                **bootstrap_meta,
-            }
-        ]
+        submission_trace: list[dict[str, Any]] = []
 
         current_obs_index = 0
         last_submitted_obs_index = -1
-
-        if warmup_action_jobs > 0:
-            print(
-                f"[anchor-debug] warmup begin anchor_step={int(anchor_step)} warmup_action_jobs={int(warmup_action_jobs)}",
-                flush=True,
-            )
-            warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
-            warmup_start = -int(warmup_span)
-            current_obs_index = runner.run_warmup(
-                input_image=bootstrap_image,
-                proprio=None,
-                warmup_action_jobs=warmup_action_jobs,
-                start_env_step=warmup_start,
-                start_obs_index=warmup_start,
-            )
-            runtime.reset_for_formal_phase(env_step=0)
-            print(
-                f"[anchor-debug] warmup done anchor_step={int(anchor_step)} current_obs_index={int(current_obs_index)}",
-                flush=True,
-            )
 
         def _submit_selected(
             *,

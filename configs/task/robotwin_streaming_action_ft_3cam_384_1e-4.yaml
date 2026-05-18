@@ -33,10 +33,3 @@ eval_every: 1000
 gradient_accumulation_steps: 4
 weight_decay: 1e-2
 resume: null
-
-profile_bootstrap:
-  target_obs_period_ms: 100.0
-  action_trigger_every_n_obs: 2
-  expected_video_prefill_ms: null
-  expected_action_full_ms: null
-  expected_action_step_ms: null

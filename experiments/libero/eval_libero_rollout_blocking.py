@@ -101,15 +101,9 @@ def run_single_episode_async(
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     obs_stride_env_steps = int(cfg.EVALUATION.get("async_obs_stride_env_steps", 3))
-    trigger_every_n_obs = int(cfg.EVALUATION.get("async_action_trigger_every_n_obs", 3))
-    video_layers_per_chunk = int(cfg.EVALUATION.get("async_video_layers_per_chunk", 2))
-    force_first_job = bool(cfg.EVALUATION.get("async_force_first_job", True))
     control_dt_ms = float(cfg.EVALUATION.get("async_control_dt_ms", 50.0))
-    min_step_dt_s = max(0.0, control_dt_ms / 1000.0)
-    warmup_action_jobs = int(cfg.EVALUATION.get("async_warmup_action_jobs", 0))
-    if warmup_action_jobs < 0:
-        raise ValueError(f"`async_warmup_action_jobs` must be >= 0, got {warmup_action_jobs}.")
-
+    no_realtime_pacing = bool(cfg.EVALUATION.get("no_realtime_pacing", False))
+    min_step_dt_s = 0.0 if no_realtime_pacing else max(0.0, control_dt_ms / 1000.0)
     prompt = DEFAULT_PROMPT.format(task=task_description)
     with torch.no_grad():
         video_context, video_context_mask = video_model.encode_prompt(prompt)
@@ -136,9 +130,8 @@ def run_single_episode_async(
         sigma_shift=(None if cfg.EVALUATION.get("sigma_shift") is None else float(cfg.EVALUATION.get("sigma_shift"))),
         rand_device=str(cfg.EVALUATION.get("rand_device", "cpu")),
         tiled=bool(cfg.EVALUATION.get("tiled", False)),
-        action_trigger_every_n_obs=trigger_every_n_obs,
-        video_layers_per_chunk=video_layers_per_chunk,
         seed=(None if cfg.get("seed") is None else int(cfg.seed)),
+        collect_full_trace=bool(cfg.EVALUATION.get("save_full_runtime_trace", False)),
     )
 
     replay_images = []
@@ -164,7 +157,6 @@ def run_single_episode_async(
             )
 
         image, proprio, imgs = _encode_obs(obs)
-        runtime.bootstrap_sync(input_image=image, obs_index=0, obs_timestamp_ms=0.0)
 
         obs_counter = 0
         for wait_step in range(num_steps_wait):
@@ -191,34 +183,6 @@ def run_single_episode_async(
         if not terminated_during_wait:
             runtime.wait_until_idle()
             runtime.reset_for_formal_phase(env_step=num_steps_wait)
-
-            if warmup_action_jobs > 0:
-                warmup_span = max(1, warmup_action_jobs) * max(1, action_horizon)
-                warmup_t = -int(warmup_span)
-                warmup_obs_index = -int(warmup_span)
-                warmup_obs_count = 0
-                warmup_first_triggered = False
-                while runtime.completed_jobs() < warmup_action_jobs:
-                    if (warmup_t + int(warmup_span)) % obs_stride_env_steps == 0:
-                        should_trigger = runtime.should_trigger_on_obs(warmup_obs_count + 1)
-                        if force_first_job and not warmup_first_triggered:
-                            should_trigger = True
-                        runtime.submit_observation(
-                            input_image=image,
-                            proprio=proprio,
-                            env_step=warmup_t,
-                            obs_index=warmup_obs_index,
-                            obs_timestamp_ms=float(warmup_obs_index) * control_dt_ms * float(obs_stride_env_steps),
-                            trigger_job=should_trigger,
-                        )
-                        warmup_obs_index += 1
-                        warmup_obs_count += 1
-                        if should_trigger:
-                            warmup_first_triggered = True
-                    runtime.get_action(warmup_t)
-                    warmup_t += 1
-                runtime.wait_until_idle()
-                runtime.reset_for_formal_phase(env_step=num_steps_wait)
 
             if num_steps_wait % obs_stride_env_steps == 0:
                 runtime.submit_observation(
@@ -315,8 +279,7 @@ def run_single_task(
     action_horizon: int,
     input_w: int,
     input_h: int,
-    model_device: str,
-    action_device: str,
+    device: str,
     render_gpu_device_id: int,
 ) -> dict:
     env, task_description = get_libero_env(
@@ -334,8 +297,7 @@ def run_single_task(
         "action_horizon": int(action_horizon),
         "async_runtime_episodes": [],
         "async_runtime_summary": None,
-        "async_video_device": str(model_device),
-        "async_action_device": str(action_device),
+        "device": str(device),
     }
     try:
         for trial_idx in range(int(cfg.EVALUATION.num_trials)):

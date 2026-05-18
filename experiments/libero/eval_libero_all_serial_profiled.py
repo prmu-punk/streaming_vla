@@ -23,7 +23,6 @@ from experiments.libero.eval_libero_single_profiled import (
     _build_eval_model,
     _configure_egl_device,
     _mixed_precision_to_model_dtype,
-    _resolve_async_runtime_devices,
     _resolve_dataset_stats_path,
     _resolve_eval_device,
     _resolve_trial_selection,
@@ -55,19 +54,8 @@ def eval_all_serial(cfg: DictConfig):
 
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
-    async_video_device, async_action_device = _resolve_async_runtime_devices(cfg, model_device)
-
+    model = _build_eval_model(cfg, model_dtype=model_dtype, device=model_device)
     action_model: Optional[torch.nn.Module] = None
-    if async_action_device != async_video_device:
-        logging.info(
-            "Async dual-device runtime enabled: video_device=%s action_device=%s",
-            async_video_device,
-            async_action_device,
-        )
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
-        action_model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_action_device)
-    else:
-        model = _build_eval_model(cfg, model_dtype=model_dtype, device=async_video_device)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -148,8 +136,7 @@ def eval_all_serial(cfg: DictConfig):
                 action_horizon=action_horizon,
                 input_w=input_w,
                 input_h=input_h,
-                model_device=async_video_device,
-                action_device=async_action_device,
+                device=model_device,
                 render_gpu_device_id=render_gpu_device_id,
             )
 
@@ -169,7 +156,7 @@ def eval_all_serial(cfg: DictConfig):
                 "duration": float(time.time() - task_start),
             }
 
-            for key in ("async_runtime_episodes", "async_runtime_summary", "async_video_device", "async_action_device"):
+            for key in ("async_runtime_episodes", "async_runtime_summary", "device"):
                 if key in task_results:
                     result[key] = task_results[key]
 
