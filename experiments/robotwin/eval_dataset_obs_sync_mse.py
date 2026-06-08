@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-precision", default="bf16")
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--action-horizon", type=int, default=None)
+    parser.add_argument("--replan-steps", type=int, default=None)
     parser.add_argument("--skip-initial-steps", type=int, default=0)
     parser.add_argument("--rand-device", default=None)
     parser.add_argument("--tiled", action="store_true")

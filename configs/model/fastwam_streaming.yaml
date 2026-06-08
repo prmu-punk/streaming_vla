@@ -63,4 +63,4 @@ streaming:
   streaming_train:
     enabled: false
     cache_mode: full_cur
-    token_noise_pattern: front_low_high
+    token_noise_pattern: random_all

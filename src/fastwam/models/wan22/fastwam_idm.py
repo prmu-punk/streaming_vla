@@ -80,11 +80,7 @@ class FastWAMIDM(FastWAMJoint):
 
         # Branch B: noisy action.
         noise_action = torch.randn_like(action)
-        timestep_action = self.train_action_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=action.dtype,
-        )
+        timestep_action = self._sample_action_training_t(action)
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
@@ -206,18 +202,12 @@ class FastWAMIDM(FastWAMJoint):
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
-
-        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        loss_action = self._compute_action_loss(
+            pred_action=pred_action,
+            target_action=target_action,
+            timestep_action=timestep_action,
+            action_is_pad=action_is_pad,
         )
-        loss_action = (action_loss_per_sample * action_weight).mean()
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {

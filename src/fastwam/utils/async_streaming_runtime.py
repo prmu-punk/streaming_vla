@@ -216,13 +216,34 @@ class StreamingRuntime:
     def _reset_profile_trace_samples(self) -> None:
         self._profile_trace_window_order: list[int] = []
         self._profile_trace_by_window: dict[int, list[dict[str, Any]]] = {}
+        self._profile_trace_seen_windows: set[int] = set()
+        self._profile_trace_num_seen_windows = 0
+        rng_seed = 0 if self.seed is None else int(self.seed)
+        self._profile_trace_rng = np.random.default_rng(rng_seed)
 
     def _should_sample_profile_window(self, window_start_env_step: int) -> bool:
         window_t = int(window_start_env_step)
         if window_t in self._profile_trace_by_window:
             return True
-        if len(self._profile_trace_window_order) >= int(self._profile_trace_max_windows):
+        if window_t in self._profile_trace_seen_windows:
             return False
+
+        self._profile_trace_seen_windows.add(window_t)
+        self._profile_trace_num_seen_windows += 1
+
+        # Reservoir-sample windows across the whole rollout instead of keeping
+        # only the first few startup windows.
+        max_windows = int(self._profile_trace_max_windows)
+        if len(self._profile_trace_window_order) >= max_windows:
+            replace_idx = int(self._profile_trace_rng.integers(0, self._profile_trace_num_seen_windows))
+            if replace_idx >= max_windows:
+                return False
+            old_window_t = int(self._profile_trace_window_order[replace_idx])
+            self._profile_trace_by_window.pop(old_window_t, None)
+            self._profile_trace_window_order[replace_idx] = window_t
+            self._profile_trace_by_window[window_t] = []
+            return True
+
         self._profile_trace_window_order.append(window_t)
         self._profile_trace_by_window[window_t] = []
         return True

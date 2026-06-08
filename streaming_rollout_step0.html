@@ -1,0 +1,1305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FastWAM Streaming Rollout Animation</title>
+  <style>
+    :root {
+      --bg: #f5efe4;
+      --panel: rgba(255, 251, 245, 0.9);
+      --ink: #162028;
+      --muted: #64727a;
+      --line: #dccfbe;
+      --accent: #0f766e;
+      --accent-soft: #dcf2ef;
+      --violet: #7c3aed;
+      --amber: #c07b18;
+      --green: #2f855a;
+      --shadow: 0 22px 60px rgba(38, 34, 28, 0.09);
+      --slot-gap: 12px;
+      --token-h: 160px;
+      --horizon: 6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.10), transparent 26%),
+        radial-gradient(circle at bottom right, rgba(124, 58, 237, 0.08), transparent 24%),
+        linear-gradient(180deg, #fbf7f1 0%, var(--bg) 100%);
+    }
+
+    .page {
+      max-width: 1460px;
+      margin: 0 auto;
+      padding: 28px 22px 48px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(220, 207, 190, 0.82);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .hero-card {
+      padding: 26px 28px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 14px 0 8px;
+      font-size: clamp(30px, 4vw, 50px);
+      line-height: 1.04;
+    }
+
+    .lede {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.72;
+      font-size: 16px;
+      max-width: 62ch;
+    }
+
+    .assumptions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .chip {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 10px 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .chip strong {
+      color: var(--ink);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 330px 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .timeline {
+      padding: 18px;
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+    }
+
+    .timeline h2,
+    .stage h2,
+    .summary h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+    }
+
+    .timeline-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .event {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: white;
+      color: var(--ink);
+      padding: 12px 13px;
+      cursor: pointer;
+      transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+    }
+
+    .event:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 26px rgba(22, 32, 40, 0.08);
+    }
+
+    .event.active {
+      border-color: var(--accent);
+      box-shadow: 0 12px 30px rgba(15, 118, 110, 0.16);
+      background: linear-gradient(180deg, #ffffff 0%, #f2fbfa 100%);
+    }
+
+    .event-index {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .event-title {
+      font-size: 14px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+
+    .event-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .main {
+      display: grid;
+      gap: 18px;
+    }
+
+    .controls {
+      padding: 18px 20px;
+    }
+
+    .control-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    button {
+      border: none;
+      border-radius: 14px;
+      background: var(--ink);
+      color: white;
+      padding: 10px 15px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: white;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    input[type="range"] {
+      width: min(480px, 100%);
+      accent-color: var(--accent);
+    }
+
+    .range-label {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .stage {
+      padding: 20px;
+    }
+
+    .topline {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 16px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .status-pill.shift {
+      background: #f0e8ff;
+      color: var(--violet);
+    }
+
+    .status-pill.observe {
+      background: #fff0d9;
+      color: var(--amber);
+    }
+
+    .status-pill.execute {
+      background: #e3f6e8;
+      color: var(--green);
+    }
+
+    .metric-box {
+      min-width: 118px;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px 14px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+
+    .metric-value {
+      font-size: 22px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .obs-panel {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .obs-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .obs-current {
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .obs-note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .obs-timeline {
+      position: relative;
+      padding: 18px 10px 6px;
+    }
+
+    .obs-line {
+      position: absolute;
+      left: 16px;
+      right: 16px;
+      top: 33px;
+      height: 2px;
+      background: linear-gradient(90deg, #e7ddcf 0%, #d1eee9 100%);
+    }
+
+    .obs-points {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(10, minmax(0, 1fr));
+      gap: 0;
+    }
+
+    .obs-point {
+      position: relative;
+      text-align: center;
+      min-height: 58px;
+    }
+
+    .obs-node {
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      margin: 0 auto 8px;
+      border: 2px solid #ddcfbc;
+      background: #fffaf2;
+      position: relative;
+      z-index: 1;
+      transition: transform 260ms ease, background 260ms ease, border-color 260ms ease, box-shadow 260ms ease;
+    }
+
+    .obs-point.refresh .obs-node::after {
+      content: "";
+      position: absolute;
+      inset: 4px;
+      border-radius: 999px;
+      background: #efb96b;
+      opacity: 0.55;
+    }
+
+    .obs-point.active .obs-node {
+      background: #d8f2ef;
+      border-color: var(--accent);
+      transform: scale(1.18);
+      box-shadow: 0 0 0 8px rgba(15, 118, 110, 0.10);
+    }
+
+    .obs-point.future .obs-node {
+      opacity: 0.6;
+    }
+
+    .obs-label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .window-shell {
+      background:
+        radial-gradient(circle at top left, rgba(124, 58, 237, 0.06), transparent 22%),
+        linear-gradient(180deg, #fffdfa 0%, #fbf6ef 100%);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 18px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .window-header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+
+    .window-title {
+      font-size: 16px;
+      font-weight: 800;
+    }
+
+    .window-sub {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 4px;
+    }
+
+    .window-shift-note {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #f0e8ff;
+      color: var(--violet);
+      font-size: 12px;
+      font-weight: 800;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 220ms ease, transform 220ms ease;
+    }
+
+    .window-shift-note.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .window-track {
+      position: relative;
+      height: calc(var(--token-h) + 54px);
+      border-radius: 22px;
+      background:
+        repeating-linear-gradient(
+          90deg,
+          rgba(212, 197, 180, 0.0) 0,
+          rgba(212, 197, 180, 0.0) calc((100% / var(--horizon)) - 1px),
+          rgba(212, 197, 180, 0.52) calc((100% / var(--horizon)) - 1px),
+          rgba(212, 197, 180, 0.52) calc(100% / var(--horizon))
+        ),
+        linear-gradient(180deg, rgba(255,255,255,0.74) 0%, rgba(252,246,238,0.92) 100%);
+      border: 1px solid rgba(220, 207, 190, 0.76);
+      overflow: hidden;
+    }
+
+    .slot-labels {
+      position: absolute;
+      inset: 0 0 auto 0;
+      display: grid;
+      grid-template-columns: repeat(var(--horizon), minmax(0, 1fr));
+      gap: 0;
+      pointer-events: none;
+    }
+
+    .slot-label {
+      text-align: center;
+      padding-top: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    .token-layer {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 38px;
+      bottom: 0;
+    }
+
+    .token-card {
+      position: absolute;
+      top: 0;
+      height: var(--token-h);
+      width: calc((100% / var(--horizon)) - var(--slot-gap));
+      border-radius: 20px;
+      border: 1px solid rgba(255,255,255,0.75);
+      color: white;
+      padding: 14px 14px 12px;
+      box-shadow: 0 20px 36px rgba(28, 35, 44, 0.18);
+      transition:
+        left 650ms cubic-bezier(.22,1,.36,1),
+        transform 650ms cubic-bezier(.22,1,.36,1),
+        opacity 420ms ease,
+        filter 420ms ease,
+        box-shadow 420ms ease,
+        background 420ms ease;
+      overflow: hidden;
+    }
+
+    .token-card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0.0) 58%);
+      pointer-events: none;
+    }
+
+    .token-card.entering {
+      opacity: 0;
+      transform: translateY(18px) scale(0.94);
+    }
+
+    .token-card.exiting {
+      opacity: 0;
+      transform: translateY(-20px) scale(0.88);
+      pointer-events: none;
+    }
+
+    .token-card.released {
+      box-shadow: 0 16px 34px rgba(47, 133, 90, 0.24);
+    }
+
+    .token-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .token-slot {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      opacity: 0.75;
+    }
+
+    .token-step {
+      font-size: 28px;
+      font-weight: 900;
+      line-height: 1;
+      margin-top: 10px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .token-env {
+      margin-top: 4px;
+      font-size: 13px;
+      opacity: 0.85;
+      position: relative;
+      z-index: 1;
+    }
+
+    .token-origin {
+      display: inline-flex;
+      width: fit-content;
+      margin-top: 12px;
+      padding: 6px 9px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.18);
+      backdrop-filter: blur(2px);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      position: relative;
+      z-index: 1;
+    }
+
+    .noise-band {
+      position: relative;
+      z-index: 1;
+      margin-top: 12px;
+    }
+
+    .noise-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      opacity: 0.86;
+      margin-bottom: 6px;
+    }
+
+    .noise-bar {
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.24);
+      overflow: hidden;
+    }
+
+    .noise-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(255,255,255,0.88) 0%, rgba(255,255,255,0.36) 100%);
+      transform-origin: left center;
+      transition: width 420ms ease;
+    }
+
+    .token-meta {
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.55;
+      opacity: 0.9;
+      position: relative;
+      z-index: 1;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .legend-item {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px;
+    }
+
+    .legend-title {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .legend-swatch {
+      height: 18px;
+      border-radius: 999px;
+      margin-bottom: 8px;
+    }
+
+    .summary {
+      padding: 20px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 18px;
+    }
+
+    .summary-copy {
+      color: var(--muted);
+      line-height: 1.75;
+      font-size: 15px;
+    }
+
+    .detail-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 11px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: white;
+      font-size: 14px;
+    }
+
+    .detail-row span {
+      color: var(--muted);
+    }
+
+    .detail-row strong {
+      text-align: right;
+    }
+
+    @media (max-width: 1180px) {
+      .hero,
+      .layout,
+      .summary-grid,
+      .topline {
+        grid-template-columns: 1fr;
+      }
+
+      .timeline {
+        position: static;
+        max-height: none;
+      }
+    }
+
+    @media (max-width: 860px) {
+      .legend {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 640px) {
+      .legend {
+        grid-template-columns: 1fr;
+      }
+
+      .metric-box {
+        min-width: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="card hero-card">
+        <div class="eyebrow">Streaming Rollout Animation</div>
+        <h1>从第 0 步开始，看每一个 denoise step</h1>
+        <p class="lede">
+          这页不是静态示意图，而是一个 rollout 动画。你可以逐步或自动播放，
+          看到每一轮 denoise 时当前用的是哪个 <code>obs_t</code>，
+          窗口内每个 token 的噪声程度如何变化，以及窗口在新观测到来后怎样左移并补入新的尾部 token。
+        </p>
+      </div>
+
+      <div class="card hero-card">
+        <h2>模拟设定</h2>
+        <div class="assumptions">
+          <div class="chip"><strong>blocking</strong>，没动作就等</div>
+          <div class="chip"><strong>obs_stride = 1</strong></div>
+          <div class="chip"><strong>action_horizon = 6</strong></div>
+          <div class="chip"><strong>num_inference_steps = 4</strong></div>
+          <div class="chip"><strong>startup_uncertainty_scale = 1.0</strong></div>
+        </div>
+        <p class="lede" style="margin-top:14px;">
+          页面按方法语义做了一个可读化缩放。真实 runtime 还会混入 layer 混合、GPU stream、渲染和调度因素，
+          这里故意只保留最关键的机制。
+        </p>
+      </div>
+    </section>
+
+    <section class="layout">
+      <aside class="card timeline">
+        <h2>事件时间线</h2>
+        <div class="timeline-list" id="timeline"></div>
+      </aside>
+
+      <main class="main">
+        <section class="card controls">
+          <div class="control-row">
+            <button id="prevBtn" type="button">上一步</button>
+            <button id="nextBtn" type="button">下一步</button>
+            <button id="playBtn" class="secondary" type="button">自动播放</button>
+            <input id="eventSlider" type="range" min="0" max="0" value="0" />
+            <div class="range-label" id="rangeLabel"></div>
+          </div>
+        </section>
+
+        <section class="card stage">
+          <div class="topline">
+            <div>
+              <div class="status-pill" id="statusPill"></div>
+              <p class="lede" id="statusText" style="margin-top:10px;"></p>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">当前 conditioning obs</div>
+              <div class="metric-value" id="obsMetric"></div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">window range</div>
+              <div class="metric-value" id="windowMetric"></div>
+            </div>
+          </div>
+
+          <div class="obs-panel">
+            <div class="obs-header">
+              <div class="obs-current" id="obsCurrent"></div>
+              <div class="obs-note">橙色节点表示观测刷新点，青色高亮表示这一轮 denoise 实际正在使用的 obs。</div>
+            </div>
+            <div class="obs-timeline">
+              <div class="obs-line"></div>
+              <div class="obs-points" id="obsPoints"></div>
+            </div>
+          </div>
+
+          <div class="window-shell">
+            <div class="window-header">
+              <div>
+                <div class="window-title">Persistent action window</div>
+                <div class="window-sub" id="windowSubtitle"></div>
+              </div>
+              <div class="window-shift-note" id="shiftNote"></div>
+            </div>
+
+            <div class="window-track" id="windowTrack">
+              <div class="slot-labels" id="slotLabels"></div>
+              <div class="token-layer" id="tokenLayer"></div>
+            </div>
+
+            <div class="legend">
+              <div class="legend-item">
+                <div class="legend-title">高噪声 token</div>
+                <div class="legend-swatch" style="background:linear-gradient(90deg,#5b2ab7 0%,#7c3aed 100%);"></div>
+                <div class="lede" style="font-size:13px;">刚补进窗口尾部，几乎还没做 denoise。</div>
+              </div>
+              <div class="legend-item">
+                <div class="legend-title">中间状态</div>
+                <div class="legend-swatch" style="background:linear-gradient(90deg,#9f6ae6 0%,#d2b2ff 100%);"></div>
+                <div class="lede" style="font-size:13px;">正在被最新 obs 条件继续推进。</div>
+              </div>
+              <div class="legend-item">
+                <div class="legend-title">低噪声 token</div>
+                <div class="legend-swatch" style="background:linear-gradient(90deg,#e4d8ff 0%,#f6f0ff 100%);"></div>
+                <div class="lede" style="font-size:13px;">已经很接近最终动作。</div>
+              </div>
+              <div class="legend-item">
+                <div class="legend-title">released action</div>
+                <div class="legend-swatch" style="background:linear-gradient(90deg,#2f855a 0%,#67bb8e 100%);"></div>
+                <div class="lede" style="font-size:13px;">达到最终 denoise step，可直接执行。</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card summary">
+          <h2>当前帧说明</h2>
+          <div class="summary-grid">
+            <div class="summary-copy" id="summaryText"></div>
+            <div class="detail-list">
+              <div class="detail-row"><span>事件类型</span><strong id="detailKind"></strong></div>
+              <div class="detail-row"><span>runtime denoise step</span><strong id="detailRuntime"></strong></div>
+              <div class="detail-row"><span>obs index</span><strong id="detailObsIndex"></strong></div>
+              <div class="detail-row"><span>shift steps</span><strong id="detailShift"></strong></div>
+              <div class="detail-row"><span>本轮释放 actions</span><strong id="detailReleased"></strong></div>
+              <div class="detail-row"><span>环境正在执行</span><strong id="detailServed"></strong></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <script>
+    const CONFIG = {
+      obsStride: 1,
+      actionHorizon: 6,
+      numInferenceSteps: 4,
+      startupUncertaintyScale: 1.0,
+      targetServedSteps: 9,
+      maxVisualStep: 9,
+    };
+
+    document.documentElement.style.setProperty("--horizon", String(CONFIG.actionHorizon));
+
+    function cloneTokens(tokens) {
+      return tokens.map((token) => ({ ...token }));
+    }
+
+    function noiseRatio(token) {
+      return Math.max(0, 1 - token.count / CONFIG.numInferenceSteps);
+    }
+
+    function tokenOriginLabel(origin, released) {
+      if (released) return "released";
+      if (origin === "new_tail") return "new tail";
+      if (origin === "reused") return "reused";
+      return "fresh";
+    }
+
+    function eventStyle(kind) {
+      if (kind === "shift") return "shift";
+      if (kind === "obs_refresh" || kind === "bootstrap") return "observe";
+      if (kind === "serve") return "execute";
+      return "";
+    }
+
+    function eventLabel(kind) {
+      if (kind === "bootstrap") return "bootstrap";
+      if (kind === "obs_refresh") return "obs refresh";
+      if (kind === "shift") return "window shift";
+      if (kind === "serve") return "execute action";
+      return "denoise step";
+    }
+
+    function narrative(state) {
+      if (state.kind === "bootstrap") {
+        return "第一个观测 obs@0 进入系统，video cache 被 bootstrap，persistent action window 初始化为 [0, 5]。此时所有 token 都是高噪声状态。";
+      }
+      if (state.kind === "obs_refresh") {
+        return `系统在 env step ${state.nextEnvStep} 处刷新观测，提交 obs@${state.latestObsEnvStep}。后续 action denoise 都会尽量在这份最新视觉条件下继续推进。`;
+      }
+      if (state.kind === "shift") {
+        return `由于最新 obs 已经来自 ${state.latestObsEnvStep}，窗口从 [${state.windowStartBefore}, ${state.windowStartBefore + CONFIG.actionHorizon - 1}] 左移到 [${state.windowStart}, ${state.windowStart + CONFIG.actionHorizon - 1}]。前半段 token 保留原 latent 和 denoise 进度，尾部补入全新噪声。`;
+      }
+      if (state.kind === "denoise") {
+        if (state.released.length > 0) {
+          return `这一轮 denoise 使用 obs@${state.latestObsEnvStep} 作为条件，${state.released.map((x) => `action@${x}`).join("、")} 在本轮完成去噪并被释放。`;
+        }
+        return `这一轮 denoise 使用 obs@${state.latestObsEnvStep} 作为条件。窗口内 token 的颜色会整体变浅，表示噪声正在下降。`;
+      }
+      return `环境执行 action@${state.servedStep}。在 blocking 语义下，环境优先消费已经 release 的最近动作。`;
+    }
+
+    function createInitialTokens() {
+      const tokens = [];
+      for (let i = 0; i < CONFIG.actionHorizon; i += 1) {
+        tokens.push({
+          envStep: i,
+          slot: i,
+          count: 0,
+          origin: "fresh",
+          released: false,
+        });
+      }
+      return tokens;
+    }
+
+    function simulate() {
+      const states = [];
+      let tokens = createInitialTokens();
+      let actionCache = new Set();
+      let nextEnvStep = 0;
+      let latestObsEnvStep = 0;
+      let obsIndex = 0;
+      let windowStart = 0;
+      let runtimeStep = 0;
+      let startupScheduleStep = 0;
+
+      states.push({
+        kind: "bootstrap",
+        title: "Bootstrap obs@0",
+        latestObsEnvStep,
+        obsIndex,
+        nextEnvStep,
+        windowStart,
+        runtimeStep,
+        shift: 0,
+        released: [],
+        servedStep: null,
+        tokens: cloneTokens(tokens),
+      });
+
+      while (nextEnvStep < CONFIG.targetServedSteps) {
+        if (nextEnvStep > latestObsEnvStep && nextEnvStep % CONFIG.obsStride === 0) {
+          latestObsEnvStep = nextEnvStep;
+          obsIndex += 1;
+          states.push({
+            kind: "obs_refresh",
+            title: `Refresh obs@${latestObsEnvStep}`,
+            latestObsEnvStep,
+            obsIndex,
+            nextEnvStep,
+            windowStart,
+            runtimeStep,
+            shift: 0,
+            released: [],
+            servedStep: null,
+            tokens: cloneTokens(tokens),
+          });
+        }
+
+        const shift = Math.max(0, latestObsEnvStep - windowStart);
+        if (shift > 0) {
+          const shifted = [];
+          const keep = Math.max(0, CONFIG.actionHorizon - shift);
+          for (let slot = 0; slot < CONFIG.actionHorizon; slot += 1) {
+            if (slot < keep) {
+              const from = tokens[slot + shift];
+              shifted.push({
+                envStep: from.envStep,
+                slot,
+                count: from.count,
+                origin: "reused",
+                released: from.released,
+              });
+            } else {
+              shifted.push({
+                envStep: windowStart + shift + slot,
+                slot,
+                count: 0,
+                origin: "new_tail",
+                released: false,
+              });
+            }
+          }
+          const windowStartBefore = windowStart;
+          windowStart += shift;
+          tokens = shifted;
+          states.push({
+            kind: "shift",
+            title: `Shift window by ${shift}`,
+            latestObsEnvStep,
+            obsIndex,
+            nextEnvStep,
+            windowStart,
+            windowStartBefore,
+            runtimeStep,
+            shift,
+            released: [],
+            servedStep: null,
+            tokens: cloneTokens(tokens),
+          });
+        }
+
+        const released = [];
+        tokens = tokens.map((token, position) => {
+          const next = { ...token };
+          const ready = startupScheduleStep >= Math.floor(position * CONFIG.startupUncertaintyScale);
+          if (next.count < CONFIG.numInferenceSteps && ready) {
+            next.count += 1;
+          }
+          const justReleased = token.count < CONFIG.numInferenceSteps && next.count >= CONFIG.numInferenceSteps;
+          next.released = next.count >= CONFIG.numInferenceSteps;
+          if (justReleased) {
+            released.push(next.envStep);
+            actionCache.add(next.envStep);
+          }
+          if (next.origin === "fresh") next.origin = "reused";
+          return next;
+        });
+        runtimeStep += 1;
+        startupScheduleStep += 1;
+        states.push({
+          kind: "denoise",
+          title: `Denoise step ${runtimeStep}`,
+          latestObsEnvStep,
+          obsIndex,
+          nextEnvStep,
+          windowStart,
+          runtimeStep,
+          shift: 0,
+          released,
+          servedStep: null,
+          tokens: cloneTokens(tokens),
+        });
+
+        if (actionCache.has(nextEnvStep)) {
+          actionCache.delete(nextEnvStep);
+          const servedStep = nextEnvStep;
+          nextEnvStep += 1;
+          states.push({
+            kind: "serve",
+            title: `Execute action@${servedStep}`,
+            latestObsEnvStep,
+            obsIndex,
+            nextEnvStep,
+            windowStart,
+            runtimeStep,
+            shift: 0,
+            released: [],
+            servedStep,
+            tokens: cloneTokens(tokens),
+          });
+        }
+      }
+
+      return states.map((state, index) => ({
+        ...state,
+        index,
+        narrative: narrative(state),
+      }));
+    }
+
+    const states = simulate();
+
+    const timelineEl = document.getElementById("timeline");
+    const sliderEl = document.getElementById("eventSlider");
+    const rangeLabelEl = document.getElementById("rangeLabel");
+    const statusPillEl = document.getElementById("statusPill");
+    const statusTextEl = document.getElementById("statusText");
+    const obsMetricEl = document.getElementById("obsMetric");
+    const windowMetricEl = document.getElementById("windowMetric");
+    const obsCurrentEl = document.getElementById("obsCurrent");
+    const obsPointsEl = document.getElementById("obsPoints");
+    const slotLabelsEl = document.getElementById("slotLabels");
+    const tokenLayerEl = document.getElementById("tokenLayer");
+    const shiftNoteEl = document.getElementById("shiftNote");
+    const windowSubtitleEl = document.getElementById("windowSubtitle");
+    const summaryTextEl = document.getElementById("summaryText");
+    const detailKindEl = document.getElementById("detailKind");
+    const detailRuntimeEl = document.getElementById("detailRuntime");
+    const detailObsIndexEl = document.getElementById("detailObsIndex");
+    const detailShiftEl = document.getElementById("detailShift");
+    const detailReleasedEl = document.getElementById("detailReleased");
+    const detailServedEl = document.getElementById("detailServed");
+    const prevBtn = document.getElementById("prevBtn");
+    const nextBtn = document.getElementById("nextBtn");
+    const playBtn = document.getElementById("playBtn");
+
+    let currentIndex = 0;
+    let autoplayTimer = null;
+    const tokenDom = new Map();
+
+    function tokenLeft(slot) {
+      const percent = (slot * 100) / CONFIG.actionHorizon;
+      return `calc(${percent}% + 6px)`;
+    }
+
+    function tokenGradient(token) {
+      if (token.released) {
+        return "linear-gradient(180deg, #4fb580 0%, #2f855a 100%)";
+      }
+      const noise = noiseRatio(token);
+      const top = 72 + Math.round((1 - noise) * 160);
+      const sat = 60 - Math.round((1 - noise) * 22);
+      const lightTop = 34 + Math.round((1 - noise) * 48);
+      const lightBottom = 52 + Math.round((1 - noise) * 38);
+      return `linear-gradient(180deg, hsl(${top} ${sat}% ${lightTop}%) 0%, hsl(${Math.max(top - 8, 250)} ${Math.max(sat - 8, 28)}% ${lightBottom}%) 100%)`;
+    }
+
+    function noiseText(token) {
+      if (token.released) return "ready";
+      const noise = noiseRatio(token);
+      if (noise > 0.75) return "very noisy";
+      if (noise > 0.45) return "mid noise";
+      return "low noise";
+    }
+
+    function ensureTokenElement(envStep) {
+      if (tokenDom.has(envStep)) return tokenDom.get(envStep);
+      const el = document.createElement("div");
+      el.className = "token-card entering";
+      el.dataset.envStep = String(envStep);
+      el.innerHTML = `
+        <div class="token-top">
+          <div class="token-slot"></div>
+          <div class="token-origin"></div>
+        </div>
+        <div class="token-step"></div>
+        <div class="token-env"></div>
+        <div class="noise-band">
+          <div class="noise-label">
+            <span class="noise-kind"></span>
+            <span class="noise-count"></span>
+          </div>
+          <div class="noise-bar"><div class="noise-fill"></div></div>
+        </div>
+        <div class="token-meta"></div>
+      `;
+      tokenLayerEl.appendChild(el);
+      tokenDom.set(envStep, el);
+      requestAnimationFrame(() => {
+        el.classList.remove("entering");
+      });
+      return el;
+    }
+
+    function renderObsTimeline(state) {
+      obsPointsEl.innerHTML = "";
+      for (let step = 0; step <= CONFIG.maxVisualStep; step += 1) {
+        const point = document.createElement("div");
+        const refresh = step % CONFIG.obsStride === 0;
+        const isActive = step === state.latestObsEnvStep;
+        const isFuture = step > state.nextEnvStep + 2;
+        point.className = `obs-point${refresh ? " refresh" : ""}${isActive ? " active" : ""}${isFuture ? " future" : ""}`;
+        point.innerHTML = `
+          <div class="obs-node"></div>
+          <div class="obs-label">t=${step}</div>
+        `;
+        obsPointsEl.appendChild(point);
+      }
+      obsCurrentEl.textContent = `当前 denoise 正在使用 obs_t = ${state.latestObsEnvStep}`;
+    }
+
+    function renderSlots() {
+      slotLabelsEl.innerHTML = "";
+      for (let slot = 0; slot < CONFIG.actionHorizon; slot += 1) {
+        const div = document.createElement("div");
+        div.className = "slot-label";
+        div.textContent = `slot ${slot}`;
+        slotLabelsEl.appendChild(div);
+      }
+    }
+
+    function renderTimeline() {
+      timelineEl.innerHTML = "";
+      states.forEach((state, idx) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `event${idx === currentIndex ? " active" : ""}`;
+        button.innerHTML = `
+          <div class="event-index">Event ${idx}</div>
+          <div class="event-title">${state.title}</div>
+          <div class="event-meta">
+            <span>${eventLabel(state.kind)}</span>
+            <span>obs@${state.latestObsEnvStep}</span>
+            <span>win@${state.windowStart}</span>
+          </div>
+        `;
+        button.addEventListener("click", () => {
+          stopAutoplay();
+          setIndex(idx);
+        });
+        timelineEl.appendChild(button);
+      });
+    }
+
+    function renderTokens(state) {
+      const visible = new Set(state.tokens.map((token) => token.envStep));
+
+      state.tokens.forEach((token, slot) => {
+        const el = ensureTokenElement(token.envStep);
+        el.classList.remove("exiting");
+        el.classList.toggle("released", token.released);
+        el.style.left = tokenLeft(slot);
+        el.style.background = tokenGradient(token);
+        el.style.opacity = "1";
+        el.style.filter = token.origin === "new_tail" ? "saturate(1.08)" : "saturate(1)";
+
+        el.querySelector(".token-slot").textContent = `slot ${slot}`;
+        el.querySelector(".token-origin").textContent = tokenOriginLabel(token.origin, token.released);
+        el.querySelector(".token-step").textContent = token.envStep;
+        el.querySelector(".token-env").textContent = `target action @ env step ${token.envStep}`;
+        el.querySelector(".noise-kind").textContent = noiseText(token);
+        el.querySelector(".noise-count").textContent = `${token.count} / ${CONFIG.numInferenceSteps}`;
+        el.querySelector(".noise-fill").style.width = `${(token.count / CONFIG.numInferenceSteps) * 100}%`;
+        el.querySelector(".token-meta").textContent =
+          token.released
+            ? `已完成 denoise，可立即 release`
+            : token.origin === "new_tail"
+              ? `尾部新 token，刚补进窗口`
+              : `继续沿用旧 latent，在 obs@${state.latestObsEnvStep} 下推进`;
+      });
+
+      for (const [envStep, el] of tokenDom.entries()) {
+        if (visible.has(envStep)) continue;
+        el.classList.add("exiting");
+        window.setTimeout(() => {
+          if (tokenDom.get(envStep) === el) {
+            tokenDom.delete(envStep);
+            el.remove();
+          }
+        }, 650);
+      }
+    }
+
+    function renderState() {
+      const state = states[currentIndex];
+      sliderEl.value = String(currentIndex);
+      rangeLabelEl.textContent = `Event ${currentIndex + 1} / ${states.length}`;
+
+      statusPillEl.className = `status-pill ${eventStyle(state.kind)}`;
+      statusPillEl.textContent = eventLabel(state.kind);
+      statusTextEl.textContent = state.narrative;
+      obsMetricEl.textContent = `obs@${state.latestObsEnvStep}`;
+      windowMetricEl.textContent = `[${state.windowStart}, ${state.windowStart + CONFIG.actionHorizon - 1}]`;
+
+      renderObsTimeline(state);
+      renderTokens(state);
+
+      windowSubtitleEl.textContent =
+        `当前 window 起点是 env step ${state.windowStart}。颜色越深表示噪声越高；每走一轮 denoise，颜色会逐步变浅。`;
+      if (state.kind === "shift") {
+        shiftNoteEl.textContent = `window left shift = ${state.shift}`;
+        shiftNoteEl.classList.add("visible");
+      } else {
+        shiftNoteEl.classList.remove("visible");
+      }
+
+      summaryTextEl.textContent = state.narrative;
+      detailKindEl.textContent = eventLabel(state.kind);
+      detailRuntimeEl.textContent = String(state.runtimeStep);
+      detailObsIndexEl.textContent = String(state.obsIndex);
+      detailShiftEl.textContent = String(state.shift || 0);
+      detailReleasedEl.textContent = state.released.length
+        ? state.released.map((step) => `action@${step}`).join(", ")
+        : "none";
+      detailServedEl.textContent = state.servedStep == null ? "none" : `action@${state.servedStep}`;
+
+      renderTimeline();
+      prevBtn.disabled = currentIndex === 0;
+      nextBtn.disabled = currentIndex === states.length - 1;
+    }
+
+    function setIndex(index) {
+      currentIndex = Math.max(0, Math.min(states.length - 1, index));
+      renderState();
+    }
+
+    function stopAutoplay() {
+      if (autoplayTimer !== null) {
+        clearInterval(autoplayTimer);
+        autoplayTimer = null;
+        playBtn.textContent = "自动播放";
+      }
+    }
+
+    function startAutoplay() {
+      if (autoplayTimer !== null) return;
+      playBtn.textContent = "停止";
+      autoplayTimer = window.setInterval(() => {
+        if (currentIndex >= states.length - 1) {
+          stopAutoplay();
+          return;
+        }
+        setIndex(currentIndex + 1);
+      }, 950);
+    }
+
+    sliderEl.max = String(states.length - 1);
+    sliderEl.addEventListener("input", (event) => {
+      stopAutoplay();
+      setIndex(Number(event.target.value));
+    });
+    prevBtn.addEventListener("click", () => {
+      stopAutoplay();
+      setIndex(currentIndex - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      stopAutoplay();
+      setIndex(currentIndex + 1);
+    });
+    playBtn.addEventListener("click", () => {
+      if (autoplayTimer !== null) stopAutoplay();
+      else startAutoplay();
+    });
+
+    renderSlots();
+    renderState();
+  </script>
+</body>
+</html>

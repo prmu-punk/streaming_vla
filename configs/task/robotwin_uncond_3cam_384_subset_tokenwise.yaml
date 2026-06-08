@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: fastwam
+  - _self_
+
+# Quick RoboTwin subset experiment.
+# Episode blocks in robotwin2.0 are contiguous by task:
+#   lift_pot:     6500:7000
+#   open_laptop:  9000:9500
+#   turn_switch: 27000:27500
+data:
+  train:
+    _target_: fastwam.datasets.lerobot.robot_video_subset_dataset.RobotVideoSubsetDataset
+    episode_ranges:
+      - [6500, 7000]
+    num_frames: 17
+    action_video_freq_ratio: 2
+  val:
+    _target_: fastwam.datasets.lerobot.robot_video_subset_dataset.RobotVideoSubsetDataset
+    episode_ranges:
+      - [6500, 7000]
+    num_frames: 17
+    action_video_freq_ratio: 2
+
+batch_size: 15
+num_workers: 16
+
+model:
+  mot_checkpoint_mixed_attn: false
+  action_train_tokenwise_random_t: true
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 500 
+eval_every: 500
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+EVALUATION:
+  action_horizon: 16
+
+wandb:
+  enabled: true
+  project: fast-wam
+  name: robotwin_subset_lift_pot_h8_v9_tokenwise
+  group: robotwin_subset_tokenwise
+  mode: offline

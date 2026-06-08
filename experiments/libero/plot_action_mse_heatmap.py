@@ -38,9 +38,12 @@ def _sync_sqerr_matrix(data: dict) -> np.ndarray:
     rows = data.get("per_step", [])
     per_step = []
     for row in rows:
-        pred = np.asarray(row["first_pred_action"], dtype=np.float32)
-        target = np.asarray(row["first_target_action"], dtype=np.float32)
-        per_step.append(np.square(pred - target))
+        if "per_dim_sqerr" in row:
+            per_step.append(np.asarray(row["per_dim_sqerr"], dtype=np.float32))
+        else:
+            pred = np.asarray(row["first_pred_action"], dtype=np.float32)
+            target = np.asarray(row["first_target_action"], dtype=np.float32)
+            per_step.append(np.square(pred - target))
     if not per_step:
         raise ValueError("Sync JSON has no per_step data.")
     return np.stack(per_step, axis=0)

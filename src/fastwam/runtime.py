@@ -87,6 +87,7 @@ def create_fastwam(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    action_train_tokenwise_random_t: bool = False,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -156,6 +157,7 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_train_tokenwise_random_t=bool(action_train_tokenwise_random_t),
     )
 
 
@@ -237,6 +239,7 @@ def create_fastwam_joint(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    action_train_tokenwise_random_t: bool = False,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -306,6 +309,7 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_train_tokenwise_random_t=bool(action_train_tokenwise_random_t),
     )
 
 
@@ -322,6 +326,7 @@ def create_fastwam_idm(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    action_train_tokenwise_random_t: bool = False,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -393,6 +398,7 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_train_tokenwise_random_t=bool(action_train_tokenwise_random_t),
     )
 
 

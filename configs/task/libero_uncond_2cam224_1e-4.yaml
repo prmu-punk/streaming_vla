@@ -11,6 +11,7 @@ num_workers: 8
 
 model:
   mot_checkpoint_mixed_attn: false
+  action_train_tokenwise_random_t: true
 
 # scheduler
 lr_scheduler_type: "cosine"

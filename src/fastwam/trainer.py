@@ -12,6 +12,7 @@ import torch
 from accelerate import Accelerator
 from omegaconf import DictConfig
 from PIL import Image
+from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
@@ -76,6 +77,7 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.profiler_cfg = cfg.get("profiler", {})
         streaming_cfg = cfg.model.get("streaming", None) if cfg.get("model", None) is not None else None
         streaming_train_cfg = (
             streaming_cfg.get("streaming_train", None) if streaming_cfg is not None else None
@@ -169,6 +171,38 @@ class Wan22Trainer:
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _create_profiler(self):
+        profiler_cfg = self.profiler_cfg
+        if profiler_cfg is None or not bool(profiler_cfg.get("enabled", False)):
+            return None
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        output_dir = profiler_cfg.get("output_dir", None)
+        if output_dir in (None, "null", ""):
+            output_dir = os.path.join(self.output_dir, "torch_profile")
+        output_dir = os.path.join(str(output_dir), f"rank_{self.accelerator.process_index:03d}")
+        ensure_dir(output_dir)
+
+        prof = profile(
+            activities=activities,
+            schedule=schedule(
+                wait=int(profiler_cfg.get("wait", 10)),
+                warmup=int(profiler_cfg.get("warmup", 3)),
+                active=int(profiler_cfg.get("active", 5)),
+                repeat=int(profiler_cfg.get("repeat", 1)),
+            ),
+            on_trace_ready=tensorboard_trace_handler(output_dir),
+            record_shapes=bool(profiler_cfg.get("record_shapes", True)),
+            profile_memory=bool(profiler_cfg.get("profile_memory", True)),
+            with_stack=bool(profiler_cfg.get("with_stack", False)),
+            with_flops=bool(profiler_cfg.get("with_flops", False)),
+        )
+        logger.info("Torch profiler enabled: output_dir=%s activities=%s", output_dir, activities)
+        return prof
 
     def _configure_rank_local_deepspeed_batch_size(self):
         return
@@ -731,10 +765,14 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        profiler = self._create_profiler()
+        if profiler is not None:
+            profiler.start()
         
         while self.global_step < self.max_steps:
             try:
-                sample = next(data_iter)
+                with torch.profiler.record_function("train/dataloader_next"):
+                    sample = next(data_iter)
                 self.batch_in_epoch += 1
             except StopIteration:
                 self.epoch += 1
@@ -748,7 +786,8 @@ class Wan22Trainer:
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    with torch.profiler.record_function("train/forward_training_loss"):
+                        loss, loss_dict = train_model.training_loss(sample)
                 if not torch.is_tensor(loss):
                     loss = torch.as_tensor(loss, device=self.accelerator.device)
                 if loss.numel() != 1:
@@ -768,26 +807,30 @@ class Wan22Trainer:
                         "Loss does not require grad before backward. "
                         f"shape={tuple(loss.shape)} dtype={loss.dtype} device={loss.device}"
                     )
-                self.accelerator.backward(loss)
+                with torch.profiler.record_function("train/backward"):
+                    self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    with torch.profiler.record_function("train/grad_clip"):
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    with torch.profiler.record_function("train/optimizer_step"):
+                        self.optimizer.step()
+                        if not self.accelerator.optimizer_step_was_skipped:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
-                    raw_global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        gathered_metric = self.accelerator.gather(metric_tensor)
-                        raw_global_loss_metrics[key] = float(gathered_metric.mean().item())
-                    global_loss_metrics = raw_global_loss_metrics
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    with torch.profiler.record_function("train/gather_metrics"):
+                        global_loss = float(
+                            self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+                        )
+                        raw_global_loss_metrics = {}
+                        for key, value in loss_dict.items():
+                            metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+                            gathered_metric = self.accelerator.gather(metric_tensor)
+                            raw_global_loss_metrics[key] = float(gathered_metric.mean().item())
+                        global_loss_metrics = raw_global_loss_metrics
+                        grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+                        global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
@@ -832,7 +875,8 @@ class Wan22Trainer:
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
                     ):
-                        metrics = self.evaluate()
+                        with torch.profiler.record_function("train/evaluate"):
+                            metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
                             primary_metric = "val_loss"
@@ -862,7 +906,8 @@ class Wan22Trainer:
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
-                        ckpt_info = self.save_checkpoint()
+                        with torch.profiler.record_function("train/save_checkpoint"):
+                            ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[ckpt] step=%d weights=%s state=%s",
@@ -871,8 +916,14 @@ class Wan22Trainer:
                                 ckpt_info["state_path"],
                             )
 
+                    if profiler is not None:
+                        profiler.step()
+
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
+                        with torch.profiler.record_function("train/save_checkpoint_final"):
+                            ckpt_info = self.save_checkpoint()
+                        if profiler is not None:
+                            profiler.stop()
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[done] max_steps reached step=%d weights=%s state=%s",
@@ -882,7 +933,10 @@ class Wan22Trainer:
                             )
                         return
 
-        ckpt_info = self.save_checkpoint()
+        with torch.profiler.record_function("train/save_checkpoint_final"):
+            ckpt_info = self.save_checkpoint()
+        if profiler is not None:
+            profiler.stop()
         if self.accelerator.is_main_process:
             logger.info(
                 "[done] training finished step=%d weights=%s state=%s",

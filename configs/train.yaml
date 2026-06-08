@@ -25,7 +25,7 @@ max_steps: null
 log_every: 10
 save_every: 100
 eval_every: 50
-eval_num_inference_steps: 12
+eval_num_inference_steps: 13
 
 # training
 gradient_accumulation_steps: 1
@@ -48,6 +48,18 @@ wandb:
   name: train
   group: null
   mode: online
+
+profiler:
+  enabled: false
+  wait: 10
+  warmup: 3
+  active: 5
+  repeat: 1
+  output_dir: null
+  record_shapes: true
+  profile_memory: true
+  with_stack: false
+  with_flops: false
 
 hydra:
   job:

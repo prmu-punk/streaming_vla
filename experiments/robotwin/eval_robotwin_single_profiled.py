@@ -80,21 +80,21 @@ def _parse_args() -> argparse.Namespace:
     # --- model / inference knobs
     p.add_argument("--mixed-precision", default="bf16")
     p.add_argument("--replan-steps", type=int, default=24)
-    p.add_argument("--num-inference-steps", type=int, default=12)
-    p.add_argument("--action-horizon", type=int, default=None)
+    p.add_argument("--num-inference-steps", type=int, default=16)
+    p.add_argument("--action-horizon", type=int, default=8)
     p.add_argument("--sigma-shift", type=float, default=None)
     p.add_argument("--text-cfg-scale", type=float, default=1.0)
     p.add_argument("--negative-prompt", default="")
-    p.add_argument("--rand-device", default="cpu")
+    p.add_argument("--rand-device", default=None)
     p.add_argument("--tiled", type=int, default=0)
     p.add_argument("--timing-enabled", type=int, default=1)
     p.add_argument("--save-full-runtime-trace", type=int, default=0)
-    p.add_argument("--load-text-encoder", type=int, default=1,
+    p.add_argument("--load-text-encoder", type=int, default=0,
                    help="Must be 1 for streaming RobotWin profiling.")
     p.add_argument("--redirect-common-files", type=int, default=1)
     # --- episode loop
     p.add_argument("--eval-num-episodes", type=int, default=1)
-    p.add_argument("--instruction-type", default="unseen")
+    p.add_argument("--instruction-type", default="seen")
     p.add_argument("--skip-get-obs-within-replan", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-output-dir", default=None,
@@ -108,6 +108,9 @@ def _parse_args() -> argparse.Namespace:
 
 def _build_usr_args(args: argparse.Namespace) -> Dict[str, Any]:
     sim_cfg_path = str((PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve())
+    rand_device = args.rand_device
+    if rand_device is None:
+        rand_device = args.device
     return {
         # RoboTwin main() fields
         "task_name": args.task_name,
@@ -130,7 +133,7 @@ def _build_usr_args(args: argparse.Namespace) -> Dict[str, Any]:
         "sigma_shift": args.sigma_shift,
         "text_cfg_scale": args.text_cfg_scale,
         "negative_prompt": args.negative_prompt,
-        "rand_device": args.rand_device,
+        "rand_device": rand_device,
         "tiled": bool(args.tiled),
         "timing_enabled": bool(args.timing_enabled),
         "profile_runtime": True,

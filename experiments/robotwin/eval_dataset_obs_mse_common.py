@@ -112,6 +112,8 @@ def compose_robotwin_cfg(args):
         overrides.append(f"EVALUATION.num_inference_steps={int(args.num_inference_steps)}")
     if args.action_horizon is not None:
         overrides.append(f"EVALUATION.action_horizon={int(args.action_horizon)}")
+    if getattr(args, "replan_steps", None) is not None:
+        overrides.append(f"EVALUATION.replan_steps={int(args.replan_steps)}")
     if args.rand_device is not None:
         overrides.append(f"EVALUATION.rand_device={args.rand_device}")
     if getattr(args, "control_dt_ms", None) is not None:
@@ -273,6 +275,24 @@ def sync_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     head = rows[: min(8, len(rows))]
     next8 = rows[8:16]
     tail = rows[16:]
+    if len(rows) > 0 and "mse" in rows[0]:
+        pred_arr = np.asarray([row["pred_action"] for row in rows], dtype=np.float32)
+        target_arr = np.asarray([row["target_action"] for row in rows], dtype=np.float32)
+        return {
+            "env_action_mse": array_stats([float(row["mse"]) for row in rows]),
+            "env_action_mae": array_stats([float(row["mae"]) for row in rows]),
+            "head8_env_action_mse": array_stats([float(row["mse"]) for row in head]),
+            "next8_env_action_mse": array_stats([float(row["mse"]) for row in next8]),
+            "tail_env_action_mse": array_stats([float(row["mse"]) for row in tail]),
+            "chunk_position_env_action_mse": position_stats(
+                rows,
+                action_horizon=max(int(row.get("action_horizon", 0)) for row in rows),
+                key="mse",
+                position_key="chunk_position",
+                output_key="chunk_position",
+            ),
+            "per_dim_mse": np.mean(np.square(pred_arr - target_arr), axis=0).astype(float).tolist(),
+        }
     return {
         "chunk_mse": array_stats([float(row["chunk_mse"]) for row in rows]),
         "env_action_mse": array_stats([float(row["chunk_env_action_mse"]) for row in rows if row.get("chunk_env_action_mse") is not None]),
@@ -283,16 +303,33 @@ def sync_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def runtime_chunk_offset_stats(rows: list[dict[str, Any]], *, action_horizon: int, key: str) -> list[dict[str, float | int | None]]:
+def position_stats(
+    rows: list[dict[str, Any]],
+    *,
+    action_horizon: int,
+    key: str,
+    position_key: str,
+    output_key: str,
+) -> list[dict[str, float | int | None]]:
     buckets: list[list[float]] = [[] for _ in range(int(action_horizon))]
     for row in rows:
-        chunk_offset = row.get("chunk_offset", None)
-        if chunk_offset is None:
+        position = row.get(position_key, None)
+        if position is None:
             continue
-        idx = int(chunk_offset)
+        idx = int(position)
         if 0 <= idx < int(action_horizon):
             buckets[idx].append(float(row[key]))
-    return [{"chunk_offset": int(idx), **array_stats(values)} for idx, values in enumerate(buckets)]
+    return [{output_key: int(idx), **array_stats(values)} for idx, values in enumerate(buckets)]
+
+
+def runtime_chunk_offset_stats(rows: list[dict[str, Any]], *, action_horizon: int, key: str) -> list[dict[str, float | int | None]]:
+    return position_stats(
+        rows,
+        action_horizon=action_horizon,
+        key=key,
+        position_key="chunk_offset",
+        output_key="chunk_offset",
+    )
 
 
 def runtime_summary(rows: list[dict[str, Any]], *, action_horizon: int) -> dict[str, Any]:
@@ -339,15 +376,18 @@ def run_sync_mse(args) -> dict[str, Any]:
     context_mask = context_mask.to(device="cpu", dtype=torch.bool)
 
     action_horizon = int(resolve_action_horizon(cfg))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", action_horizon))
+    replan_steps = max(1, min(int(replan_steps), int(action_horizon)))
     num_inference_steps = int(cfg.EVALUATION.get("num_inference_steps", cfg.get("eval_num_inference_steps", 10)))
     rand_device = str(cfg.EVALUATION.get("rand_device", "cpu"))
     tiled = bool(cfg.EVALUATION.get("tiled", False) or bool(getattr(args, "tiled", False)))
 
     rows: list[dict[str, Any]] = []
-    for env_step in range(max_steps):
+    replan_env_step = 0
+    while replan_env_step < max_steps:
         model.reset_streaming_state()
-        image = episode_image(dataset, payload, int(env_step))
-        proprio = episode_proprio(dataset, payload, int(env_step))
+        image = episode_image(dataset, payload, int(replan_env_step))
+        proprio = episode_proprio(dataset, payload, int(replan_env_step))
         infer_out = model.infer_action(
             prompt=None,
             input_image=image,
@@ -356,37 +396,53 @@ def run_sync_mse(args) -> dict[str, Any]:
             context=context,
             context_mask=context_mask,
             num_inference_steps=num_inference_steps,
-            seed=int(args.seed) + int(env_step),
+            seed=int(args.seed) + int(replan_env_step),
             rand_device=rand_device,
             tiled=tiled,
         )
         pred_action = infer_out["action"].detach().to(device="cpu", dtype=torch.float32)
-        target_raw_chunk, action_is_pad_np = build_padded_raw_chunk(raw_action, env_step=int(env_step), action_horizon=action_horizon)
+        target_raw_chunk, action_is_pad_np = build_padded_raw_chunk(raw_action, env_step=int(replan_env_step), action_horizon=action_horizon)
         target_action = raw_action_chunk_to_normalized(target_raw_chunk, processor=processor)
         action_is_pad = torch.from_numpy(action_is_pad_np)
 
         pred_raw_chunk = normalized_action_to_raw(pred_action, processor=processor)
-        first_diff = pred_raw_chunk[0] - target_raw_chunk[0]
         chunk_mse = masked_mse(pred_action.unsqueeze(0), target_action.unsqueeze(0), action_is_pad.unsqueeze(0))
         valid_mask = ~action_is_pad_np
         chunk_env_mse = float(np.mean(np.square(pred_raw_chunk[valid_mask] - target_raw_chunk[valid_mask]))) if bool(np.any(valid_mask)) else None
-        rows.append(
-            {
-                "env_step": int(env_step),
-                "first_env_action_mse": float(np.mean(np.square(first_diff))),
-                "first_env_action_mae": float(np.mean(np.abs(first_diff))),
-                "chunk_mse": float(chunk_mse),
-                "chunk_rmse": float(chunk_mse ** 0.5),
-                "chunk_mse_per_position": masked_mse_per_position(pred_action.unsqueeze(0), target_action.unsqueeze(0), action_is_pad.unsqueeze(0)),
-                "chunk_env_action_mse": chunk_env_mse,
-                "chunk_env_action_mse_per_position": [
-                    None if bool(action_is_pad_np[pos]) else float(np.mean(np.square(pred_raw_chunk[pos] - target_raw_chunk[pos])))
-                    for pos in range(int(action_horizon))
-                ],
-                "first_pred_action": pred_raw_chunk[0].astype(float).tolist(),
-                "first_target_action": target_raw_chunk[0].astype(float).tolist(),
-            }
-        )
+        chunk_mse_per_position = masked_mse_per_position(pred_action.unsqueeze(0), target_action.unsqueeze(0), action_is_pad.unsqueeze(0))
+        chunk_env_action_mse_per_position = [
+            None if bool(action_is_pad_np[pos]) else float(np.mean(np.square(pred_raw_chunk[pos] - target_raw_chunk[pos])))
+            for pos in range(int(action_horizon))
+        ]
+
+        n_exec = min(int(replan_steps), int(action_horizon), int(max_steps - replan_env_step))
+        for chunk_pos in range(n_exec):
+            if bool(action_is_pad_np[chunk_pos]):
+                continue
+            env_step = int(replan_env_step + chunk_pos)
+            pred = np.asarray(pred_raw_chunk[chunk_pos], dtype=np.float32)
+            target = np.asarray(raw_action[env_step], dtype=np.float32)
+            diff = pred - target
+            rows.append(
+                {
+                    "env_step": int(env_step),
+                    "source_env_step": int(replan_env_step),
+                    "chunk_position": int(chunk_pos),
+                    "action_horizon": int(action_horizon),
+                    "replan_steps": int(replan_steps),
+                    "mse": float(np.mean(np.square(diff))),
+                    "mae": float(np.mean(np.abs(diff))),
+                    "per_dim_sqerr": np.square(diff).astype(float).tolist(),
+                    "pred_action": pred.astype(float).tolist(),
+                    "target_action": target.astype(float).tolist(),
+                    "chunk_mse": float(chunk_mse),
+                    "chunk_rmse": float(chunk_mse ** 0.5),
+                    "chunk_mse_per_position": chunk_mse_per_position,
+                    "chunk_env_action_mse": chunk_env_mse,
+                    "chunk_env_action_mse_per_position": chunk_env_action_mse_per_position,
+                }
+            )
+        replan_env_step += int(replan_steps)
 
     skip_initial_steps = max(0, int(args.skip_initial_steps))
     return {
@@ -401,6 +457,7 @@ def run_sync_mse(args) -> dict[str, Any]:
         "num_episode_raw_actions": int(raw_num_steps),
         "num_compared_steps": int(len(rows)),
         "action_horizon": int(action_horizon),
+        "replan_steps": int(replan_steps),
         "num_inference_steps": int(num_inference_steps),
         "tiled": bool(tiled),
         "summary": sync_summary(rows),

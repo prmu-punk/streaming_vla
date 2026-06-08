@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - override /data: domino
+  - override /model: fastwam
+  - _self_
+
+# Same training recipe as the RoboTwin H200 uncond run, but using DOMINO data.
+batch_size: 32
+num_workers: 16
+
+model:
+  mot_checkpoint_mixed_attn: false
+  action_train_tokenwise_random_t: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 500
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null

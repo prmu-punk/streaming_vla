@@ -38,6 +38,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_train_tokenwise_random_t: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,6 +85,7 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.action_train_tokenwise_random_t = bool(action_train_tokenwise_random_t)
 
         self.to(self.device)
 
@@ -111,6 +113,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_train_tokenwise_random_t: bool = False,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -169,6 +172,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            action_train_tokenwise_random_t=action_train_tokenwise_random_t,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -239,6 +243,42 @@ class FastWAM(torch.nn.Module):
             torch.cat([context, proprio_token], dim=1),
             torch.cat([context_mask, proprio_mask], dim=1),
         )
+
+    def _sample_action_training_t(self, action: torch.Tensor) -> torch.Tensor:
+        if not self.action_train_tokenwise_random_t:
+            return self.train_action_scheduler.sample_training_t(
+                batch_size=int(action.shape[0]),
+                device=self.device,
+                dtype=action.dtype,
+            )
+        batch_size, action_horizon = action.shape[:2]
+        return self.train_action_scheduler.sample_training_t(
+            batch_size=int(batch_size * action_horizon),
+            device=self.device,
+            dtype=action.dtype,
+        ).view(batch_size, action_horizon)
+
+    def _compute_action_loss(
+        self,
+        *,
+        pred_action: torch.Tensor,
+        target_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            device=action_loss_token.device,
+            dtype=action_loss_token.dtype,
+        )
+        if action_weight.ndim == 1:
+            action_weight = action_weight.unsqueeze(1)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            action_weight = action_weight * valid
+        weight_sum = action_weight.sum(dim=1).clamp(min=1.0)
+        action_loss_per_sample = (action_loss_token * action_weight).sum(dim=1) / weight_sum
+        return action_loss_per_sample.mean()
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -466,7 +506,8 @@ class FastWAM(torch.nn.Module):
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
     def training_loss(self, sample, tiled: bool = False):
-        inputs = self.build_inputs(sample, tiled=tiled)
+        with torch.profiler.record_function("loss/build_inputs_vae_encode"):
+            inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
         context = inputs["context"]
@@ -475,42 +516,41 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
-        noise_video = torch.randn_like(input_latents)
-        timestep_video = self.train_video_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=input_latents.dtype,
-        )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        with torch.profiler.record_function("loss/sample_noise"):
+            noise_video = torch.randn_like(input_latents)
+            timestep_video = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+            target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+            if inputs["first_frame_latents"] is not None:
+                latents[:, :, 0:1] = inputs["first_frame_latents"]
 
-        noise_action = torch.randn_like(action)
-        timestep_action = self.train_action_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=action.dtype,
-        )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
-        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+            noise_action = torch.randn_like(action)
+            timestep_action = self._sample_action_training_t(action)
+            noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+            target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        video_pre = self.video_expert.pre_dit(
-            x=latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=action,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-        )
+        with torch.profiler.record_function("loss/video_pre_dit"):
+            video_pre = self.video_expert.pre_dit(
+                x=latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=context_mask,
+                action=action,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            )
 
-        action_pre = self.action_expert.pre_dit(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
+        with torch.profiler.record_function("loss/action_pre_dit"):
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=context,
+                context_mask=context_mask,
+            )
 
         video_tokens = video_pre["tokens"]
         action_tokens = action_pre["tokens"]
@@ -521,64 +561,59 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
         )
-        tokens_out = self.mot(
-            embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
-            },
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
+        with torch.profiler.record_function("loss/mot_forward"):
+            tokens_out = self.mot(
+                embeds_all={
+                    "video": video_tokens,
+                    "action": action_tokens,
                 },
-                "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                attention_mask=attention_mask,
+                freqs_all={
+                    "video": video_pre["freqs"],
+                    "action": action_pre["freqs"],
                 },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
-        )
+                context_all={
+                    "video": {
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    "action": {
+                        "context": action_pre["context"],
+                        "mask": action_pre["context_mask"],
+                    },
+                },
+                t_mod_all={
+                    "video": video_pre["t_mod"],
+                    "action": action_pre["t_mod"],
+                },
+            )
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        with torch.profiler.record_function("loss/post_dit_and_loss"):
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+            pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+            include_initial_video_step = inputs["first_frame_latents"] is None
+            if inputs["first_frame_latents"] is not None:
+                pred_video = pred_video[:, :, 1:]
+                target_video = target_video[:, :, 1:]
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+            loss_video_per_sample = self._compute_video_loss_per_sample(
+                pred_video=pred_video,
+                target_video=target_video,
+                image_is_pad=image_is_pad,
+                include_initial_video_step=include_initial_video_step,
+            )
+            video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+            )
+            loss_video = (loss_video_per_sample * video_weight).mean()
 
-        loss_video_per_sample = self._compute_video_loss_per_sample(
-            pred_video=pred_video,
-            target_video=target_video,
-            image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
-        )
-        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
-        )
-        loss_video = (loss_video_per_sample * video_weight).mean()
-
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
-
-        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
-        )
-        loss_action = (action_loss_per_sample * action_weight).mean()
+            loss_action = self._compute_action_loss(
+                pred_action=pred_action,
+                target_action=target_action,
+                timestep_action=timestep_action,
+                action_is_pad=action_is_pad,
+            )
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {
